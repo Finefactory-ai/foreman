@@ -1,0 +1,10 @@
+[
+  { "name": "bash-allowed", "event": "PreToolUse", "run": true, "why": "A tester's Bash call that touches no production host is allowed: nothing on stdout." },
+  { "name": "bash-denied", "event": "PreToolUse", "run": true, "why": "A tester's Bash call naming the production host gets the exact deny JSON." },
+  { "name": "write-protected", "event": "PreToolUse", "run": true, "why": "A Write to the project's .env.local gets the exact deny JSON, path included." },
+  { "name": "recorded-tool", "event": "PreToolUse", "run": true, "why": "A tool the hook only records (TodoWrite) answers nothing." },
+  { "name": "subagent-start", "event": "SubagentStart", "run": true, "why": "SubagentStart answers nothing." },
+  { "name": "subagent-stop", "event": "SubagentStop", "run": true, "why": "SubagentStop answers nothing." },
+  { "name": "bash-not-json", "event": "PreToolUse", "run": true, "why": "A truncated payload on a Bash call inside a run answers nothing today; pinned." },
+  { "name": "outside-run", "event": "PreToolUse", "run": false, "why": "Outside a factory run the hook answers nothing, even for a call it would deny inside one." }
+]

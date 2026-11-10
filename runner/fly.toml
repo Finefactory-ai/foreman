@@ -1,0 +1,29 @@
+# Foreman's container runner on Fly.io (runner/README.md). A starting point: change `app`
+# and FOREMAN_REPO, then follow the README's Fly steps.
+app = "my-foreman"
+primary_region = "iad"
+# Seconds Fly waits after asking the run to stop; stories in progress finish if they can.
+kill_timeout = 300
+
+[build]
+  dockerfile = "fly.Dockerfile"
+
+[env]
+  FOREMAN_REPO = "owner/name"
+  FOREMAN_BRANCH = "main"
+
+[mounts]
+  source = "foreman_work"
+  destination = "/work"
+
+# The dashboard, over HTTPS, behind its token.
+[http_service]
+  internal_port = 4317
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"

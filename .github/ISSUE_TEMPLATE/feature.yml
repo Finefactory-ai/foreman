@@ -1,0 +1,30 @@
+name: Feature request
+description: Something Foreman should do, or do differently.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like Foreman to do
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do instead today
+      description: Workarounds, other tools, or a config or trait you tried.
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Code or text you send
+      description: Foreman can only use what it is free to use. Ideas and bug reports without code need nothing more.
+      options:
+        - label: If this issue includes code or text for Foreman, I have the right to send it and I agree to the terms in [CONTRIBUTING.md](https://github.com/Finefactory-ai/foreman/blob/main/CONTRIBUTING.md).
+          required: true

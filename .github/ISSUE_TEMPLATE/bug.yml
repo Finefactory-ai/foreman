@@ -1,0 +1,83 @@
+name: Bug report
+description: Foreman did something wrong, stopped, or would not start.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please run `foreman doctor` first: it finds and explains most set-up problems, and its output is the fastest way for us to see what is going on.
+        Strip every key, token and password from anything you paste. Foreman's own keys live in `.env.foreman`; never paste that file.
+  - type: input
+    id: version
+    attributes:
+      label: Foreman version
+      description: The tag you installed, from the `/plugin marketplace add finefactory-ai/foreman#vX.Y.Z` line.
+      placeholder: v0.11.0
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where Foreman runs
+      options:
+        - On my laptop, started from Claude Code or the terminal
+        - As a background service (foreman service install)
+        - In the container runner
+        - In GitHub Actions (foreman cloud tick)
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Story source and pack
+      options:
+        - Markdown stories, no pack
+        - Jira, no pack
+        - Markdown stories, Salesforce pack
+        - Jira, Salesforce pack
+    validations:
+      required: true
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened
+      description: What you saw, including the story id and stage if one was running.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to see it again
+      placeholder: |
+        1. ...
+        2. ...
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `foreman doctor`
+      render: text
+  - type: textarea
+    id: config
+    attributes:
+      label: Your `foreman.config.json`, with anything secret removed
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The last lines of `.foreman/logs/supervisor.out`, or the error from the dashboard or the terminal.
+      render: text
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Code or text you send
+      description: Foreman can only use what it is free to use. Ideas and bug reports without code need nothing more.
+      options:
+        - label: If this issue includes code or text for Foreman, I have the right to send it and I agree to the terms in [CONTRIBUTING.md](https://github.com/Finefactory-ai/foreman/blob/main/CONTRIBUTING.md).
+          required: true

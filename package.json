@@ -1,0 +1,17 @@
+{
+  "name": "foreman",
+  "version": "0.11.0",
+  "private": true,
+  "license": "FSL-1.1-ALv2",
+  "description": "An autonomous story-to-production pipeline for Claude Code: architect, build, test, review, release.",
+  "type": "module",
+  "bin": { "foreman": "plugin/bin/foreman" },
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node test/run-suite.mjs",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "vitest": "^5.0.2"
+  }
+}

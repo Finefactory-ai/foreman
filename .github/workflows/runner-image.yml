@@ -1,0 +1,92 @@
+# Builds Foreman's container runner (runner/Dockerfile) for each release tag, tries it, and
+# publishes it as ghcr.io/<owner, in lower case>/foreman-runner:<version>, and the same with the
+# Salesforce tools (--build-arg SALESFORCE=1) as foreman-runner:<version>-salesforce. It runs only in
+# Finefactory-ai/foreman, where releases are published; the workshop builds no image.
+name: Runner image
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    if: github.repository == 'Finefactory-ai/foreman'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { suffix: '', salesforce: '0' }
+          - { suffix: '-salesforce', salesforce: '1' }
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read the version
+        id: version
+        run: echo "version=$(node -p "require('./plugin/.claude-plugin/plugin.json').version")" >> "$GITHUB_OUTPUT"
+
+      # GHCR wants lower case, and the owner is Finefactory-ai.
+      - name: Name the image
+        id: image
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/foreman-runner:$VERSION$SUFFIX" >> "$GITHUB_OUTPUT"
+
+      - name: Check the tag is the plugin version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: test "$GITHUB_REF_NAME" = "v$VERSION"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: runner/Dockerfile
+          load: true
+          build-args: SALESFORCE=${{ matrix.salesforce }}
+          tags: ${{ steps.image.outputs.name }}
+
+      # As the default user, so the Salesforce check proves foreman sees sf's plugins.
+      - name: Try the image
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          SALESFORCE: ${{ matrix.salesforce }}
+        run: |
+          docker run --rm --entrypoint sh "$IMAGE" -c 'foreman --help > /dev/null && claude --version && gh --version && git --version && command -v setpriv'
+          test "$(docker run --rm --entrypoint id "$IMAGE" -un)" = foreman
+          # The check matches each plugin's name and its pinned version, because sf's own core
+          # agent plugin has the same name as the pinned one.
+          if [ "$SALESFORCE" = 1 ]; then
+            docker run --rm --entrypoint sh "$IMAGE" -c 'sf --version && python3 --version && java -version'
+            docker run --rm --entrypoint sh "$IMAGE" -c 'sf plugins --core --json' > "$RUNNER_TEMP/sf-plugins.json"
+            node runner/check-sf-plugins.mjs "$RUNNER_TEMP/sf-plugins.json"
+          fi
+
+      # This only prints the trees, so drift between rebuilds of a tag shows in the log; npm ls exits non-zero on peer warnings, so it never fails the build.
+      - name: Record the resolved packages
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          SALESFORCE: ${{ matrix.salesforce }}
+        run: |
+          docker run --rm --entrypoint sh "$IMAGE" -c 'npm ls --global --all' || true
+          if [ "$SALESFORCE" = 1 ]; then docker run --rm --entrypoint sh "$IMAGE" -c 'npm ls --all --prefix "$SF_DATA_DIR"' || true; fi
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: docker push "$IMAGE"

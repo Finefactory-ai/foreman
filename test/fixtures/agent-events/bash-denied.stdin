@@ -1,0 +1,1 @@
+{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"curl https://app.acme.example/api"},"agent_id":"x1","agent_type":"foreman:tester","cwd":"<PROJECT>"}

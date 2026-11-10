@@ -1,0 +1,7 @@
+{"type":"system","subtype":"init","cwd":"/work/project","session_id":"s-2","tools":["Bash","Agent"],"mcp_servers":[],"model":"claude-opus-5-5","permissionMode":"default","apiKeySource":"none","plugins":[],"uuid":"u-1"}
+{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":1200,"error_status":529,"error":"overloaded","uuid":"u-2","session_id":"s-2"}
+{"type":"assistant","message":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"Building S-2 now."}]},"parent_tool_use_id":null,"session_id":"s-2","uuid":"u-3"}
+{"type":"assistant","message":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"The architect plan is ready."}]},"parent_tool_use_id":null,"session_id":"s-2","uuid":"u-4"}
+{"type":"assistant","message":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"npm run build"}}]},"parent_tool_use_id":null,"session_id":"s-2","uuid":"u-5"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]},"parent_tool_use_id":null,"session_id":"s-2","uuid":"u-6"}
+{"type":"assistant","message":{"id":"msg_2","type":"mess

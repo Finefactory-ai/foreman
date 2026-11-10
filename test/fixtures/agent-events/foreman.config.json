@@ -1,0 +1,1 @@
+{"version":1,"project":{"name":"acme"},"ship":{"steps":["pr"],"smoke":{"urls":["https://app.acme.example/health"]}}}

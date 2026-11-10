@@ -1,0 +1,45 @@
+[
+  {
+    "name": "markdown",
+    "why": "SKILL.md step 3 (markdown: the stories block is { adapter, dir }), step 5.1 and 5.2 (the check command and the CI jobs, defaults from the detection), and step 6 (the final config is suggested plus the answers, nothing that equals a default added).",
+    "answers": { "name": "Acme Shop", "source": "markdown", "dir": "docs/stories", "check": "npm test", "ci": ["Unit tests"] },
+    "config": {
+      "version": 1,
+      "project": { "name": "Acme Shop" },
+      "install": { "run": "npm ci", "when": "package-lock.json", "creates": "node_modules" },
+      "checks": [{ "run": "npm test", "when": "always" }],
+      "stories": { "adapter": "markdown", "dir": "docs/stories" },
+      "ship": {
+        "steps": ["merge-main", "resources", "push", "pr", "ci", "mergeable-recheck", "merge"],
+        "ci": { "required": ["Unit tests"] }
+      }
+    }
+  },
+  {
+    "name": "jira",
+    "why": "SKILL.md step 3 (Jira: the site's host and the JQL filter; ownerLabel left out because it equals the default, transitions left out because blank means leave out), step 5.1 and 5.2 (the check command and the CI jobs), and step 6 (the final config is suggested plus the answers).",
+    "answers": {
+      "name": "Acme Shop",
+      "source": "jira",
+      "site": "acme.atlassian.net",
+      "jql": "project = ACME AND labels = foreman AND statusCategory != Done ORDER BY Rank",
+      "check": "npm test",
+      "ci": ["Unit tests", "lint"]
+    },
+    "config": {
+      "version": 1,
+      "project": { "name": "Acme Shop" },
+      "install": { "run": "npm ci", "when": "package-lock.json", "creates": "node_modules" },
+      "checks": [{ "run": "npm test", "when": "always" }],
+      "stories": {
+        "adapter": "jira",
+        "site": "acme.atlassian.net",
+        "jql": "project = ACME AND labels = foreman AND statusCategory != Done ORDER BY Rank"
+      },
+      "ship": {
+        "steps": ["merge-main", "resources", "push", "pr", "ci", "mergeable-recheck", "merge"],
+        "ci": { "required": ["Unit tests", "lint"] }
+      }
+    }
+  }
+]

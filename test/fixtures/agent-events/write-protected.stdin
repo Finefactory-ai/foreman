@@ -1,0 +1,1 @@
+{"hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{"file_path":"<PROJECT>/.env.local","content":"X=1"},"agent_id":"b1","agent_type":"foreman:builder","cwd":"<PROJECT>"}

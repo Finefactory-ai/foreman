@@ -1,0 +1,25 @@
+# Foreman's container runner with Docker Compose (runner/README.md):
+#
+#   cp .env.runner runner/foreman.env
+#   docker compose -f runner/compose.yaml up -d --build
+#
+# A stop asks the run to finish the stories in progress first, so it gets a long grace period;
+# it restarts only after a failure, so `foreman stop` and `docker compose stop` stay stopped.
+services:
+  foreman:
+    image: ghcr.io/finefactory-ai/foreman-runner:0.11.0
+    build:
+      context: ..
+      dockerfile: runner/Dockerfile
+    env_file: foreman.env
+    volumes:
+      - foreman-work:/work
+      # For the docker or supabase slot environments (see the README):
+      # - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "127.0.0.1:4317:4317"
+    restart: on-failure
+    stop_grace_period: 15m
+
+volumes:
+  foreman-work:

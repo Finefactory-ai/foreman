@@ -1,0 +1,6 @@
+{
+  "name": "foreman",
+  "version": "0.11.0",
+  "description": "An autonomous story-to-production pipeline for Claude Code.",
+  "license": "FSL-1.1-ALv2"
+}

@@ -1,0 +1,1 @@
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Foreman denies this edit: it would change <PROJECT>/.env.local, which belongs to the project this run builds. Story sessions never write the real project's config, settings or keys; check Foreman commands in a scratch git repo, with the FOREMAN_* variables left set."}}

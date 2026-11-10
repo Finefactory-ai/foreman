@@ -1,0 +1,69 @@
+# Foreman: builds the next story, one per job (`foreman cloud tick`).
+# Written by `foreman cloud actions init`; run it again with --force to rewrite this file.
+# Secrets: FOREMAN_GH_TOKEN, and ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, plus RESEND_API_KEY.
+name: Foreman
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      story:
+        description: 'A story to build next (optional)'
+        required: false
+        type: string
+
+concurrency:
+  group: foreman
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      FOREMAN_VERSION: 'v0.5.0'
+      CLAUDE_CODE_VERSION: '2.1.292'
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.FOREMAN_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Install Claude Code
+        run: npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+      - name: Fetch Foreman
+        env:
+          GH_TOKEN: ${{ secrets.FOREMAN_GH_TOKEN }}
+        run: |
+          gh repo clone finefactory-ai/foreman "$RUNNER_TEMP/foreman" -- --depth 1 --branch "$FOREMAN_VERSION"
+          echo "$RUNNER_TEMP/foreman/plugin/bin" >> "$GITHUB_PATH"
+
+      - name: Build one story
+        id: tick
+        env:
+          FOREMAN_PLUGIN_DIR: ${{ runner.temp }}/foreman/plugin
+          GH_TOKEN: ${{ secrets.FOREMAN_GH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          STORY: ${{ inputs.story }}
+        run: foreman cloud tick ${STORY:+--story "$STORY"}
+
+      - name: Save the state
+        if: ${{ always() && steps.tick.outcome != 'skipped' }}
+        env:
+          GH_TOKEN: ${{ secrets.FOREMAN_GH_TOKEN }}
+        run: foreman cloud sync

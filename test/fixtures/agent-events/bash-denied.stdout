@@ -1,0 +1,1 @@
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Foreman keeps the tester and reviewers off production (app.acme.example). Test against the local or slot environment instead."}}

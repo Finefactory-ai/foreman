@@ -1,0 +1,11 @@
+{
+  "name": "foreman",
+  "owner": { "name": "finefactory.ai" },
+  "plugins": [
+    {
+      "name": "foreman",
+      "source": "./plugin",
+      "description": "An autonomous story-to-production pipeline for Claude Code."
+    }
+  ]
+}

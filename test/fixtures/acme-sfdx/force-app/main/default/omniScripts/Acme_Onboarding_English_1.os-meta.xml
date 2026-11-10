@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OmniScript xmlns="http://soap.sforce.com/2006/04/metadata">
+    <isActive>false</isActive>
+    <language>English</language>
+    <name>Acme Onboarding</name>
+    <subType>Onboarding</subType>
+    <type>Acme</type>
+    <versionNumber>1</versionNumber>
+</OmniScript>

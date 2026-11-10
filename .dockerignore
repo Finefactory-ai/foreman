@@ -1,0 +1,8 @@
+# The runner image copies only plugin/, runner/entrypoint.sh, runner/claude.sh and runner/THIRD-PARTY.md; keep the
+# rest out of the build context.
+*
+!plugin/
+!runner/entrypoint.sh
+!runner/claude.sh
+!runner/THIRD-PARTY.md
+plugin/**/*.test.mjs

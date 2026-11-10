@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security problem
+    url: https://github.com/Finefactory-ai/foreman/blob/main/SECURITY.md
+    about: Keys, the production guard or anything an attacker could use. Please do not open a public issue; SECURITY.md says how to report it privately.
+  - name: Question or early access
+    url: mailto:hello@finefactory.ai?subject=Foreman
+    about: Anything that is not a bug or a feature request.
+  - name: Foreman on finefactory.ai
+    url: https://finefactory.ai/apps/foreman/
+    about: What Foreman is and what it does.

@@ -1,0 +1,1 @@
+{"hook_event_name":"PreToolUse","tool_name":"TodoWrite","tool_input":{"todos":[]},"agent_id":"b1","agent_type":"foreman:builder","cwd":"<PROJECT>"}

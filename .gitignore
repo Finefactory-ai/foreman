@@ -1,0 +1,12 @@
+node_modules/
+# factory run state: logs, STOP and HALT markers, worktrees
+.factory/
+.claude/settings.local.json
+.DS_Store
+# the container runner's filled-in settings
+runner/foreman.env
+
+# Foreman running on this repo: keys and run state
+.env.local
+.env.foreman
+.foreman/
