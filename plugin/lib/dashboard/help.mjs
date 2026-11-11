@@ -35,6 +35,10 @@ const ACTIONS = {
       'Sends the story back to be designed and built again, with your note.',
       'The story goes back to todo with "Note for the architect: <your note>". The architect designs it again, then it is built and reviewed again.',
     ),
+    'Retry the release': h(
+      'Puts the story back in line; it resumes from its built branch and ships again.',
+      'The story goes back to todo with a note saying the owner asked to retry the release. Its branch and pull request are kept, so the next session picks up the built branch and runs the release again without building it anew.',
+    ),
     "I'll take it": h(
       'You take the story over; the run leaves it alone until you hand it back.',
       'Foreman claims the story for you (`foreman lock owner-claim`) and blocks it with "Taken by the owner". Its branch and draft pull request stay. Hand it back under Taken by you when the run should carry on.',

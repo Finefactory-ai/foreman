@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildOrder, byPriority, dependentsOf, eligible, freedBy, needsExclusive, nextStory, progress, waitersOf, waitsOnStories } from './pick.mjs';
+import { blockedNow, buildOrder, byPriority, dependentsOf, eligible, freedBy, needsExclusive, nextStory, progress, waitersOf, waitsOnStories } from './pick.mjs';
 
 const ID = '[A-Z]+-\\d+';
 const s = (id, over = {}) => ({
@@ -207,5 +207,38 @@ describe('waitersOf', () => {
 
   it('needs the id pattern', () => {
     expect(() => waitersOf([], ['S-1'], {})).toThrow('idPattern is required');
+  });
+});
+
+describe('blockedNow', () => {
+  it('is true for a story blocked in words', () => {
+    const list = [s('S-1', { status: 'blocked', blockedBy: 'Deploy failed.' })];
+    expect(blockedNow(list[0], list, { idPattern: ID })).toBe(true);
+  });
+  it('is true for a story blocked on an unfinished story', () => {
+    const list = [s('S-1'), s('S-2', { status: 'blocked', blockedBy: 'S-1 must land first' })];
+    expect(blockedNow(list[1], list, { idPattern: ID })).toBe(true);
+  });
+  it('is false once every story it waits on is done', () => {
+    const list = [s('S-1', { status: 'done' }), s('S-2', { status: 'blocked', blockedBy: 'S-1 must land first' })];
+    expect(blockedNow(list[1], list, { idPattern: ID })).toBe(false);
+  });
+  it('is false for todo and in-progress stories', () => {
+    const list = [s('S-1'), s('S-2', { status: 'in-progress' })];
+    expect(blockedNow(list[0], list, { idPattern: ID })).toBe(false);
+    expect(blockedNow(list[1], list, { idPattern: ID })).toBe(false);
+  });
+  it('needs an idPattern', () => {
+    const list = [s('S-1')];
+    expect(() => blockedNow(list[0], list)).toThrow('idPattern is required');
+  });
+
+  it('agrees with nextStory: a blocked story is never picked, even alone and first', () => {
+    const inWords = [s('S-1', { status: 'blocked', blockedBy: 'Deploy failed.', order: -1 })];
+    const onStory = [s('S-1', { status: 'blocked', blockedBy: 'S-2 must land first', order: -1 }), s('S-2', { status: 'todo', ownerTask: true })];
+    for (const list of [inWords, onStory]) {
+      expect(nextStory(list, { idPattern: ID })).toBeNull();
+      expect(nextStory(list, { id: 'S-1', strict: true, idPattern: ID })).toBeNull();
+    }
   });
 });

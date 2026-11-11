@@ -2,6 +2,7 @@
 // the facts and carries the answers out.
 
 import { stepTableFor, stepsFor } from '../adapters/ship/registry.mjs';
+import { mergedAfter } from './resume-close.mjs';
 
 // A Mac is kept awake while the supervisor builds (caffeinate exits with it, and keepAwake
 // below lets go of it on standby); elsewhere, nothing.
@@ -48,6 +49,22 @@ export function keepAwake(command, { spawn, onError = () => {} }) {
     },
     held: () => child !== null,
   };
+}
+
+// The head branches of gh's merged pull requests `prs` ([{ headRefName, mergedAt }]) that still count
+// as shipped, each once and in order. A story's branch counts when one of its pull requests merged
+// after the story's last rollback (rolledBackAt(id), null for none); a branch that names no story
+// counts as it is. Entries that are not objects, or have no head branch name, are skipped.
+export function shippedBranches(prs, stories, branchPrefix, rolledBackAt = () => null) {
+  const byBranch = new Map(stories.map((s) => [`${branchPrefix}${s.id.toLowerCase()}`, s.id]));
+  const kept = [];
+  for (const pr of prs) {
+    if (pr === null || typeof pr !== 'object' || typeof pr.headRefName !== 'string') continue;
+    const id = byBranch.get(pr.headRefName);
+    if (id !== undefined && !mergedAfter(pr.mergedAt, rolledBackAt(id))) continue;
+    if (!kept.includes(pr.headRefName)) kept.push(pr.headRefName);
+  }
+  return kept;
 }
 
 // The stories whose branches are among `branches` (merged pull requests' head branches). A

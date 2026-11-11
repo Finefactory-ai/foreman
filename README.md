@@ -19,13 +19,30 @@ the ship steps, the notifier and the console.
 ## Install
 
 ```
-/plugin marketplace add finefactory-ai/foreman#v0.11.0
+/plugin marketplace add finefactory-ai/foreman#v0.12.0
 /plugin install foreman@foreman
 ```
 
 Then run `/foreman:init` in your project. The user guide is at
 [finefactory.ai/apps/foreman/docs](https://finefactory.ai/apps/foreman/docs/), and the dashboard's
 Help link opens it.
+
+### Windows
+
+Foreman runs on macOS and Linux. On a Windows PC it runs inside WSL2, the Linux that Windows
+ships. Running it straight on Windows (PowerShell, the Command Prompt or Git Bash) is not
+supported yet.
+
+1. In PowerShell as administrator, run `wsl --install`, then restart. This installs WSL2 and
+   Ubuntu.
+2. Inside Ubuntu, install Claude Code, Node 22 or later, git and the GitHub CLI. The copies
+   installed on Windows do not count.
+3. Clone your project under your Linux home folder, not under `/mnt/c/`.
+4. Start `claude` there and run the two install commands above.
+
+Keep an Ubuntu terminal open while a run is going: Windows stops WSL2 when the last one closes.
+The full steps are on
+[Foreman on Windows](https://finefactory.ai/apps/foreman/docs/windows/).
 
 Foreman's home is [finefactory.ai/apps/foreman](https://finefactory.ai/apps/foreman/), with a page
 on [Foreman for Salesforce](https://finefactory.ai/apps/foreman/salesforce/).

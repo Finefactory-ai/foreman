@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { FINAL, JOB_ID, summary, waitForJob } from './deploy-result.mjs';
+import { FINAL, JOB_ID, componentFailureCount, summary, waitForJob } from './deploy-result.mjs';
 import { fakeCtx } from '../../../test/ship-fakes.mjs';
 import { sfError, sfOk } from '../../../test/fake-sf.mjs';
 
@@ -76,6 +76,25 @@ describe('summary', () => {
     for (const leak of ['Acme Admin', 'createdBy', '005000000000001AAA', '01p000000000001AAA', 'classes/AcmeService.cls', 'stackTrace', 'line 9']) {
       expect(text).not.toContain(leak);
     }
+  });
+});
+
+describe('componentFailureCount', () => {
+  const entry = (i) => ({ componentType: 'ApexClass', fullName: `Acme${i}`, problem: 'Missing ;' });
+
+  it('counts every component failure in the raw result, past the 20 summary keeps', () => {
+    const result = report({}, { componentFailures: Array.from({ length: 30 }, (_, i) => entry(i)) });
+    expect(componentFailureCount(result)).toBe(30);
+    expect(summary(result).failures.filter((f) => f.kind === 'component')).toHaveLength(20);
+  });
+  it('counts one object as one failure', () => {
+    expect(componentFailureCount(report())).toBe(1);
+  });
+  it('counts only the plain objects of an array', () => {
+    expect(componentFailureCount(report({}, { componentFailures: [entry(1), 'x', null, 3, entry(2)] }))).toBe(2);
+  });
+  it('counts nothing for a bare or odd result', () => {
+    for (const odd of [null, {}, { details: {} }, { details: { componentFailures: 'x' } }]) expect(componentFailureCount(odd)).toBe(0);
   });
 });
 

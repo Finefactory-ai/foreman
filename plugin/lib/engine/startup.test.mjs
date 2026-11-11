@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
-import { closableIds, closableMergedIds, keepAwake, keepAwakeCommand, mergedStoryIds, mustFinishFor, remoteHasBranch } from './startup.mjs';
+import { closableIds, closableMergedIds, keepAwake, keepAwakeCommand, mergedStoryIds, mustFinishFor, remoteHasBranch, shippedBranches } from './startup.mjs';
 import { withDefaults } from '../config/defaults.mjs';
 import { configWithLocal, effective } from '../settings/resolve.mjs';
 import { fakePack } from '../../../test/fake-pack.mjs';
@@ -188,5 +188,56 @@ describe('closableMergedIds', () => {
   });
   it('ignores a branch that names no story', () => {
     expect(closableMergedIds(['story/s-9', 'other/x', 'story/s-1'], stories, 'story/')).toEqual(['S-1']);
+  });
+});
+
+describe('shippedBranches', () => {
+  const stories = [
+    { id: 'ACME-1', status: 'todo' },
+    { id: 'ACME-2', status: 'todo' },
+  ];
+  const BEFORE = '2026-11-01T10:00:00Z';
+  const RB = '2026-11-01T11:00:00Z';
+  const AFTER = '2026-11-01T12:00:00Z';
+  const rolled = (id) => (id === 'ACME-1' ? RB : null);
+
+  it('keeps every branch when no rollback is recorded', () => {
+    const prs = [{ headRefName: 'story/acme-1', mergedAt: BEFORE }, { headRefName: 'story/acme-2', mergedAt: BEFORE }];
+    expect(shippedBranches(prs, stories, 'story/')).toEqual(['story/acme-1', 'story/acme-2']);
+  });
+
+  it('drops a story branch whose only pull request merged before its rollback', () => {
+    const prs = [{ headRefName: 'story/acme-1', mergedAt: BEFORE }, { headRefName: 'story/acme-2', mergedAt: BEFORE }];
+    expect(shippedBranches(prs, stories, 'story/', rolled)).toEqual(['story/acme-2']);
+  });
+
+  it('keeps it when a second pull request merged after the rollback', () => {
+    const prs = [{ headRefName: 'story/acme-1', mergedAt: BEFORE }, { headRefName: 'story/acme-1', mergedAt: AFTER }];
+    expect(shippedBranches(prs, stories, 'story/', rolled)).toEqual(['story/acme-1']);
+  });
+
+  it('keeps a branch that names no story', () => {
+    expect(shippedBranches([{ headRefName: 'other/x', mergedAt: BEFORE }], stories, 'story/', () => RB)).toEqual(['other/x']);
+  });
+
+  it('skips entries that are not objects and entries without a head branch name', () => {
+    const prs = [null, 'story/acme-2', 3, [], {}, { headRefName: 7 }, { headRefName: 'story/acme-2', mergedAt: BEFORE }];
+    expect(shippedBranches(prs, stories, 'story/', rolled)).toEqual(['story/acme-2']);
+  });
+
+  it('lists a branch once', () => {
+    const prs = [{ headRefName: 'story/acme-2', mergedAt: BEFORE }, { headRefName: 'story/acme-2', mergedAt: AFTER }];
+    expect(shippedBranches(prs, stories, 'story/', rolled)).toEqual(['story/acme-2']);
+  });
+
+  it('drops a pull request with no merge time when a rollback is recorded', () => {
+    expect(shippedBranches([{ headRefName: 'story/acme-1' }], stories, 'story/', rolled)).toEqual([]);
+  });
+
+  it('composes with closableMergedIds: a rolled-back todo story is not closed, and one with no record is', () => {
+    const prs = [{ headRefName: 'story/acme-1', mergedAt: BEFORE }];
+    const closable = (rb) => closableMergedIds(shippedBranches(prs, stories, 'story/', rb), stories, 'story/');
+    expect(closable(rolled)).toEqual([]);
+    expect(closable(() => null)).toEqual(['ACME-1']);
   });
 });

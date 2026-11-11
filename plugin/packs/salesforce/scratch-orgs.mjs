@@ -79,3 +79,23 @@ export function storiesInSlots(stateDir) {
   }
   return ids;
 }
+
+// The stories that hold a claim: one id per <stateDir>/claims/*.json, whoever holds it (the
+// factory or the owner), live or stale, and whether or not the file parses. A claimed story is
+// one a run resumes (interrupted, held, parked, queued) or the owner holds; every closing ending
+// lets go of its claim. Read from the folder directly, as storiesInSlots reads the slots, to keep
+// off locks.mjs and state.mjs. Never throws.
+export function claimedStories(stateDir) {
+  const ids = new Set();
+  if (!isText(stateDir)) return ids;
+  let names;
+  try {
+    names = fs.readdirSync(join(stateDir, 'claims'));
+  } catch {
+    return ids;
+  }
+  for (const name of names) {
+    if (name.endsWith('.json') && name.length > '.json'.length) ids.add(name.slice(0, -'.json'.length));
+  }
+  return ids;
+}

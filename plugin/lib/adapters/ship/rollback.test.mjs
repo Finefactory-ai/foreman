@@ -26,6 +26,56 @@ describe('rollback step', () => {
     expect(ctx.sh.opts[ctx.sh.calls.indexOf(`sh -c ${CMD}`)]).toEqual({ env: { ...ENV, FOREMAN_STORY: 'S-1' }, cwd: '/project', timeout: 300_000 });
   });
 
+  describe('manual steps on the last line of stdout', () => {
+    const STEP = 'Delete agent Acme_Order_Helper in acme-qa by hand in Setup > Agentforce Agents: the rollback deactivated it';
+    const out = (stdout) => ({ status: 0, stdout, stderr: '' });
+
+    it('returns them when the command ends its stdout with a JSON line holding manualSteps', async () => {
+      const stdout = `rolled S-1 back on acme-qa (qa)\n  by hand: ${STEP}\n${JSON.stringify({ ok: true, manualSteps: [STEP] })}\n`;
+      expect(await rollback.run(ctxFor(out(stdout)))).toEqual({ ok: true, command: CMD, manualSteps: [STEP] });
+    });
+
+    it('returns exactly { ok, command } for output that is not JSON, JSON without manualSteps, or an empty list', async () => {
+      for (const stdout of ['rolled back\n', '', '{"ok":true}\n', '{"ok":true,"manualSteps":[]}\n', '{"ok":true,"manualSteps":"a"}\n', '[1]\n', 'null\n', '{"manualSteps":[1,"",null]}\n']) {
+        expect(await rollback.run(ctxFor(out(stdout)))).toEqual({ ok: true, command: CMD });
+      }
+    });
+
+    it('reads only the last non-empty line', async () => {
+      const first = JSON.stringify({ ok: true, manualSteps: ['not this one'] });
+      expect(await rollback.run(ctxFor(out(`${first}\nrolled back\n\n`)))).toEqual({ ok: true, command: CMD });
+    });
+
+    it('redacts a secret-looking value inside a step and keeps only non-empty strings', async () => {
+      const stdout = `${JSON.stringify({ ok: true, manualSteps: ['Delete the key sk_live_0123456789abcdef by hand', '', 7, 'Second step'] })}\n`;
+      const r = await rollback.run(ctxFor(out(stdout)));
+      expect(r.manualSteps).toHaveLength(2);
+      expect(r.manualSteps[0]).not.toContain('0123456789abcdef');
+      expect(r.manualSteps[1]).toBe('Second step');
+    });
+
+    it('parses the line before redacting, so a secret at the end of a step cannot break the JSON', async () => {
+      const stdout = `${JSON.stringify({ ok: true, manualSteps: ['Second step', 'Rotate ACME_TOKEN=s3cr3tvalue'] })}\n`;
+      const r = await rollback.run(ctxFor(out(stdout)));
+      expect(r).toEqual({ ok: true, command: CMD, manualSteps: ['Second step', 'Rotate ACME_TOKEN=•••'] });
+      expect(JSON.stringify(r)).not.toContain('s3cr3tvalue');
+    });
+
+    it('cuts the list to 20 steps and each step to 300 characters', async () => {
+      const steps = Array.from({ length: 25 }, (_, i) => `Step ${i} ${'x'.repeat(400)}`);
+      const r = await rollback.run(ctxFor(out(`${JSON.stringify({ ok: true, manualSteps: steps })}\n`)));
+      expect(r.manualSteps).toHaveLength(20);
+      expect(r.manualSteps[0]).toHaveLength(300);
+      expect(r.manualSteps[19].startsWith('Step 19 ')).toBe(true);
+    });
+
+    it('returns no steps for a failed command, even with a JSON line', async () => {
+      const r = await rollback.run(ctxFor({ status: 1, stdout: `${JSON.stringify({ ok: false, manualSteps: ['a'] })}\n`, stderr: '' }));
+      expect(r).not.toHaveProperty('manualSteps');
+      expect(r.ok).toBe(false);
+    });
+  });
+
   it('follows timeoutSeconds', async () => {
     const ctx = ctxFor(0, { timeoutSeconds: 60 });
     await rollback.run(ctx);

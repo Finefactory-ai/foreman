@@ -450,6 +450,35 @@ describe('foreman sf', () => {
       expect(slot.lastBeat).toBe('2026-10-24T12:00:20.000Z');
     });
 
+    it('prints one by hand line per manual step before the JSON line, and exits 0', async () => {
+      seed(['qa']);
+      const JOB = '0Af000000000005AAA';
+      // sgd writes a delta of one class and a Flow delete, which the rollback leaves to the owner.
+      const sgd = (line) => {
+        const out = /--output-dir (\S+)/.exec(line)[1];
+        fs.mkdirSync(path.join(out, 'package'), { recursive: true });
+        fs.mkdirSync(path.join(out, 'destructiveChanges'), { recursive: true });
+        fs.writeFileSync(path.join(out, 'package', 'package.xml'), '<Package><types><members>AcmeService</members><name>ApexClass</name></types><version>62.0</version></Package>');
+        fs.writeFileSync(path.join(out, 'destructiveChanges', 'destructiveChanges.xml'), '<Package><types><members>AcmeFlow</members><name>Flow</name></types><version>62.0</version></Package>');
+        return sfOk({ success: true });
+      };
+      const sh = fakeSh([
+        ['git rev-parse HEAD', `${'b'.repeat(40)}\n`],
+        [/^sf plugins --core/, sfRaw(acmePlugins({ 'sfdx-git-delta': '6.45.1' }))],
+        [/FROM Organization --target-org acme-qa/, orgRecord(ACME_QA_ID)],
+        [/^sf sgd source delta /, sgd],
+        [/^sf project deploy start /, sfOk({ id: JOB, status: 'Queued' })],
+        [/^sf project deploy report /, sfOk({ id: JOB, status: 'Succeeded', details: {} })],
+      ]);
+      const r = await run(['rollback', 'S-1'], command(sh), { FOREMAN_SF_HOME: path.join(dir, 'sf-home') });
+      expect(r.code).toBe(0);
+      const lines = r.out.trim().split('\n');
+      expect(lines).toHaveLength(3);
+      expect(lines[0]).toContain('1 manual step(s) left');
+      expect(lines[1]).toBe('  by hand: Delete Flow AcmeFlow by hand in acme-qa; the rollback never deletes Flows');
+      expect(r.last).toMatchObject({ ok: true, manualSteps: ['Delete Flow AcmeFlow by hand in acme-qa; the rollback never deletes Flows'] });
+    });
+
     it('refuses a project that does not use the salesforce pack', async () => {
       fs.writeFileSync(path.join(root, 'foreman.config.json'), JSON.stringify({ version: 1, project: { name: 'Acme' } }));
       const r = await run(['rollback', 'S-1'], command(fakeSh([])));

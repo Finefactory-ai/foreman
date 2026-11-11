@@ -2,7 +2,8 @@
 // envAdapterContract({ name, make }) to register them. `make()` builds a fresh adapter. Its
 // prepare(n, path) may answer a state now or a promise of one, an optional repair() may
 // answer a boolean now or a promise of one, and an optional sweep() may answer { warnings }
-// now or a promise of it (engine/slot-prepare.mjs).
+// now or a promise of it (engine/slot-prepare.mjs). Its sweep may also be called once at a stop,
+// as sweep({ stopping: true, limitMs }): it should then finish, or give up, within limitMs.
 
 import { describe, expect, it } from 'vitest';
 

@@ -26,7 +26,9 @@
 //
 // Facts for later steps: sfDelta { dir, from, to, manifest, postDestructive, deletes, sha256 }
 // and manualSteps (always an array). sgdProblem (step 1) and buildDelta (steps 3 and 5, without
-// the decision) are exported for rollback.mjs. A message names only metadata types and members, plus
+// the decision) are exported for rollback.mjs. buildDelta also takes `hold`, a list of
+// { type, member } that a delete must not deploy (the rollback holds what a published agent
+// still uses); the step itself passes none. A message names only metadata types and members, plus
 // sf's own error message; never an sf result.
 
 import { createHash } from 'node:crypto';
@@ -98,10 +100,12 @@ export function sgdProblem(iso) {
 
 // Runs sgd from `from` to `to` into `dir`, emptied first, in `cwd` when given, and reads what
 // it wrote: Flow and RecordType deletes go into byHand, the rest into deletes (sorted by type,
-// then member), which are written to postDestructiveChanges.xml. Returns { ok: true, manifest,
-// postDestructive, deletes, byHand, sha256 } (sha256 is that of destructiveChanges.xml), or
-// { ok: false, reason }. rollback.mjs builds its reverse delta with it.
-export function buildDelta(iso, { from, to, dir, cwd }) {
+// then member), which are written to postDestructiveChanges.xml. A delete that equals a `hold`
+// item (same type and member, not Flow or RecordType) goes into held, sorted the same way, and
+// not into deletes or the file. Returns { ok: true, manifest, postDestructive, deletes, byHand,
+// held, sha256 } (sha256 is that of destructiveChanges.xml, held or not), or { ok: false,
+// reason }. rollback.mjs builds its reverse delta with it.
+export function buildDelta(iso, { from, to, dir, cwd, hold = [] }) {
   fs.rmSync(dir, { recursive: true, force: true });
   fs.mkdirSync(dir, { recursive: true });
   const delta = runSf(iso, ['sgd', 'source', 'delta', '--from', from, '--to', to, '--output-dir', dir, '--generate-delta'], { timeoutMs: SGD_TIMEOUT_MS, ...(cwd ? { cwd } : {}) });
@@ -113,12 +117,19 @@ export function buildDelta(iso, { from, to, dir, cwd }) {
 
   const byHand = [];
   const deletes = [];
+  const held = [];
+  const holding = (type, member) => hold.find((h) => h?.type === type && h?.member === member);
   for (const [type, members] of Object.entries(removed)) {
-    for (const member of members) (BY_HAND.includes(type) ? byHand : deletes).push({ type, member });
+    for (const member of members) {
+      if (BY_HAND.includes(type)) byHand.push({ type, member });
+      else if (holding(type, member)) held.push({ ...holding(type, member) });
+      else deletes.push({ type, member });
+    }
   }
   const byTypeThenMember = (a, b) => compare(a.type, b.type) || compare(a.member, b.member);
   byHand.sort(byTypeThenMember);
   deletes.sort(byTypeThenMember);
+  held.sort(byTypeThenMember);
 
   const postDestructive = join(dir, 'postDestructiveChanges.xml');
   fs.writeFileSync(postDestructive, packageXml(deletes, versionOf(destructive)));
@@ -130,7 +141,7 @@ export function buildDelta(iso, { from, to, dir, cwd }) {
     return { ok: false, reason: 'sfdx-git-delta wrote no destructiveChanges.xml' };
   }
   const sha256 = createHash('sha256').update(bytes).digest('hex');
-  return { ok: true, manifest, postDestructive, deletes, byHand, sha256 };
+  return { ok: true, manifest, postDestructive, deletes, byHand, held, sha256 };
 }
 
 export default {

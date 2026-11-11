@@ -806,6 +806,19 @@ describe('the waiting list in the snapshot', () => {
     expect(snap.waiting.checkedAt).toBe(at(2).toISOString());
   });
 
+  it('a HALT written with the ship state object shows the step reason, not the object', async () => {
+    const root = project({ 'ABC-1': note('ABC-1', 'Build the page') });
+    const state = join(dir, 'state');
+    mkdirSync(state, { recursive: true });
+    const R = 'qa (acme-qa) was rolled back with `foreman sf rollback "$FOREMAN_STORY"`. ./watch.sh reported a problem after the deploy: 3 new errors';
+    const result = { sfDelta: { dir: '/tmp/acme-delta', from: 'a'.repeat(40), to: 'b'.repeat(40), components: Array.from({ length: 12 }, (_, i) => `classes/AcmeService${i}.cls`) }, stage: 'watch', reason: R, rolledBack: true };
+    writeFileSync(join(state, 'HALT'), `2026-11-10T11:27:00.000Z ${JSON.stringify(result)}\n`);
+    const all = await ownerWaiting(state, at(2), { root, slots: 3 });
+    const halt = all.items.find((i) => i.kind === 'halt');
+    expect(halt.why).toBe(R);
+    expect(halt.why).not.toContain('{');
+  });
+
   it('is null with no decisions source and nothing waiting', async () => {
     const root = project({ 'ABC-1': note('ABC-1', 'Build the page') });
     expect((await snapshot(join(dir, 'state'), at(2), null, { root, slots: 3 })).waiting).toBeNull();

@@ -34,6 +34,16 @@
 // runs it every minute, busy slots or not, while paused or halted too (supervisor.mjs,
 // slot-prepare.mjs runEnvSweep).
 //
+// sweep({ stopping: true, limitMs }) is the supervisor's one call when the run stops. It deletes
+// the org of every story that is in no slot and holds no claim (scratch-orgs.mjs claimedStories:
+// an interrupted, held, parked or queued story, or one the owner holds, keeps its claim and so its
+// org), with no grace. All its sf calls share one deadline of limitMs from the start (60 s when
+// limitMs is not a positive integer); each call is cut to the time left, and an org reached with
+// under a second left is not tried. For every org it did not delete, a warning gives the command
+// to run by hand through Foreman's own sf wrapper (alias and job ID, never a username; the home
+// path is shell-quoted when it holds characters unsafe in a shell). It waits
+// for a periodic sweep already running, and never rejects.
+//
 // Records live in scratch-orgs.mjs. Every sf call runs through the isolated sf home
 // (isolation.mjs), where the Dev Hub is signed in. A message names only aliases, story ids,
 // the Dev Hub and org IDs; sf's own words go through a scrub that turns every word holding an
@@ -44,8 +54,8 @@ import { join } from 'node:path';
 import fs from 'node:fs';
 import { defaultSh } from '../../../lib/engine/worktree.mjs';
 import { layout } from '../config.mjs';
-import { isolatedSh, orgQuery, sfHome } from '../isolation.mjs';
-import { readScratchOrgs, removeScratchOrg, scratchAlias, storiesInSlots, writeScratchOrg } from '../scratch-orgs.mjs';
+import { binDir, isolatedSh, orgQuery, sfHome } from '../isolation.mjs';
+import { claimedStories, readScratchOrgs, removeScratchOrg, scratchAlias, storiesInSlots, writeScratchOrg } from '../scratch-orgs.mjs';
 import { runSf, stopsRetry } from '../sf.mjs';
 
 export const requires = { env: [], tools: ['sf'] };
@@ -57,6 +67,9 @@ const CREATE_LIMIT_MS = 20 * 60_000;
 const SWEEP_GRACE_MS = 5 * 60_000;
 const RESUME_TIMEOUT_MS = 600_000;
 const DELETE_TIMEOUT_MS = 120_000;
+const STOP_LIMIT_MS = 60_000;
+const MIN_CALL_MS = 1_000;
+const NO_TIME = 'no time was left before the stop';
 const IN_PROGRESS = 'StillInProgressError';
 const SIGNED_OUT = /No authori[sz]ation information found/i;
 const STILL_MAKING = 'its org is still being made';
@@ -66,6 +79,8 @@ const isText = (v) => typeof v === 'string' && v.length > 0;
 const id15 = (v) => (typeof v === 'string' ? v.slice(0, 15) : '');
 // Every word holding an @ (a username, or an auth file named after one) becomes "an org".
 const scrub = (text) => String(text ?? '').replace(/\S+@\S+/g, 'an org');
+// A word for a shell: plain when it holds only safe characters, else single-quoted.
+const shellWord = (s) => (/^[A-Za-z0-9_@%+=:,.\/-]+$/.test(String(s)) ? String(s) : `'${String(s).replaceAll("'", "'\\''")}'`);
 const sfMessage = (r) => scrub(r?.error?.message ?? 'no answer');
 
 // The org ID and username a successful `org resume scratch` gives: its own, then its
@@ -135,10 +150,21 @@ export function create(options = {}, ctx = {}) {
   // `resume` is false: a resume that signs the org in is recorded before the delete, so a
   // failed delete leaves it allow-listed by org ID rather than a stray. An org still being made,
   // or a login stop, keeps the record; a job that failed or is gone goes on to the delete.
-  const deleteOrg = (given, { resume = true } = {}) => {
+  //
+  // With a `deadline` (ms on the clock), each sf call is cut to the time left, and one reached
+  // with under MIN_CALL_MS left is not made: NO_TIME, and the record stays.
+  const deleteOrg = (given, { resume = true, deadline = null } = {}) => {
     let record = given;
+    // The most an sf call may take: its own limit, or the time left before the deadline.
+    const budget = (limit) => {
+      if (deadline === null) return limit;
+      const left = deadline - now();
+      return left < MIN_CALL_MS ? null : Math.min(limit, Math.floor(left));
+    };
     if (resume && isText(record.jobId) && !isText(record.orgId)) {
-      const r = runSf(iso, ['org', 'resume', 'scratch', '--job-id', record.jobId, '--wait', '0'], { timeoutMs: RESUME_TIMEOUT_MS });
+      const timeoutMs = budget(RESUME_TIMEOUT_MS);
+      if (timeoutMs === null) return NO_TIME;
+      const r = runSf(iso, ['org', 'resume', 'scratch', '--job-id', record.jobId, '--wait', '0'], { timeoutMs });
       if (r.ok) {
         record = { ...record, ...signedIn(r.result, record) };
         writeScratchOrg(stateDir, record);
@@ -147,7 +173,9 @@ export function create(options = {}, ctx = {}) {
     }
     const target = isText(record.username) ? record.username : isText(record.orgId) ? record.alias : null;
     if (target) {
-      const r = runSf(iso, ['org', 'delete', 'scratch', '--target-org', target, '--no-prompt'], { timeoutMs: DELETE_TIMEOUT_MS });
+      const timeoutMs = budget(DELETE_TIMEOUT_MS);
+      if (timeoutMs === null) return NO_TIME;
+      const r = runSf(iso, ['org', 'delete', 'scratch', '--target-org', target, '--no-prompt'], { timeoutMs });
       const gone = r.ok || r.error?.name === 'NamedOrgNotFoundError' || SIGNED_OUT.test(String(r.error?.message ?? ''));
       if (!gone) return sfMessage(r);
     }
@@ -187,8 +215,45 @@ export function create(options = {}, ctx = {}) {
     return { deleted, warnings };
   };
 
+  // The command, as one string, that deletes the record's org by hand through Foreman's own sf
+  // wrapper. An alias and a job ID, never a username. Not the `HOME=... SF_USE_GENERIC_UNIX_KEYCHAIN=true
+  // sf` form: redact turns any `...KEY...=value` into `=•••`, and every warning is redacted.
+  // The home path and the wrapper path are shell-quoted when they hold a character unsafe in a shell.
+  const byHand = (record) => {
+    const sf = `FOREMAN_SF_HOME=${shellWord(iso.sfHome)} ${shellWord(join(binDir(iso.sfHome), 'sf'))}`;
+    const del = `${sf} org delete scratch --target-org ${shellWord(record.alias)} --no-prompt`;
+    if (isText(record.jobId) && !isText(record.orgId)) return `${sf} org resume scratch --job-id ${shellWord(record.jobId)} --wait 30, then ${del}`;
+    return del;
+  };
+
+  // The sweep at a stop: no grace, but only a story in no slot and with no claim, and every sf
+  // call inside one deadline. A story left alone is one a run resumes, or the owner holds.
+  const sweepClosedAtStop = (deadline) => {
+    const deleted = [];
+    const warnings = [];
+    for (const record of readScratchOrgs(stateDir)) {
+      // Read again for each record, as sweepClosed does.
+      if (storiesInSlots(stateDir).has(record.story) || claimedStories(stateDir).has(record.story)) continue;
+      const why = deleteOrg(record, { deadline });
+      if (why === null) {
+        missingSince.delete(record.story);
+        deleted.push(record.story);
+        continue;
+      }
+      // The hint comes before the reason, so a long sf message is what gets cut.
+      warnings.push(`could not delete the scratch org ${record.alias} of ${record.story} at the stop; delete it by hand with ${byHand(record)} (${why})`);
+    }
+    return { deleted, warnings };
+  };
+
   let sweeping = null;
-  const sweep = () => {
+  const sweep = (opts) => {
+    if (opts?.stopping === true) {
+      const limit = Number.isInteger(opts.limitMs) && opts.limitMs > 0 ? opts.limitMs : STOP_LIMIT_MS;
+      return (sweeping ?? Promise.resolve())
+        .then(() => sweepClosedAtStop(now() + limit))
+        .catch((err) => ({ deleted: [], warnings: [`the scratch org sweep at the stop failed: ${scrub(err?.message ?? err)}`] }));
+    }
     if (sweeping) return sweeping;
     sweeping = Promise.resolve()
       .then(() => sweepClosed({ graceMs: SWEEP_GRACE_MS }))

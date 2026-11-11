@@ -94,7 +94,12 @@ const MERGE_RULES = [
 
 // The start answers `start`; the report answers each item of `reports` in turn, then the last.
 // A report item may be a function of the line, called when the report runs.
-function ctxFor({ salesforce = LAYOUT_B, start = startOk(), reports = [sfOk(report('Succeeded'))], facts = sfDeltaFacts(), git = MERGE_RULES, ...rest } = {}) {
+// The merge step's sha: the head of the branch the pull request merged into, which every deploy
+// checks out. M2 is another one.
+const STAGE_SHA = '1'.repeat(40);
+const M2 = '2'.repeat(40);
+
+function ctxFor({ salesforce = LAYOUT_B, start = startOk(), reports = [sfOk(report('Succeeded'))], facts = sfDeltaFacts(), git = MERGE_RULES, sha = STAGE_SHA, ...rest } = {}) {
   let n = 0;
   const ctx = fakeCtx({
     config: { pack: 'salesforce', salesforce, slots: 1 },
@@ -112,8 +117,14 @@ function ctxFor({ salesforce = LAYOUT_B, start = startOk(), reports = [sfOk(repo
     ...rest,
   });
   if (facts) ctx.sfDelta = facts;
+  if (sha !== null) ctx.sha = sha;
   return ctx;
 }
+
+// The folder `git worktree add --detach <tree> <sha>` was given.
+const addLine = (ctx) => ctx.sh.calls.find((l) => l.startsWith('git worktree add --detach'));
+const treeOf = (ctx) => addLine(ctx)?.split(' ')[4];
+const gitCalls = (ctx, what) => ctx.sh.calls.filter((l) => l.startsWith(`git ${what}`));
 
 const sfLines = (ctx) => ctx.sh.calls.filter((l) => l.startsWith('sf '));
 const startLine = (ctx) => ctx.sh.calls.find((l) => l.startsWith('sf project deploy start'));
@@ -137,9 +148,9 @@ const make = (opts) => {
 };
 
 describe('sfDeploy(stage)', () => {
-  it('is the step that deploys to that stage, needs sf, halts and deploys, one module per name', () => {
+  it('is the step that deploys to that stage, needs sf and git, halts and deploys, one module per name', () => {
     const qa = sfDeploy('qa');
-    expect(qa).toMatchObject({ name: 'sf-deploy-qa', label: 'deploying the Salesforce delta to qa', needs: ['sf'], halts: true, deploys: true });
+    expect(qa).toMatchObject({ name: 'sf-deploy-qa', label: 'deploying the Salesforce delta to qa', needs: ['sf', 'git'], halts: true, deploys: true });
     expect(sfDeploy('qa')).toBe(qa);
     expect(sfDeploy('uat')).not.toBe(qa);
     expect(sfDeploy('uat').name).toBe('sf-deploy-uat');
@@ -151,7 +162,7 @@ describe('sfDeploy(stage)', () => {
     expect(sfDeploy('uat', { later: true })).toBe(later);
     expect(sfDeploy('uat')).not.toBe(later);
     expect(sfDeploy('uat')).not.toHaveProperty('noRollback');
-    expect(sfDeploy('qa').needs).toEqual(['sf']);
+    expect(sfDeploy('qa').needs).toEqual(['sf', 'git']);
   });
 
   describe('a later stage on its own branch', () => {
@@ -160,10 +171,10 @@ describe('sfDeploy(stage)', () => {
 
     it('merges the story branch into uat before it deploys, and records the merge as the commit', async () => {
       const qa = make();
-      qa.sha = 'm1';
+      qa.sha = STAGE_SHA;
       await sfDeploy('qa').run(qa);
       const ctx = make();
-      ctx.sha = 'm1';
+      ctx.sha = STAGE_SHA;
       const r = await sfDeploy('uat', { later: true }).run(ctx);
       expect(r).toMatchObject({ ok: true, sha: UAT_MERGE, shaBranch: 'uat', sfDeploys: { uat: { org: 'acme-uat', jobId: JOB } } });
       expect(mergeAt(ctx)).toBeGreaterThan(-1);
@@ -172,7 +183,7 @@ describe('sfDeploy(stage)', () => {
       expect(readDeployed(state, 'uat').commit).toBe(UAT_MERGE);
       const rec = readRelease(state, 'S-1');
       expect(rec.reached).toEqual(['qa', 'uat']);
-      expect(rec.first).toMatchObject({ stage: 'qa', merge: 'm1' });
+      expect(rec.first).toMatchObject({ stage: 'qa', merge: STAGE_SHA });
     });
 
     it('a merge that fails is code 5 and starts no deploy', async () => {
@@ -198,7 +209,7 @@ describe('sfDeploy(stage)', () => {
     it('an empty delta still merges, and skips the deploy', async () => {
       writeDeployed(state, { stage: 'uat', org: 'acme-uat', orgId: ACME_UAT_ID, jobId: OTHER_JOB, story: 'S-0', commit: 'u0', at: '2026-10-15T11:00:00.000Z' });
       const ctx = make({ facts: sfDeltaFacts({ types: {} }) });
-      ctx.sha = 'm1';
+      ctx.sha = STAGE_SHA;
       const r = await sfDeploy('uat', { later: true }).run(ctx);
       expect(r).toEqual({ ok: true, sha: UAT_MERGE, shaBranch: 'uat', sfDeploys: { uat: { org: 'acme-uat', skipped: true } } });
       expect(mergeAt(ctx)).toBeGreaterThan(-1);
@@ -207,15 +218,170 @@ describe('sfDeploy(stage)', () => {
     });
   });
 
-  it('a later stage that follows the branch before it does no merge and records ctx.sha', async () => {
+  it('a later stage that follows the branch before it does no merge, deploys a checkout of ctx.sha and records it', async () => {
     const ctx = make({ salesforce: { ...LAYOUT_B, stages: [{ name: 'qa', org: 'acme-qa', branch: 'qa' }, { name: 'uat', org: 'acme-uat' }] } });
-    ctx.sha = 'm1';
+    ctx.sha = STAGE_SHA;
     const r = await sfDeploy('uat', { later: true }).run(ctx);
     expect(r.ok).toBe(true);
     expect(r).not.toHaveProperty('sha');
     expect(r).not.toHaveProperty('shaBranch');
-    expect(ctx.sh.calls.some((l) => l.startsWith('git '))).toBe(false);
-    expect(readDeployed(state, 'uat').commit).toBe('m1');
+    expect(ctx.sh.calls.some((l) => l.startsWith('git merge') || l.startsWith('git fetch'))).toBe(false);
+    expect(ctx.sh.calls.filter((l) => l.startsWith('git '))).toEqual([`git worktree add --detach ${treeOf(ctx)} ${STAGE_SHA}`, `git worktree remove --force ${treeOf(ctx)}`]);
+    expect(readDeployed(state, 'uat').commit).toBe(STAGE_SHA);
+  });
+
+  describe('the checkout the deploy starts in', () => {
+    const at = (ctx, prefix) => ctx.sh.calls.findIndex((l) => l.startsWith(prefix));
+
+    it('starts sf in a checkout of the stage commit, made before the start and removed after it', async () => {
+      const ctx = make();
+      const r = await sfDeploy('qa').run(ctx);
+      expect(r.ok).toBe(true);
+      const tree = treeOf(ctx);
+      expect(tree).toBeTypeOf('string');
+      expect(addLine(ctx)).toBe(`git worktree add --detach ${tree} ${STAGE_SHA}`);
+      const add = at(ctx, 'git worktree add');
+      const start = at(ctx, 'sf project deploy start');
+      const remove = at(ctx, 'git worktree remove');
+      expect(add).toBeGreaterThan(-1);
+      expect(start).toBeGreaterThan(add);
+      expect(remove).toBeGreaterThan(start);
+      expect(ctx.sh.calls[remove]).toBe(`git worktree remove --force ${tree}`);
+      expect(ctx.sh.opts[add].cwd).toBe('/acme/repo');
+      expect(ctx.sh.opts[start].cwd).toBe(tree);
+      expect(ctx.sh.opts[remove].cwd).toBe('/acme/repo');
+      // The report is not read from the checkout, and the folder is gone.
+      expect(ctx.sh.opts[at(ctx, 'sf project deploy report')].cwd).toBeUndefined();
+      expect(remove).toBeLessThan(at(ctx, 'sf project deploy report'));
+      expect(fs.existsSync(path.dirname(tree))).toBe(false);
+      expect(gitCalls(ctx, 'worktree prune')).toEqual([]);
+    });
+
+    it('prunes git\'s record of the checkout when the remove fails, after the folder is gone, and changes nothing else', async () => {
+      let goneAtPrune = null;
+      const ctx = make({
+        git: [
+          ['git worktree remove', { status: 128, stderr: 'fatal: simulated' }],
+          ['git worktree prune', () => {
+            goneAtPrune = !fs.existsSync(path.dirname(treeOf(ctx)));
+            return 0;
+          }],
+          ...MERGE_RULES,
+        ],
+      });
+      const r = await sfDeploy('qa').run(ctx);
+      expect(r).toEqual({ ok: true, sfDeploys: { qa: { org: 'acme-qa', jobId: JOB, components: expect.anything(), tests: expect.anything(), resumed: false } } });
+      const tree = treeOf(ctx);
+      expect(gitCalls(ctx, 'worktree')).toEqual([`git worktree add --detach ${tree} ${STAGE_SHA}`, `git worktree remove --force ${tree}`, 'git worktree prune']);
+      expect(ctx.sh.opts[at(ctx, 'git worktree prune')].cwd).toBe('/acme/repo');
+      expect(goneAtPrune).toBe(true);
+      expect(fs.existsSync(path.dirname(tree))).toBe(false);
+    });
+
+    it('removes the checkout when the start fails, and the reason is the same', async () => {
+      const ctx = make({ start: sfError('NoAuthInfoFound', 'No authorization information found for acme-qa.') });
+      const r = await sfDeploy('qa').run(ctx);
+      expect(r.reason).toBe('The deploy to acme-qa (qa) never started: No authorization information found for acme-qa.');
+      expect(gitCalls(ctx, 'worktree remove')).toEqual([`git worktree remove --force ${treeOf(ctx)}`]);
+      expect(fs.existsSync(path.dirname(treeOf(ctx)))).toBe(false);
+    });
+
+    it('names the commit and the folder when sf finds no source, and still removes the checkout', async () => {
+      const ctx = make({ start: sfError('DeployFailed', 'No source-backed components present in the package.') });
+      const r = await sfDeploy('qa').run(ctx);
+      expect(r.reason).toBe(`The deploy to acme-qa (qa) never started: No source-backed components present in the package. (sf looked in ${treeOf(ctx)}, a checkout of ${STAGE_SHA}, the qa commit)`);
+      expect(gitCalls(ctx, 'worktree remove')).toHaveLength(1);
+      expect(fs.existsSync(path.dirname(treeOf(ctx)))).toBe(false);
+    });
+
+    it('a checkout that fails is code 5 with no start and no record, and cleans up', async () => {
+      const ctx = make({ git: [['git worktree add', { status: 128, stderr: 'fatal: invalid reference: x' }], ...MERGE_RULES] });
+      const r = await sfDeploy('qa').run(ctx);
+      expect(r).toMatchObject({ ok: false, code: 5, stage: 'sf-deploy-qa' });
+      expect(r.reason).toBe(`The deploy to acme-qa (qa) never started: could not check out ${STAGE_SHA} (the qa commit) to deploy from: fatal: invalid reference: x`);
+      expect(sfLines(ctx)).toEqual([]);
+      expect(fs.existsSync(recordFile())).toBe(false);
+      expect(gitCalls(ctx, 'worktree remove')).toEqual([`git worktree remove --force ${treeOf(ctx)}`]);
+      expect(fs.existsSync(path.dirname(treeOf(ctx)))).toBe(false);
+    });
+
+    it('removes the checkout when something throws after the start', async () => {
+      const ctx = make();
+      const clock = ctx.now;
+      // The job record is written with ctx.now() right after the start, inside the checkout's scope.
+      ctx.now = () => {
+        if (addLine(ctx)) throw new Error('the clock broke');
+        return clock();
+      };
+      await expect(sfDeploy('qa').run(ctx)).rejects.toThrow('the clock broke');
+      expect(gitCalls(ctx, 'worktree remove')).toEqual([`git worktree remove --force ${treeOf(ctx)}`]);
+      expect(fs.existsSync(path.dirname(treeOf(ctx)))).toBe(false);
+    });
+
+    it.each([['no commit', null], ['a commit that is not a sha', 'm1']])('with %s is code 5 before any git or sf call, and no record', async (_, sha) => {
+      const ctx = make({ sha });
+      const r = await sfDeploy('qa').run(ctx);
+      expect(r).toMatchObject({ ok: false, code: 5, stage: 'sf-deploy-qa' });
+      expect(r.reason).toBe('The deploy to acme-qa (qa) never started: the qa commit is not known, so there is nothing to check out and deploy.');
+      expect(gitCalls(ctx, 'worktree')).toEqual([]);
+      expect(sfLines(ctx)).toEqual([]);
+      expect(fs.existsSync(recordFile())).toBe(false);
+      expect(readDeployed(state, 'qa')).toBeNull();
+      expect(readRelease(state, 'S-1')).toMatchObject({ reached: ['qa'], first: null });
+    });
+
+    it('an empty delta with no commit is still skipped, with no checkout', async () => {
+      const ctx = make({ sha: null, facts: sfDeltaFacts({ types: {} }) });
+      const r = await sfDeploy('qa').run(ctx);
+      expect(r).toEqual({ ok: true, sfDeploys: { qa: { org: 'acme-qa', skipped: true } } });
+      expect(ctx.sh.calls.filter((l) => l.startsWith('git '))).toEqual([]);
+    });
+
+    it('a resumed job makes no checkout', async () => {
+      writeDeployJob(state, { story: 'S-1', stage: 'qa', org: 'acme-qa', orgId: ACME_QA_ID, jobId: JOB, to: 'bbb', startedAt: '2026-10-15T11:00:00.000Z' });
+      const ctx = make();
+      const r = await sfDeploy('qa').run(ctx);
+      expect(r).toMatchObject({ ok: true, sfDeploys: { qa: { resumed: true } } });
+      expect(gitCalls(ctx, 'worktree')).toEqual([]);
+    });
+
+    it('a refused resume makes one checkout for its new deploy, and removes it', async () => {
+      writeDeployJob(state, { story: 'S-1', stage: 'qa', org: 'acme-qa', orgId: ACME_QA_ID, jobId: OTHER_JOB, to: 'bbb', startedAt: '2026-10-15T11:00:00.000Z' });
+      const ctx = make({ reports: [sfOk({ ...report('Succeeded'), id: OTHER_JOB, checkOnly: true }), sfOk(report('Succeeded'))] });
+      const r = await sfDeploy('qa').run(ctx);
+      expect(r).toMatchObject({ ok: true, sfDeploys: { qa: { jobId: JOB, resumed: false } } });
+      expect(gitCalls(ctx, 'worktree add')).toHaveLength(1);
+      expect(gitCalls(ctx, 'worktree remove')).toHaveLength(1);
+      expect(ctx.sh.opts[at(ctx, 'sf project deploy start')].cwd).toBe(treeOf(ctx));
+    });
+
+    it('models the bug: a start that finds source only in the checkout succeeds', async () => {
+      const ctx = make({
+        start: () => {
+          const line = ctx.sh.opts.at(-1);
+          return line.cwd === treeOf(ctx) ? startOk() : sfError('DeployFailed', 'No source-backed components present in the package.');
+        },
+      });
+      const r = await sfDeploy('qa').run(ctx);
+      expect(r.ok).toBe(true);
+    });
+
+    it('a later stage on its own branch deploys a checkout of the merge commit, made after the merge', async () => {
+      const qa = make();
+      await sfDeploy('qa').run(qa);
+      const ctx = make();
+      const r = await sfDeploy('uat', { later: true }).run(ctx);
+      expect(r.ok).toBe(true);
+      // The first worktree is the stage merge's own, of the uat branch; the second is the deploy's.
+      const adds = gitCalls(ctx, 'worktree add');
+      expect(adds).toHaveLength(2);
+      const tree = adds[1].split(' ')[4];
+      expect(adds[1]).toBe(`git worktree add --detach ${tree} ${UAT_MERGE}`);
+      const mergeAt = ctx.sh.calls.findIndex((l) => l.startsWith('git merge --no-ff'));
+      expect(mergeAt).toBeGreaterThan(-1);
+      expect(ctx.sh.calls.indexOf(adds[1])).toBeGreaterThan(mergeAt);
+      expect(ctx.sh.opts[at(ctx, 'sf project deploy start')].cwd).toBe(tree);
+    });
   });
 
   it('starts a real async deploy of the delta with testLevel.deploy', async () => {
@@ -399,7 +565,7 @@ describe('sfDeploy(stage)', () => {
     it('refuses to resume a validation job and starts a real deploy', async () => {
       stored();
       const ctx = make({ reports: [sfOk({ ...report('Succeeded'), id: OTHER_JOB, checkOnly: true }), sfOk({ ...report('Succeeded'), checkOnly: false })] });
-      ctx.sha = 'm1';
+      ctx.sha = STAGE_SHA;
       const r = await sfDeploy('qa').run(ctx);
       expect(startLine(ctx)).toBeDefined();
       expect(reportLines(ctx)).toEqual([reportLine(OTHER_JOB), reportLine(JOB)]);
@@ -538,36 +704,36 @@ describe('sfDeploy(stage)', () => {
   describe('the release records', () => {
     it('on Succeeded for stage 1 writes the stage record and the first deploy, with reached [qa]', async () => {
       const ctx = make();
-      ctx.sha = 'm1';
+      ctx.sha = STAGE_SHA;
       expect((await sfDeploy('qa').run(ctx)).ok).toBe(true);
-      expect(readDeployed(state, 'qa')).toEqual({ stage: 'qa', org: 'acme-qa', orgId: ACME_QA_ID, jobId: JOB, story: 'S-1', commit: 'm1', at: '2026-10-15T12:00:00.000Z' });
+      expect(readDeployed(state, 'qa')).toEqual({ stage: 'qa', org: 'acme-qa', orgId: ACME_QA_ID, jobId: JOB, story: 'S-1', commit: STAGE_SHA, at: '2026-10-15T12:00:00.000Z' });
       expect(readRelease(state, 'S-1')).toEqual({
         story: 'S-1',
         to: 'bbb',
         reached: ['qa'],
-        first: { stage: 'qa', org: 'acme-qa', orgId: ACME_QA_ID, branch: 'qa', merge: 'm1', method: 'merge', jobId: JOB, deployedAt: '2026-10-15T12:00:00.000Z' },
+        first: { stage: 'qa', org: 'acme-qa', orgId: ACME_QA_ID, branch: 'qa', merge: STAGE_SHA, method: 'merge', jobId: JOB, deployedAt: '2026-10-15T12:00:00.000Z' },
         rolledBack: null,
       });
     });
 
-    it('takes the branch and the merge method from ship.pr, and a null commit without the merge sha', async () => {
+    it('takes the branch and the merge method from ship.pr', async () => {
       const ctx = make({ salesforce: { ...LAYOUT_B, stages: [{ name: 'qa', org: 'acme-qa' }, { name: 'uat', org: 'acme-uat', branch: 'uat' }] } });
       ctx.config.ship = { ...ctx.config.ship, pr: { into: 'develop', mergeMethod: 'squash' } };
       await sfDeploy('qa').run(ctx);
-      expect(readDeployed(state, 'qa').commit).toBeNull();
-      expect(readRelease(state, 'S-1').first).toMatchObject({ branch: 'develop', merge: null, method: 'squash' });
+      expect(readDeployed(state, 'qa').commit).toBe(STAGE_SHA);
+      expect(readRelease(state, 'S-1').first).toMatchObject({ branch: 'develop', merge: STAGE_SHA, method: 'squash' });
     });
 
     it('a later stage marks reached but records no first deploy', async () => {
       const ctx = make();
-      ctx.sha = 'm1';
+      ctx.sha = STAGE_SHA;
       await sfDeploy('qa').run(ctx);
       const uat = make({ git: MERGE_RULES });
-      uat.sha = 'm2';
+      uat.sha = M2;
       expect((await sfDeploy('uat').run(uat)).ok).toBe(true);
       const rec = readRelease(state, 'S-1');
       expect(rec.reached).toEqual(['qa', 'uat']);
-      expect(rec.first).toMatchObject({ stage: 'qa', merge: 'm1' });
+      expect(rec.first).toMatchObject({ stage: 'qa', merge: STAGE_SHA });
       expect(readDeployed(state, 'uat')).toMatchObject({ stage: 'uat', org: 'acme-uat', commit: UAT_MERGE });
     });
 
@@ -581,16 +747,16 @@ describe('sfDeploy(stage)', () => {
     it('the skipped path moves the stage record to the new merge and keeps the org job, since no metadata changed', async () => {
       writeDeployed(state, { stage: 'qa', org: 'acme-qa', orgId: ACME_QA_ID, jobId: OTHER_JOB, story: 'S-0', commit: 'm0', at: '2026-10-15T11:00:00.000Z' });
       const ctx = make({ facts: sfDeltaFacts({ types: {} }) });
-      ctx.sha = 'm1';
+      ctx.sha = STAGE_SHA;
       expect((await sfDeploy('qa').run(ctx)).ok).toBe(true);
-      expect(readDeployed(state, 'qa')).toEqual({ stage: 'qa', org: 'acme-qa', orgId: ACME_QA_ID, jobId: OTHER_JOB, story: 'S-1', commit: 'm1', at: '2026-10-15T12:00:00.000Z' });
+      expect(readDeployed(state, 'qa')).toEqual({ stage: 'qa', org: 'acme-qa', orgId: ACME_QA_ID, jobId: OTHER_JOB, story: 'S-1', commit: STAGE_SHA, at: '2026-10-15T12:00:00.000Z' });
       expect(readRelease(state, 'S-1').first).toBeNull();
       expect(sfLines(ctx)).toEqual([]);
     });
 
     it('a failed deploy records no stage record and no first deploy', async () => {
       const ctx = make({ reports: [sfOk(report('Failed', FAILED))] });
-      ctx.sha = 'm1';
+      ctx.sha = STAGE_SHA;
       await sfDeploy('qa').run(ctx);
       expect(readDeployed(state, 'qa')).toBeNull();
       expect(readRelease(state, 'S-1')).toMatchObject({ reached: ['qa'], first: null });

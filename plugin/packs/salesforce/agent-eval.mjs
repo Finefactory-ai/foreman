@@ -26,34 +26,55 @@
 //                            Agentforce check in sf-verify, a ship step, and runShip (ship.mjs)
 //                            holds the ship lock from the first step to the last, so one release
 //                            writes the counter at a time.
-//   agentSession(...)        the session for one org: `sf org display` with SF_TEMP_SHOW_SECRETS
-//                            on that call alone (sf redacts the token without it), the org ID
-//                            and an https Salesforce instance URL checked, the user from
-//                            userinfo, and the JWT from /agentforce/bootstrap/nameduser. Both
-//                            GETs refuse redirects, so a 3xx fails as its HTTP status.
+//   agentSession(...)        the session for one org. Before the reveal it refuses a production
+//                            org (by alias or by org ID in salesforce.orgs) and checks the
+//                            alias's org ID from `sf org list`, which contacts no org. It reads
+//                            the session with `sf org display` through the real sf (findRealSf,
+//                            skipping the wrapper folder, which unsets SF_TEMP_SHOW_SECRETS when
+//                            a production org is marked), with the isolated HOME and
+//                            SF_TEMP_SHOW_SECRETS on that call alone (sf redacts the token
+//                            without it). That call names the org by alias and bypasses the
+//                            wrapper's prod-block. The isolated home is shared by story sessions,
+//                            so the alias could be re-pointed between the list and the display.
+//                            The backstop is the check after the display: the shown org ID must
+//                            be the stage's, and the token must be a session ID of that org.
+//                            Otherwise it is refused before any fetch. The token goes into no
+//                            reason, no file and no request, and stays in memory only. The org ID and an https Salesforce instance URL are
+//                            checked; a redacted or non-session-ID token is refused by name, with
+//                            no HTTP call. Then the user from userinfo, and the JWT from
+//                            /agentforce/bootstrap/nameduser. Both GETs refuse redirects: a 3xx
+//                            fails as its HTTP status and is never retried.
 //   runSuite(...)            POSTs the payload in batches of at most 5, in parallel, and merges
 //                            the results
 //   junit(api, spec, response, grade) the JUnit XML for the run
 //
-// No call is retried. A login-rate answer to the session calls cools the org down (sf.mjs). An
-// eval answer of 429, or one naming a rate or request limit, fails with no cool-down, so the
-// rollback can still reach the org.
+// Retries: userinfo, nameduser and each eval POST batch are retried once, after RETRY_WAIT_MS, on
+// a 403, a 5xx or a network failure. A POST that timed out is not retried: it may already have run
+// a suite, and the org allows only 10 in 10 hours. An answer showing login trouble, a 429 or a
+// body naming a limit is never retried. A login-rate answer to the session calls still cools the
+// org down (sf.mjs). An eval answer of 429, or one naming a rate or request limit, fails with no
+// cool-down, so the rollback can still reach the org.
 //
 // The session token and the JWT never appear in a reason, a written file or a log: the session
 // holds them in a closure, and JSON.stringify of it shows the org alone. A message names only
-// agents, case ids, check ids, aliases, HTTP statuses and sf's own error message.
+// agents, case ids, check ids, aliases, HTTP statuses, sf's own error message and the redacted
+// snippet of Salesforce's error answer (its error code and message, cut to 160 characters, with
+// the session token, the JWT and anything token-shaped blanked).
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { writeAtomic } from '../../lib/adapters/stories/overlay.mjs';
-import { isolatedSh } from './isolation.mjs';
+import { redact } from '../../lib/secrets/redact.mjs';
+import { allowList, binDir, findRealSf, isolatedSh, listOrgs, listedEntry } from './isolation.mjs';
 import { loginTrouble, recordCooldown, runSf } from './sf.mjs';
 
 export const EVAL_URL = 'https://api.salesforce.com/einstein/evaluation/v1/tests';
 export const EVAL_LIMIT = Object.freeze({ suites: 10, hours: 10 });
+export const RETRY_WAIT_MS = 10_000;
 
 const BATCH = 5;
+const SNIPPET_MAX = 160;
 const SESSION_TIMEOUT_MS = 60_000;
 const EVAL_TIMEOUT_MS = 600_000;
 const HOUR_MS = 3_600_000;
@@ -70,6 +91,7 @@ const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 const isText = (v) => typeof v === 'string' && v.length > 0;
 const msOf = (now) => (now instanceof Date ? now.getTime() : Number(now ?? Date.now()));
 const id15 = (v) => (typeof v === 'string' ? v.slice(0, 15) : '');
+const realSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export const evalSpecFile = (api) => `tests/${api}-eval.json`;
 
@@ -223,7 +245,7 @@ export function recordSuite(state, org, now) {
   writeAtomic(evalsFile(state), `${JSON.stringify({ orgs: kept }, null, 2)}\n`);
 }
 
-// One fetch with a time limit and no retry: { status, text } or { status: 0, error }.
+// One fetch with a time limit and no retry: { status, text } or { status: 0, error, text: '' }.
 async function request(fetch, url, init, ms) {
   try {
     const res = await fetch(url, { ...init, signal: AbortSignal.timeout(ms) });
@@ -235,8 +257,58 @@ async function request(fetch, url, init, ms) {
     }
     return { status: res.status, text };
   } catch (err) {
-    return { status: 0, error: err?.name === 'TimeoutError' ? 'timed out' : 'no answer' };
+    return { status: 0, error: err?.name === 'TimeoutError' ? 'timed out' : 'no answer', text: '' };
   }
+}
+
+// `request`, and when `retry(first)` says so, once more after RETRY_WAIT_MS: never more than two
+// calls. A retried answer carries retried: true.
+async function requestTwice(fetch, url, init, ms, { sleep, retry }) {
+  const first = await request(fetch, url, init, ms);
+  if (!retry(first)) return first;
+  await sleep(RETRY_WAIT_MS);
+  const second = await request(fetch, url, init, ms);
+  return { ...second, retried: true };
+}
+
+const transient = (a) => a.status === 0 || a.status === 403 || (a.status >= 500 && a.status <= 599);
+const sessionRetry = (a) => loginTrouble(a.text) === null && transient(a);
+const evalRetry = (a) => transient(a) && !(a.status === 0 && a.error === 'timed out') && a.status !== 429 && !LIMITED.test(a.text);
+
+const JWT_SHAPE = /[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g;
+const SESSION_ID = /00D[A-Za-z0-9]{12,15}(?:!|%21)[A-Za-z0-9._-]+/g;
+// Escape sequences and control characters (C0 but \t\n\v\f\r, DEL, C1): none belongs in a reason.
+const ANSI = /\x1b\[[0-?]*[ -\/]*[@-~]/g;
+const CONTROL = /[\x00-\x08\x0e-\x1f\x7f-\x9f]/g;
+const firstString = (o, keys) => keys.map((k) => o[k]).find((v) => typeof v === 'string' && v !== '');
+
+// The piece of Salesforce's answer a reason may quote: its error code and message, or its text
+// with tags stripped. On both paths escape and control characters are dropped and whitespace is
+// collapsed first, then it is redacted with `secrets` and the token shapes BEFORE the cut to
+// SNIPPET_MAX, so no part of a secret survives the cut. '' when there is nothing to show.
+export function answerSnippet(text, secrets = []) {
+  const raw = String(text ?? '');
+  const parsed = parse(raw);
+  const body = Array.isArray(parsed) ? parsed.find(isObject) : parsed;
+  let shown = '';
+  if (isObject(body)) {
+    const code = firstString(body, ['errorCode', 'error', 'code']);
+    const message = firstString(body, ['message', 'error_description']);
+    shown = [code, message].filter(Boolean).join(': ');
+  }
+  if (!shown) shown = raw.replace(/<[^>]*>/g, ' ');
+  shown = shown.replace(ANSI, '').replace(CONTROL, '').replace(/\s+/g, ' ').trim();
+  shown = redact(shown, { names: [], values: secrets }).replace(JWT_SHAPE, '•••').replace(SESSION_ID, '•••').replace(/"/g, "'");
+  return shown.length > SNIPPET_MAX ? `${shown.slice(0, SNIPPET_MAX)}…` : shown;
+}
+
+// The reason for a call that failed: what failed, its status, whether it was retried, and the
+// redacted snippet of the answer.
+function failed(what, a, secrets) {
+  const after = a.retried ? ', after one retry' : '';
+  if (a.status === 0) return `${what}: ${a.error}${after}`;
+  const snip = answerSnippet(a.text, secrets);
+  return `${what} (HTTP ${a.status}${after})${snip ? `: Salesforce answered "${snip}"` : ''}`;
 }
 
 const parse = (text) => {
@@ -259,36 +331,70 @@ function salesforceOrigin(value) {
 }
 
 // The session for `org`: { ok: true, session } or { ok: false, reason }. `sh` is the isolated sh
-// the check got, `rawSh` the sh under it.
-export async function agentSession({ sh, rawSh, env = process.env, org, orgId, fetch = globalThis.fetch, now = Date.now() }) {
+// the check got, `rawSh` the sh under it, `block` the config's salesforce block. Every refusal
+// comes before any fetch, and the first ones before any `org display`.
+export async function agentSession({ sh, rawSh, env = process.env, block, org, orgId, fetch = globalThis.fetch, now = Date.now(), sleep = realSleep }) {
   const no = (reason) => ({ ok: false, reason });
-  const secretSh = isolatedSh(rawSh, { ...env, SF_TEMP_SHOW_SECRETS: 'true' }, sh.sfHome, os.homedir());
+  const another = `${org} is signed in to another org than the one salesforce.orgs names`;
+  if (!isText(orgId)) return no(another);
+
+  const production = allowList(block).filter((o) => o.production === true);
+  const isProduction = (id) => production.some((o) => id15(o.orgId) === id15(id));
+  const productionReason = `${org} is a production org (salesforce.orgs marks it "production": true); Foreman never reads a production session`;
+  if (production.some((o) => o.alias === org) || isProduction(orgId)) return no(productionReason);
+
+  const home = sh?.sfHome;
+  if (!isText(home)) return no(`could not read the sign-in of ${org}: the isolated sf home is not known`);
+  const list = listOrgs(sh);
+  if (!list.ok) return no(`could not read the sign-in of ${org}: ${list.error.message}`);
+  const entry = listedEntry(list, org);
+  if (!entry) return no(`${org} is not signed in to the isolated sf home`);
+  if (isProduction(entry.orgId)) return no(productionReason);
+  if (id15(entry.orgId) !== id15(orgId)) return no(another);
+
+  // The wrapper unsets SF_TEMP_SHOW_SECRETS when a production org is marked, so the one call that
+  // needs the real session goes to the real sf, now that the org is known not to be production.
+  // The org-ID check after the display is the backstop if the alias moved since the list.
+  const wrapperDir = binDir(home);
+  const realSf = findRealSf(env, fs, wrapperDir);
+  if (!realSf) return no(`could not read the sign-in of ${org}: no Salesforce CLI on PATH besides Foreman's sf wrapper`);
+  const dirs = String(env.PATH ?? '').split(path.delimiter).filter((d) => d && path.resolve(d) !== path.resolve(wrapperDir));
+  const revealEnv = { ...env, SF_TEMP_SHOW_SECRETS: 'true', PATH: [path.dirname(realSf), ...dirs].join(path.delimiter) };
+  const secretSh = isolatedSh(rawSh, revealEnv, home, os.homedir());
   const shown = runSf(secretSh, ['org', 'display', '--target-org', org], { now });
   if (!shown.ok) return no(`could not read the sign-in of ${org}: ${shown.error.message}`);
   const info = isObject(shown.result) ? shown.result : {};
-  if (!isText(orgId) || id15(info.id) !== id15(orgId)) return no(`${org} is signed in to another org than the one salesforce.orgs names`);
+  if (id15(info.id) !== id15(orgId)) return no(another);
   const origin = salesforceOrigin(info.instanceUrl);
   if (!origin) return no(`${org}'s instance URL is not an https Salesforce address`);
   const token = info.accessToken;
   if (!isText(token)) return no(`sf gave no session for ${org}`);
+  if (/redacted/i.test(token)) return no(`sf showed the session of ${org} redacted, not a session ID; Foreman sends no request with it`);
+  if (!/^00D[A-Za-z0-9]{12}!\S+$/.test(token) || id15(token) !== id15(orgId)) {
+    return no(`sf gave ${org} a session that is not a Salesforce session ID for org ${id15(orgId)}; Foreman sends no request with it`);
+  }
 
+  // The time the retries waited, so the cool-down starts from the clock after them.
+  let waited = 0;
+  const pause = async (ms) => {
+    waited += ms;
+    await sleep(ms);
+  };
   const coolDown = () => {
-    const rec = recordCooldown(sh.sfHome, org, { reason: 'login rate exceeded', now });
+    const rec = recordCooldown(sh.sfHome, org, { reason: 'login rate exceeded', now: msOf(now) + waited });
     return no(`${org} answered "login rate exceeded"; Foreman never retries it and makes no sf call to ${org} until ${rec.until}`);
   };
-  const get = (url, headers) => request(fetch, url, { method: 'GET', headers, redirect: 'manual' }, SESSION_TIMEOUT_MS);
+  const get = (url, headers) => requestTwice(fetch, url, { method: 'GET', headers, redirect: 'manual' }, SESSION_TIMEOUT_MS, { sleep: pause, retry: sessionRetry });
 
   const who = await get(`${origin}/services/oauth2/userinfo`, { Authorization: `Bearer ${token}` });
   if (loginTrouble(who.text) === 'login-rate') return coolDown();
-  if (who.status === 0) return no(`could not read the user of ${org}: ${who.error}`);
-  if (who.status !== 200) return no(`could not read the user of ${org} (HTTP ${who.status})`);
+  if (who.status !== 200) return no(failed(`could not read the user of ${org}`, who, [token]));
   const userId = parse(who.text)?.user_id;
   if (!isText(userId)) return no(`${org} gave no user for the session`);
 
   const named = await get(`${origin}/agentforce/bootstrap/nameduser`, { Cookie: `sid=${token}` });
   if (loginTrouble(named.text) === 'login-rate') return coolDown();
-  if (named.status === 0) return no(`could not get an agent token from ${org}: ${named.error}`);
-  if (named.status !== 200) return no(`could not get an agent token from ${org} (HTTP ${named.status})`);
+  if (named.status !== 200) return no(failed(`could not get an agent token from ${org}`, named, [token]));
   const jwt = parse(named.text)?.access_token;
   if (typeof jwt !== 'string' || !JWT.test(jwt)) return no(`${org} gave no agent token`);
 
@@ -307,20 +413,21 @@ export async function agentSession({ sh, rawSh, env = process.env, org, orgId, f
 
 // Runs the spec's cases against the planner: { ok: true, response: { results } } or { ok: false,
 // reason }.
-export async function runSuite({ session, fetch = globalThis.fetch, plannerId, spec }) {
+export async function runSuite({ session, fetch = globalThis.fetch, plannerId, spec, sleep = realSleep }) {
   const { tests } = evalPayload(spec, plannerId);
   const batches = [];
   for (let i = 0; i < tests.length; i += BATCH) batches.push(tests.slice(i, i + BATCH));
   const answers = await Promise.all(
-    batches.map((batch) => request(fetch, EVAL_URL, { method: 'POST', headers: session.headers(), body: JSON.stringify({ tests: batch }) }, EVAL_TIMEOUT_MS)),
+    batches.map((batch) => requestTwice(fetch, EVAL_URL, { method: 'POST', headers: session.headers(), body: JSON.stringify({ tests: batch }) }, EVAL_TIMEOUT_MS, { sleep, retry: evalRetry })),
   );
+  const jwt = String(session.headers().Authorization ?? '').replace(/^Bearer /, '');
   const results = [];
   for (const a of answers) {
-    if (a.status === 0) return { ok: false, reason: `could not reach the eval API: ${a.error}` };
+    if (a.status === 0) return { ok: false, reason: failed('could not reach the eval API', a, [jwt]) };
     if (a.status === 429 || (a.status !== 200 && LIMITED.test(a.text))) {
       return { ok: false, reason: `the eval API is limiting calls (HTTP ${a.status}); Foreman never retries it, so run the release again later` };
     }
-    if (a.status !== 200) return { ok: false, reason: `the eval API refused the suite (HTTP ${a.status})` };
+    if (a.status !== 200) return { ok: false, reason: failed('the eval API refused the suite', a, [jwt]) };
     const body = parse(a.text);
     if (!isObject(body) || !Array.isArray(body.results)) return { ok: false, reason: 'the eval API gave no results' };
     results.push(...body.results);

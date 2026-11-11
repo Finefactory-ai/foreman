@@ -37,6 +37,47 @@ const note = (id) => fs.readFileSync(path.join(dir, 'stories', `${id}.md`), 'utf
 const slot = () => JSON.parse(fs.readFileSync(path.join(dir, '.foreman', 'slots', 'w1.json'), 'utf8'));
 const findings = () => fs.readFileSync(path.join(dir, '.foreman', 'findings.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
 
+describe('foreman story next after a rollback', () => {
+  const SF = {
+    productionBranch: 'main',
+    orgs: { 'acme-dev1': { orgId: '00D000000000001AAA' }, 'acme-qa': { orgId: '00D000000000002AAA' } },
+    build: ['acme-dev1'],
+    stages: [{ name: 'qa', org: 'acme-qa', branch: 'qa' }],
+  };
+  const AT = '2026-10-24T11:00:00.000Z';
+  const useSalesforce = () =>
+    fs.writeFileSync(
+      path.join(dir, 'foreman.config.json'),
+      JSON.stringify({ version: 1, project: { name: 'Acme' }, pack: 'salesforce', salesforce: SF, checks: [{ run: 'npm test', when: 'always' }], stories: { adapter: 'markdown', dir: 'stories' } }),
+    );
+  const record = (rolledBack) => {
+    const file = path.join(dir, '.foreman', 'salesforce', 'releases', 'S-1.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ story: 'S-1', to: 'aaa', reached: ['qa'], first: null, rolledBack }));
+  };
+
+  it('adds rolledBackAt when the story release was rolled back', async () => {
+    useSalesforce();
+    record({ revert: 'r1', jobId: null, at: AT });
+    const { code, out } = await run(['story', 'next', '--id', 'S-1']);
+    expect(code).toBe(0);
+    expect(out.trim().split('\n')).toHaveLength(1);
+    expect(JSON.parse(out)).toMatchObject({ id: 'S-1', rolledBackAt: AT });
+  });
+
+  it('has no rolledBackAt without a record, or once it is cleared', async () => {
+    useSalesforce();
+    expect(JSON.parse((await run(['story', 'next', '--id', 'S-1'])).out)).not.toHaveProperty('rolledBackAt');
+    record(null);
+    expect(JSON.parse((await run(['story', 'next', '--id', 'S-1'])).out)).not.toHaveProperty('rolledBackAt');
+  });
+
+  it('prints no rolledBackAt for a project with no pack, even with a record on disk', async () => {
+    record({ revert: 'r1', jobId: null, at: AT });
+    expect(JSON.parse((await run(['story', 'next', '--id', 'S-1'])).out)).not.toHaveProperty('rolledBackAt');
+  });
+});
+
 describe('foreman story next / plan', () => {
   it('prints the first buildable story as one JSON line', async () => {
     const { code, out } = await run(['story', 'next']);

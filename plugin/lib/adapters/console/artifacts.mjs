@@ -26,7 +26,7 @@ import { randomBytes } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { readControl, saveControl } from '../../console/control.mjs';
-import { KINDS } from '../../console/decisions.mjs';
+import { KINDS, TASK_OPTIONS, TASK_REFUSAL } from '../../console/decisions.mjs';
 import { decisionNote, queueStoryNote } from '../../engine/story-notes-queue.mjs';
 import { ACTIONS, slotIdsFor } from '../../engine/scheduler.mjs';
 import { DEFAULT_ID_PATTERN } from '../stories/markdown.mjs';
@@ -154,7 +154,9 @@ function toPageItem({ story, kind, title, options = [], urgent = false, body = '
   if (!KINDS.includes(kind)) throw new Error(`The kind must be decision or task, not ${kind}.`);
   if (!isText(title)) throw new Error('A decision needs a title.');
   if (!Array.isArray(options) || !options.every(isText)) throw new Error('Each option must be some text.');
-  const opts = options.map((o) => o.trim());
+  if (kind === 'task' && options.length) throw new Error(TASK_REFUSAL);
+  // A task always offers the two choices; a decision keeps the options it was given.
+  const opts = kind === 'task' ? [...TASK_OPTIONS] : options.map((o) => o.trim());
   return {
     kind,
     title: title.trim(),

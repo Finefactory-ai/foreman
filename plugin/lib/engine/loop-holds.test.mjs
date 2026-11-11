@@ -171,7 +171,7 @@ describe('the synchronous shells that go through it', () => {
     const asyncCalls = src.match(/\brunAsync\('gh', [^\n]*/g) ?? [];
     expect(asyncCalls.length).toBeGreaterThanOrEqual(1);
     for (const call of asyncCalls) expect(call).toContain('timeoutMs: 30_000');
-    expect(src).toContain("sh('gh', ['pr', 'list', '--state', 'merged', '--limit', '50', '--json', 'headRefName'], { cwd: ROOT, ...NET_LIMIT })");
+    expect(src).toContain("sh('gh', ['pr', 'list', '--state', 'merged', '--limit', '50', '--json', 'headRefName,mergedAt'], { cwd: ROOT, ...NET_LIMIT })");
     expect(src).toMatch(/sh\('git', \['ls-remote'[^\n]*\.\.\.NET_LIMIT/);
   });
 

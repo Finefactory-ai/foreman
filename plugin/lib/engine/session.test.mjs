@@ -526,6 +526,36 @@ describe("session.command with the slot's share of the cores", () => {
   });
 });
 
+describe("session.command with the plugin folder the run loads", () => {
+  const OTHER = { FOREMAN_PLUGIN_ROOT: '/elsewhere/plugin' };
+
+  it('gives the session FOREMAN_PLUGIN_ROOT, in the env file too', () => {
+    const c = command({ ...base({ adapter: 'files' }), pluginRoot: '/opt/acme/plugin' });
+    expect(c.env.FOREMAN_PLUGIN_ROOT).toBe('/opt/acme/plugin');
+    expect(JSON.parse(c.envFile.text).FOREMAN_PLUGIN_ROOT).toBe('/opt/acme/plugin');
+  });
+
+  it('wins over the base env, the env adapter and the pack env', () => {
+    const fromAdapter = { env: (n) => ({ ...envAdapter.env(n), ...OTHER }) };
+    const variants = [
+      { ...base({ adapter: 'files' }), baseEnv: { PATH: '/bin', ...OTHER } },
+      { ...base({ adapter: 'files' }), envAdapter: fromAdapter },
+      { ...base({ adapter: 'files' }), packSession: { env: OTHER, pathPrefix: [], settings: {} } },
+    ];
+    for (const v of variants) expect(command({ ...v, pluginRoot: '/opt/acme/plugin' }).env.FOREMAN_PLUGIN_ROOT).toBe('/opt/acme/plugin');
+  });
+
+  it('leaves the env as it was without one, passing a base value through', () => {
+    const plain = command(base({ adapter: 'files' }));
+    expect(plain.env).not.toHaveProperty('FOREMAN_PLUGIN_ROOT');
+    for (const pluginRoot of [undefined, null, '', 5]) {
+      expect(command({ ...base({ adapter: 'files' }), pluginRoot }), String(pluginRoot)).toEqual(plain);
+    }
+    const carried = { ...base({ adapter: 'files' }), baseEnv: { PATH: '/bin', ...OTHER } };
+    expect(command(carried).env.FOREMAN_PLUGIN_ROOT).toBe('/elsewhere/plugin');
+  });
+});
+
 describe('session.logPath', () => {
   it('names the log after the slot and the time', () => {
     expect(logPath({ stateDir: '/s', slot: 'w1', now: new Date('2026-10-15T09:08:07Z') })).toBe('/s/logs/w1-20261015-090807.log');

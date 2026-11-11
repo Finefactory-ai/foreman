@@ -10,7 +10,10 @@
 //
 // A step is { name, run(ctx), label?, needs?, requires?, pointOfNoReturn?, mayMarkNoReturn?,
 // beforeNoReturn?, mustFinish?, halts?, deploys?, noRollback?, testsMergedCode?, healthy?(ctx) }.
-// healthy() is what `foreman health` runs after a halt. testsMergedCode: the step tests the
+// healthy() is what `foreman health` runs after a halt. label is the words reported when the step
+// starts, or a function of ctx that gives them (the watch and rollback steps name the stage a
+// pack says the release is live on); a function that throws or gives no text reports the step's
+// name. testsMergedCode: the step tests the
 // code as merged with the base (ci, sf-validate). Before any step runs, the runner sets
 // ctx.testedBy to the first such step's name, or null when the release has none; merge-main
 // runs the project's checks on the merged code itself only when it is null. beforeNoReturn:
@@ -18,7 +21,9 @@
 // lock stages, left by older releases, after which a cut-off release is finished on startup
 // (startup.mjs mustFinishFor). noRollback: once a step with noRollback starts, a failure from it or any
 // later step never calls onFailure; it halts.
-// run returns { ok: true, ...facts } or { ok: false, code, stage, reason, ...facts }; the facts
+// run returns { ok: true, ...facts } or { ok: false, code, stage, reason, ...facts }; a reason
+// that is not text is reduced to its `reason` text, else "The release failed at <stage>."
+// (halt-reason.mjs), so HALT never holds an object there; the facts
 // are added to ctx for later steps and to the final result (never replacing the runner's own
 // ctx keys, the RESERVED set below). A later step's facts may replace an earlier step's: a
 // Salesforce later stage with a branch of its own (sf-deploy-<stage>, ci-deploy-watch-<stage>)
@@ -57,6 +62,7 @@
 
 import { isDeepStrictEqual } from 'node:util';
 import { fetchBase, mergeInProgress, out } from './git.mjs';
+import { reasonOf } from './halt-reason.mjs';
 import { adoptLegacySchemaLock, breakIfStale, holderOf, release, RESOURCE, setStage as setLockStage, SHIP, take } from './locks.mjs';
 
 const WAITING = 'waiting for the ship lock';
@@ -64,7 +70,7 @@ const HALT_CODES = new Set([4, 5]);
 // The most times one run brings the base in again because it moved under the release.
 const BASE_MOVES = 5;
 // ctx keys a step's facts may not replace.
-const RESERVED = new Set(['sh', 'env', 'fetch', 'root', 'config', 'story', 'branch', 'locks', 'report', 'halt', 'sleep', 'now', 'pid', 'slot', 'holderPid', 'isHalted', 'event', 'beat', 'testedBy', 'pass']);
+const RESERVED = new Set(['sh', 'env', 'fetch', 'root', 'config', 'story', 'branch', 'locks', 'report', 'halt', 'sleep', 'now', 'pid', 'slot', 'holderPid', 'isHalted', 'event', 'beat', 'testedBy', 'pass', 'rolledBackAt']);
 
 // The lock files behind the keys the runner and steps use: `ship` and `resource:<name>`.
 export function lockStore(dir) {
@@ -93,6 +99,20 @@ function validPark(parked) {
   } catch {
     return false;
   }
+}
+
+// The words reported when a step starts: its label (a function of ctx is called, and used only
+// when it gives text), else its name.
+function labelOf(step, ctx) {
+  let label = step.label;
+  if (typeof label === 'function') {
+    try {
+      label = label(ctx);
+    } catch {
+      label = null;
+    }
+  }
+  return typeof label === 'string' && label.trim() ? label : step.name;
 }
 
 const quiet = (fn) => {
@@ -135,12 +155,21 @@ function writeHalt(ctx, result) {
 // Rolls production back once for a release that failed after its new build went live. HALT
 // is written first, saying a rollback is under way, so a crash mid-rollback still leaves
 // releases frozen; then it is written again with what happened: rolledBack, and a sentence
-// before the reason.
+// before the reason. A rollback that returns manualSteps (strings) has them listed there as
+// "By hand: a; b.".
 async function rollBack(ctx, onFailure, result, report) {
   const planned = onFailure.commandFor?.(ctx.config) ?? onFailure.name;
   writeHalt(ctx, { ...result, reason: `Rolling back with \`${planned}\`… ${result.reason}` });
   quiet(() => ctx.locks.setStage('ship', ctx.pid, onFailure.name));
-  report(onFailure.label ?? onFailure.name);
+  report(labelOf(onFailure, ctx));
+  // Where it was rolled back, when the rollback can say (a Salesforce sandbox stage); else production.
+  let where = null;
+  try {
+    const named = onFailure.whereFor?.(ctx);
+    where = typeof named === 'string' && named.trim() ? named : null;
+  } catch {
+    where = null;
+  }
   let r;
   try {
     r = (await onFailure.run(ctx)) ?? { ok: false };
@@ -150,13 +179,17 @@ async function rollBack(ctx, onFailure, result, report) {
   const command = r.command ?? planned;
   result.rolledBack = r.ok === true;
   const why = r.why ?? (Number.isInteger(r.exitCode) ? `exited ${r.exitCode}` : 'failed');
-  const said = result.rolledBack ? `Production was rolled back with \`${command}\`.` : `Rollback failed (\`${command}\` ${why}); production may be broken.`;
+  const steps = Array.isArray(r.manualSteps) && r.manualSteps.length && r.manualSteps.every((x) => typeof x === 'string') ? r.manualSteps : [];
+  const byHand = steps.length ? ` By hand: ${steps.join('; ')}.` : '';
+  const said = result.rolledBack ? `${where ?? 'Production'} was rolled back with \`${command}\`.${byHand}` : `Rollback failed (\`${command}\` ${why}); ${where ?? 'production'} may be broken.`;
   result.reason = `${said} ${result.reason}`;
   writeHalt(ctx, result);
 }
 
 // ctx: { config, story, slot, pid, holderPid, sh, env?, fetch?, root?, locks, sleep, now, report,
-// beat?, halt, isHalted, event }; the runner adds branch, testedBy and pass. sh(cmd, args,
+// beat?, halt, isHalted, event, rolledBackAt? }; the runner adds branch, testedBy and pass.
+// rolledBackAt is the time the pack says the story's last release was rolled back, or null; the
+// pr step opens a new pull request instead of reusing one merged before it. sh(cmd, args,
 // { env, cwd }?) runs a command; env is the environment it runs with (the project's env file
 // loaded). onFailure: the project's rollback (registry.mjs onFailureFor), or null. It runs
 // only when a step fails after a step marked `deploys` passed, so the new build is what
@@ -207,7 +240,7 @@ export async function runShip({ steps, ctx, onFailure = null }) {
       let noRollbackFrom = null;
       for (const step of steps) {
         quiet(() => ctx.locks.setStage('ship', ctx.pid, step.name));
-        report(step.label ?? step.name);
+        report(labelOf(step, ctx));
         if (step.noRollback === true && !noRollbackFrom) noRollbackFrom = step.name;
         let r;
         try {
@@ -248,7 +281,7 @@ export async function runShip({ steps, ctx, onFailure = null }) {
         }
         // Past a point of no return the release must be finished by hand, whatever went wrong.
         const failCode = pastNoReturn ? 5 : Number.isInteger(code) && code > 0 ? code : 1;
-        const result = { ...facts, stage: stage ?? step.name, reason: reason ?? `${step.name} failed.` };
+        const result = { ...facts, stage: stage ?? step.name, reason: reason === undefined || reason === null ? `${step.name} failed.` : reasonOf(reason, stage ?? step.name) };
         if (deployed && onFailure && noRollbackFrom) {
           result.reason = `Not rolled back: Foreman never rolls back once ${noRollbackFrom} has started; put it right by hand. ${result.reason}`;
         }

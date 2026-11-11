@@ -1293,3 +1293,120 @@ describe('doctor: check commands on PATH', () => {
     expect(probes(ctx)).toEqual([]);
   });
 });
+
+describe('doctor: foreman command', () => {
+  const SHELL = '/bin/acme-sh';
+  // A recording sh: the `type foreman` call gets `typed`, everything else the happy answers.
+  function shellCtx(typed, extra = {}) {
+    const calls = [];
+    const inner = fakeSh(HAPPY());
+    const sh = (cmd, args = [], opts = {}) => {
+      if (cmd === SHELL) {
+        calls.push({ cmd, args, opts });
+        return { status: 0, stdout: '', stderr: '', ...typed };
+      }
+      return inner(cmd, args, opts);
+    };
+    return { ctx: { root: dir, env: { SHELL }, sh, fs, sourceRoot: source, pluginsDir: plugins, ...extra }, calls };
+  }
+  const check = (config, ctx) => buildChecks(config, ctx).find((c) => c.name === 'foreman command');
+  const run = (typed, extra) => {
+    const { ctx, calls } = shellCtx(typed, extra);
+    return { res: check(cfg(), ctx).run(ctx), calls };
+  };
+  const own = () => path.join(source, 'bin', 'foreman');
+
+  it('is a claude-code check, with or without a config', () => {
+    const { ctx } = shellCtx({});
+    expect(check(cfg(), ctx)).toMatchObject({ step: 'claude-code' });
+    expect(check(null, ctx)).toMatchObject({ step: 'claude-code' });
+  });
+
+  it("asks the user's interactive shell with FOREMAN_RUN=1", () => {
+    const { calls } = run({ stdout: 'foreman not found\n', status: 1 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].cmd).toBe(SHELL);
+    expect(calls[0].args).toEqual(['-ic', 'type foreman']);
+    expect(calls[0].opts.env.FOREMAN_RUN).toBe('1');
+    expect(calls[0].opts.env.SHELL).toBe(SHELL);
+  });
+
+  it('warns for an alias, naming the plugin bin and the fix, never the alias body', () => {
+    const { res } = run({ stdout: 'foreman is an alias for node /home/acme/•••/bin/foreman\n' });
+    expect(res).toMatchObject({ ok: false, level: 'warn' });
+    expect(res.detail).toContain('a shell alias');
+    expect(res.detail).toContain(own());
+    expect(res.detail).not.toContain('•••');
+    expect(res.fix.hint).toContain('if [[ -z "$FOREMAN_RUN" ]]');
+  });
+
+  it('carries the claude-code step in the fix once through buildChecks', async () => {
+    const { ctx } = shellCtx({ stdout: 'foreman is an alias for node x\n' });
+    const res = await results(cfg(), ctx);
+    expect(res['foreman command'].fix.step).toBe('claude-code');
+  });
+
+  it('warns for a function', () => {
+    const { res } = run({ stdout: 'foreman is a shell function from /home/acme/.zshrc\n' });
+    expect(res).toMatchObject({ ok: false, level: 'warn' });
+    expect(res.detail).toContain('a shell function');
+  });
+
+  it('warns for another file, naming it', () => {
+    const { res } = run({ stdout: 'foreman is /usr/local/bin/foreman\n' });
+    expect(res).toMatchObject({ ok: false, level: 'warn' });
+    expect(res.detail).toContain('/usr/local/bin/foreman');
+    expect(res.detail).toContain(own());
+  });
+
+  it("is ok for the plugin's own bin, plain or hashed", () => {
+    expect(run({ stdout: `foreman is ${own()}\n` }).res.ok).toBe(true);
+    expect(run({ stdout: `foreman is hashed (${own()})\n` }).res.ok).toBe(true);
+  });
+
+  it('is ok when the shell has no foreman', () => {
+    expect(run({ status: 1, stdout: 'foreman not found\n' }).res.ok).toBe(true);
+    expect(run({ status: 1, stderr: 'bash: type: foreman: not found\n' }).res.ok).toBe(true);
+  });
+
+  it('warns, naming the shell, when it cannot be run', () => {
+    const { res } = run({ status: 127, stderr: 'spawn /bin/acme-sh ENOENT\n' });
+    expect(res).toMatchObject({ ok: false, level: 'warn' });
+    expect(res.detail).toContain('/bin/acme-sh');
+    expect(res.fix.hint).toContain('/bin/acme-sh');
+    expect(res.detail).toContain('could not run your shell /bin/acme-sh');
+    expect(res.detail).toContain('spawn /bin/acme-sh ENOENT');
+    expect(res.fix.hint).toContain("check that `/bin/acme-sh -ic 'type foreman'` runs");
+  });
+
+  it('blanks secrets from the shell start-up output in the detail', () => {
+    const { res } = run(
+      { status: 1, stderr: `acme-init: GH_TOKEN=acme-secret-9 sk-ant-${'c'.repeat(30)}\n` },
+      { env: { SHELL: '/bin/acme-sh', GH_TOKEN: 'acme-secret-9' } },
+    );
+    expect(res.level).toBe('warn');
+    expect(res.detail).not.toContain('acme-secret-9');
+    expect(res.detail).not.toContain('cccccccccc');
+    expect(res.detail).toContain('•••');
+    // A value with no KEY= or token shape around it is blanked only by its name in the user's env.
+    const named = run(
+      { status: 1, stderr: 'acme-init: loaded acme-secret-9\n' },
+      { env: { SHELL: '/bin/acme-sh', GH_TOKEN: 'acme-secret-9' } },
+    ).res;
+    expect(named.level).toBe('warn');
+    expect(named.detail).not.toContain('acme-secret-9');
+  });
+
+  it('warns when the output says nothing', () => {
+    const { res } = run({});
+    expect(res).toMatchObject({ ok: false, level: 'warn' });
+    expect(res.detail).toContain('/bin/acme-sh');
+  });
+
+  it('is ok with no shell, and runs nothing', () => {
+    const { ctx, calls } = shellCtx({ stdout: 'foreman is an alias\n' }, { env: {} });
+    const res = check(cfg(), ctx).run(ctx);
+    expect(res.ok).toBe(true);
+    expect(calls).toEqual([]);
+  });
+});

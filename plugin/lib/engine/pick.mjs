@@ -7,7 +7,8 @@
 // supervisor ranks the stories a dead run left by it. A story is taken only when every story in
 // its `dependsOn` is done, whatever group it is in. Owner tasks are never picked. A blocked
 // story is picked again only when its `blockedBy` starts with story ids and every one of them
-// is done.
+// is done. blockedNow is that same rule as a question about one story: is it blocked, and would
+// the picker leave it alone?
 //
 // `exclude` is a test that drops stories from the automatic pick (the parallel factory keeps
 // a second story that needs an exclusive resource out while one is in flight). It never stops
@@ -41,6 +42,18 @@ export const waitsOnStories = (blockedBy, { idPattern } = {}) => blockingStories
 // maps to the single exclusive lock; story 8 generalises it to one lock per resource.
 export const needsExclusive = (story, extraIds = []) => (story.resources ?? []).length > 0 || extraIds.includes(story.id);
 
+// A blocked story the picker takes again: its `blockedBy` starts with story ids and every one is done.
+const unblocked = (story, done, idPattern) => {
+  const ids = blockingStories(story.blockedBy, idPattern);
+  return ids.length > 0 && ids.every((b) => done.has(b));
+};
+
+// True when the story's status is blocked and the picker would not take it again.
+export function blockedNow(story, stories, { idPattern } = {}) {
+  need(idPattern);
+  return story.status === 'blocked' && !unblocked(story, doneIds(stories), idPattern);
+}
+
 // The stories an agent could start now, best first.
 export function eligible(stories, { skip = [], exclude = () => false, idPattern } = {}) {
   need(idPattern);
@@ -48,14 +61,10 @@ export function eligible(stories, { skip = [], exclude = () => false, idPattern 
 }
 
 function eligibleGiven(stories, done, { skip = [], exclude = () => false, idPattern } = {}) {
-  const unblocked = (s) => {
-    const ids = blockingStories(s.blockedBy, idPattern);
-    return ids.length > 0 && ids.every((b) => done.has(b));
-  };
   return stories
     .filter((s) => !done.has(s.id) && !skip.includes(s.id) && !s.ownerTask)
     .filter((s) => !exclude(s))
-    .filter((s) => s.status === 'todo' || s.status === 'in-progress' || (s.status === 'blocked' && unblocked(s)))
+    .filter((s) => s.status === 'todo' || s.status === 'in-progress' || (s.status === 'blocked' && unblocked(s, done, idPattern)))
     .filter((s) => s.dependsOn.every((d) => done.has(d)))
     .sort((a, b) => Number(b.status === 'in-progress') - Number(a.status === 'in-progress') || byPriority(a, b));
 }

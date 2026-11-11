@@ -38,6 +38,8 @@
 //   activeScratchQuery(sh, devHub, ids)      the Dev Hub's ActiveScratchOrg rows for those org IDs
 //   aliasStray({ home, block, list, alias }) why the doctor must not query `alias`, from the
 //                                            home's `sf org list` alone, or null; no sf call
+//   listedEntry(list, alias)                 the home's `sf org list` entry for `alias`, or null; no
+//                                            sf call
 //   isolatedSh(sh, env, home, homedir)       Foreman's own sf calls: the real sf, isolated HOME;
 //                                            its sfHome is the home, for runSf's cool-downs
 //
@@ -307,6 +309,13 @@ export function aliasStray({ home, block, list, alias }) {
   if (!entry) return null;
   const allowed = new Set(allowList(block).map((a) => id15(a.orgId)));
   return allowed.has(id15(entry.orgId)) ? null : strayReason(home, [entry]);
+}
+
+// The home's `sf org list` entry for `alias`, or null when the list failed or holds none. Pure:
+// it makes no sf call.
+export function listedEntry(list, alias) {
+  if (list?.ok !== true) return null;
+  return listed(list.result).find((e) => e.alias === alias) ?? null;
 }
 
 // `sf org list` through `sh`, which contacts no org, and the Organization query for `target`, as

@@ -1,8 +1,9 @@
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { commentSwitch, doneChange, openProjectStories, openStorySource, storyCommentsOn, storyUpdate } from './story-source.mjs';
+import { commentSwitch, doneChange, fetchStoryTarget, openProjectStories, openStorySource, storyCommentsOn, storyTarget, storyUpdate } from './story-source.mjs';
 import { ACME_QA_ID } from '../../../test/fake-sf.mjs';
 import { writeToken } from '../jira/auth.mjs';
 import { CLIENT_ID, CLIENT_SECRET } from '../../../test/fake-atlassian.mjs';
@@ -90,6 +91,80 @@ describe('openStorySource', () => {
     expect(source.list()).toEqual([]);
     expect(Date.now() - started).toBeLessThan(1000);
     expect(source.brief('ACME-1')).toBeNull();
+  });
+});
+
+describe('storyTarget', () => {
+  const staged = (extra = {}, into = 'qa') => ({ baseBranch: 'main', ship: { pr: { into } }, ...extra });
+
+  it('is null when pull requests merge into the base branch', () => {
+    expect(storyTarget({})).toBeNull();
+    expect(storyTarget(undefined)).toBeNull();
+    expect(storyTarget(staged({}, 'main'))).toBeNull();
+    expect(storyTarget({ baseBranch: 'develop', ship: { pr: { into: 'develop' } } })).toBeNull();
+  });
+
+  it('is null for a branch or remote git could read as an option or a path', () => {
+    for (const into of ['-x', 'a..b', 'qa/']) expect(storyTarget(staged({}, into))).toBeNull();
+    for (const remote of ['-o', 'a/b']) expect(storyTarget(staged({ remote }))).toBeNull();
+  });
+
+  it('is the remote and the branch pull requests merge into', () => {
+    expect(storyTarget(staged())).toEqual({ remote: 'origin', branch: 'qa' });
+    expect(storyTarget(staged({ remote: 'upstream' }))).toEqual({ remote: 'upstream', branch: 'qa' });
+    expect(storyTarget({ ship: { pr: { into: 'qa' } } })).toEqual({ remote: 'origin', branch: 'qa' });
+  });
+});
+
+describe('fetchStoryTarget', () => {
+  const config = { baseBranch: 'main', ship: { pr: { into: 'qa' } } };
+  const recorder = (status) => {
+    const calls = [];
+    return { calls, sh: (...call) => (calls.push(call), { status, stdout: '', stderr: '' }) };
+  };
+
+  it('makes no call and warns of nothing without a stage branch', () => {
+    const { calls, sh } = recorder(1);
+    expect(fetchStoryTarget({ root: '/x', config: {}, sh })).toBeNull();
+    expect(calls).toEqual([]);
+  });
+
+  it('fetches the stage branch into its remote-tracking ref', () => {
+    const { calls, sh } = recorder(0);
+    expect(fetchStoryTarget({ root: '/x', config, sh })).toBeNull();
+    expect(calls).toEqual([['git', ['fetch', '--quiet', 'origin', '+refs/heads/qa:refs/remotes/origin/qa'], { cwd: '/x' }]]);
+  });
+
+  it('warns, naming the branch and the remote, when the fetch fails', () => {
+    const { sh } = recorder(1);
+    const warning = fetchStoryTarget({ root: '/x', config, sh });
+    expect(warning).toContain('qa');
+    expect(warning).toContain('origin');
+  });
+});
+
+describe('openStorySource with stage branches', () => {
+  it('reads a story shipped on the stage branch as done', () => {
+    root = mkdtempSync(join(tmpdir(), 'story-source-'));
+    const run = (...args) => {
+      const r = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: root, encoding: 'utf8' });
+      if (r.status !== 0) throw new Error(r.stderr);
+      return r.stdout.trim();
+    };
+    mkdirSync(join(root, 'stories', '.shipped'), { recursive: true });
+    writeFileSync(join(root, 'stories', 'S-1.md'), '---\nid: S-1\ntitle: One\nstatus: todo\n---\n');
+    writeFileSync(join(root, 'stories', '.shipped', 'S-1.json'), '{"id":"S-1","status":"done","notes":[]}\n');
+    writeFileSync(join(root, '.gitignore'), '.foreman/\n');
+    run('init', '-q', '-b', 'main');
+    run('add', '-A', '-f');
+    run('commit', '-qm', 'records');
+    run('update-ref', 'refs/remotes/origin/qa', 'HEAD');
+    rmSync(join(root, 'stories', '.shipped'), { recursive: true });
+    const config = { baseBranch: 'main', ship: { pr: { into: 'qa' } }, stories: { adapter: 'markdown', dir: 'stories' } };
+    const source = openStorySource({ root, config, env: { PATH: process.env.PATH } });
+    expect(source.list().map((s) => [s.id, s.status])).toEqual([['S-1', 'done']]);
+    const plain = openStorySource({ root, config: { ...config, ship: undefined }, env: { PATH: process.env.PATH } });
+    expect(plain.list().map((s) => [s.id, s.status])).toEqual([['S-1', 'todo']]);
   });
 });
 

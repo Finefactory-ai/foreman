@@ -8,15 +8,22 @@
 // AiAuthoringBundle members of the story's delta manifest (ctx.sfDelta.manifest); with none it
 // passes with no sf call, even with the switch off. Every name must match AGENT_API_NAME, because
 // it goes into SOQL. Then, before any sf call, it fails when the switch is off ("Agentforce is
-// off: <reason>"), when an agent's eval spec (tests/<Api>-eval.json at ctx.sfDelta.to, read with
+// off: <reason>"), when an agent's eval spec (tests/<Api>-eval.json at the stage's commit, read with
 // git show through ctx.sh) is missing or malformed, when the story changed more agents than the
 // suite limit, or when the stage org has no room for one more suite per agent in the suite counter
 // (agent-eval.mjs). Then, in the stage's org:
 //
+//   0. the commit is ctx.sha, the commit sf-deploy deployed (the merge for the stage's own branch,
+//      else the merge step's). The eval specs are read at that commit, and sf finds a bundle only
+//      in the folder it runs in, so validate and publish run in a temporary git worktree of that
+//      commit, never the slot's checkout (which is on whatever the merge left). The worktree is
+//      removed right after the last publish, on every path, and git's record of it is pruned when
+//      the remove fails. A commit that is not a full sha, or a checkout that fails, fails before
+//      any sf call, with no changedOrg.
 //   1. every bundle is validated: `sf agent validate authoring-bundle`
 //   2. for each bundle in order: read its versions (versionsQuery: the active one is the
 //      rollback target, previous, or null for a new agent); `sf agent publish authoring-bundle
-//      --skip-retrieve`, so the new Bot and GenAi metadata never land in the ship worktree;
+//      --skip-retrieve`, so the new Bot and GenAi metadata never land in the checkout;
 //      read the versions again, where the new highest is the story's version; record
 //      { stage, org, apiName, previous, version, at } on the story's release record
 //      (releases.mjs) before the activate, so a later failure can be rolled back; `sf agent
@@ -35,7 +42,11 @@
 //      routing case that passed only on the re-run, are notes: plain lines sf-verify adds to the
 //      story's manual steps.
 //
-// restoreAgents puts each recorded agent back: it activates the previous version when that is
+// apexTargets reads the Apex classes an Agent Script (.agent) text names as action targets
+// (`target: "apex://Name"`), sorted and unique; [] for text that is not a string. rollback.mjs
+// holds those classes back from its deletes, because a published agent still uses them.
+//
+// restoreAgents puts each recorded agent back (rollback.mjs calls it before the reverse deploy): it activates the previous version when that is
 // not already active (no deactivate first), deactivates an agent the story created (previous
 // null), and otherwise does nothing. It stops at the first failure with the command to run by
 // hand. A recorded name that is not an agent API name, or a previous that is neither an integer
@@ -44,22 +55,27 @@
 // Every sf call goes through the caller's sh, which is the isolated sf home, and through
 // runSf, which adds --json. It never passes --ignore-*, `quick`, NoTestRun or --version-number,
 // and never runs `sf agent test`. A message names only agents, versions, aliases, stages, case
-// and check ids and HTTP statuses, plus sf's own error message; never an sf result, a session
-// token or a JWT.
+// and check ids and HTTP statuses, plus sf's own error message and the redacted snippet of
+// Salesforce's error answer; never an sf result, a session token or a JWT.
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { redact } from '../../lib/secrets/redact.mjs';
 import { safeId, writeAtomic } from '../../lib/adapters/stories/overlay.mjs';
 import { stateDir } from '../../lib/engine/paths.mjs';
 import { EVAL_LIMIT, agentSession, evalRoom, gradeEval, junit, loadEvalSpec, recordSuite, runSuite } from './agent-eval.mjs';
 import { manifestTypes } from './env/sandbox-pool.mjs';
 import { recordAgent } from './releases.mjs';
 import { runSf } from './sf.mjs';
+import { removeTempTree } from './temp-tree.mjs';
 
 export const AGENT_API_NAME = /^[A-Za-z][A-Za-z0-9_]{0,79}$/;
 export const AGENTFORCE_FILE = path.join('salesforce', 'agentforce.json');
 
 const PUBLISH_TIMEOUT_MS = 600_000;
+const SHA = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+const firstLine = (text) => String(text ?? '').split('\n').map((l) => l.trim()).find(Boolean) ?? 'git gave no reason';
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const compare = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
@@ -127,7 +143,7 @@ const highestOf = (versions) => versions.reduce((max, v) => Math.max(max, v.numb
 const activateArgs = (api, version, org) => ['agent', 'activate', '--api-name', api, '--version', String(version), '--target-org', org];
 const deactivateArgs = (api, org) => ['agent', 'deactivate', '--api-name', api, '--target-org', org];
 
-function publishOne({ ctx, sh, stage, api, state }) {
+function publishOne({ ctx, sh, stage, api, state, cwd }) {
   const { org } = stage;
   const where = `${org} (${stage.name})`;
   const no = (reason) => ({ ok: false, reason });
@@ -138,7 +154,7 @@ function publishOne({ ctx, sh, stage, api, state }) {
   const previous = activeOf(before.versions);
   const highest = highestOf(before.versions);
 
-  const published = runSf(sh, ['agent', 'publish', 'authoring-bundle', '--api-name', api, '--target-org', org, '--skip-retrieve'], { timeoutMs: PUBLISH_TIMEOUT_MS });
+  const published = runSf(sh, ['agent', 'publish', 'authoring-bundle', '--api-name', api, '--target-org', org, '--skip-retrieve'], { cwd, timeoutMs: PUBLISH_TIMEOUT_MS });
   if (!published.ok) return no(`could not publish agent ${api} in ${where}: ${published.error.message}`);
 
   // From here the org has the published bundle, so every failure says so.
@@ -172,7 +188,7 @@ function plannerOf(sh, api, version, org) {
 
 // The suite for one activated agent, with its one re-run: { ok: true, notes } or { ok: false,
 // reason }. It writes the merged response and its JUnit before it returns.
-async function testAgent({ ctx, sh, stage, state, session, fetch, now, agent, spec }) {
+async function testAgent({ ctx, sh, stage, state, session, fetch, now, sleep, agent, spec }) {
   const { apiName: api, version } = agent;
   const where = `${stage.org} (${stage.name})`;
   const no = (reason) => ({ ok: false, reason: `agent ${api} in ${where}: ${reason}` });
@@ -181,14 +197,14 @@ async function testAgent({ ctx, sh, stage, state, session, fetch, now, agent, sp
   if (planner.error) return no(planner.error);
 
   recordSuite(state, stage.org, now);
-  const first = await runSuite({ session, fetch, plannerId: planner.id, spec });
+  const first = await runSuite({ session, fetch, plannerId: planner.id, spec, sleep });
   if (!first.ok) return no(first.reason);
   const firstGrade = gradeEval(spec, first.response);
 
   let response = first.response;
   const failed = [...new Set(firstGrade.routing.map((f) => f.case))];
   if (failed.length) {
-    const again = await runSuite({ session, fetch, plannerId: planner.id, spec: { ...spec, tests: spec.tests.filter((t) => failed.includes(t.id)) } });
+    const again = await runSuite({ session, fetch, plannerId: planner.id, spec: { ...spec, tests: spec.tests.filter((t) => failed.includes(t.id)) }, sleep });
     if (!again.ok) return no(again.reason);
     const rerun = new Map(again.response.results.filter(isObject).map((r) => [r.id, r]));
     response = { results: [...first.response.results.filter((r) => !failed.includes(r?.id)), ...failed.filter((id) => rerun.has(id)).map((id) => rerun.get(id))] };
@@ -231,9 +247,14 @@ export const agentforceCheck = {
       };
     }
 
+    const commit = ctx.sha;
+    if (typeof commit !== 'string' || !SHA.test(commit)) {
+      return { ok: false, reason: `could not check the agents in ${stage.org} (${stage.name}): the ${stage.name} commit is not known, so there is nothing to check out` };
+    }
+
     const specs = new Map();
     for (const api of bundles) {
-      const read = loadEvalSpec(ctx.sh, ctx.sfDelta?.to, api);
+      const read = loadEvalSpec(ctx.sh, commit, api);
       if (!read.ok) return { ok: false, reason: read.reason };
       specs.set(api, read.spec);
     }
@@ -245,33 +266,51 @@ export const agentforceCheck = {
       return { ok: false, reason: `agent eval limit: ${room.used} suites ran in ${stage.org} in the last ${EVAL_LIMIT.hours} hours (limit ${EVAL_LIMIT.suites})${next}` };
     }
 
-    for (const api of bundles) {
-      const v = runSf(sh, ['agent', 'validate', 'authoring-bundle', '--api-name', api, '--target-org', stage.org]);
-      if (!v.ok) return { ok: false, reason: `could not validate agent ${api} in ${stage.org} (${stage.name}): ${v.error.message}` };
-    }
-
     const agents = [];
     let published = false;
-    for (const api of bundles) {
-      const r = publishOne({ ctx, sh, stage, api, state });
-      if (r.published) published = true;
-      if (!r.ok) return { ok: false, reason: r.reason, ...(published ? { changedOrg: true } : {}) };
-      agents.push(r.agent);
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'foreman-sf-agent-'));
+    const tree = path.join(tmp, 'tree');
+    const git = (args, cwd = ctx.root) => ctx.sh('git', args, { cwd }) ?? {};
+    try {
+      const added = git(['worktree', 'add', '--detach', tree, commit]);
+      if (added.status !== 0) {
+        return { ok: false, reason: `could not check the agents in ${stage.org} (${stage.name}): could not check out ${commit} (the ${stage.name} commit): ${redact(firstLine(added.stderr || added.stdout), { env })}` };
+      }
+
+      for (const api of bundles) {
+        const v = runSf(sh, ['agent', 'validate', 'authoring-bundle', '--api-name', api, '--target-org', stage.org], { cwd: tree });
+        if (!v.ok) return { ok: false, reason: `could not validate agent ${api} in ${stage.org} (${stage.name}): ${v.error.message}` };
+      }
+
+      for (const api of bundles) {
+        const r = publishOne({ ctx, sh, stage, api, state, cwd: tree });
+        if (r.published) published = true;
+        if (!r.ok) return { ok: false, reason: r.reason, ...(published ? { changedOrg: true } : {}) };
+        agents.push(r.agent);
+      }
+    } finally {
+      removeTempTree(git, tree, tmp);
     }
 
     const fetch = ctx.fetch ?? globalThis.fetch;
-    const opened = await agentSession({ sh, rawSh: ctx.sh, env, org: stage.org, orgId: stage.orgId, fetch, now });
+    const opened = await agentSession({ sh, rawSh: ctx.sh, env, block: ctx.config?.salesforce, org: stage.org, orgId: stage.orgId, fetch, now, sleep: ctx.sleep });
     if (!opened.ok) return { ok: false, reason: `could not test the agents in ${stage.org} (${stage.name}): ${opened.reason}`, changedOrg: true };
 
     const notes = [];
     for (const agent of agents) {
-      const r = await testAgent({ ctx, sh, stage, state, session: opened.session, fetch, now, agent, spec: specs.get(agent.apiName) });
+      const r = await testAgent({ ctx, sh, stage, state, session: opened.session, fetch, now, sleep: ctx.sleep, agent, spec: specs.get(agent.apiName) });
       if (!r.ok) return { ok: false, reason: r.reason, changedOrg: true };
       notes.push(...r.notes);
     }
     return { ok: true, changedOrg: true, agents, ...(notes.length ? { notes } : {}) };
   },
 };
+
+// The Apex classes the Agent Script text targets with apex://, sorted and unique.
+export function apexTargets(source) {
+  if (typeof source !== 'string') return [];
+  return [...new Set([...source.matchAll(/apex:\/\/([A-Za-z][A-Za-z0-9_]*)/g)].map((m) => m[1]))].sort();
+}
 
 // Puts each recorded agent back in `org`, for `foreman sf rollback`. Returns { ok: true,
 // restored: [{ apiName, version: previous }] }, or { ok: false, apiName, command, reason } at the

@@ -29,6 +29,8 @@
     The answer reaches the architect as a note (see `answers.md`).
   - **`needs_owner` is true otherwise** — ask the owner for it:
     `foreman decide add --story <ID> --kind task --title '<what the owner must supply>'`.
-    A free-text task is only for what the owner must supply: a key, an account, a sign-off.
+    A task is only for what the owner must supply: a key, an account, a sign-off. Give a task
+    no `--option`: every task offers "Retry the story" and "Close the task", and the story is
+    retried only when the owner picks the first.
 
   Stop with `blocked`.

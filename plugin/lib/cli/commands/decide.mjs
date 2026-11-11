@@ -7,11 +7,15 @@
 //              [--summary <t>] [--hint <h>]... [--recommend <option>]
 //              [--purpose <t> --happened <t> [--damage <t>] --recommendation <t>]
 //                                       prints the new item's id; the hints pair with --option by
-//                                       position, one per option or none. The last four are the
+//                                       position, one per option or none. A task always offers
+//                                       "Retry the story" and "Close the task" (with their hints)
+//                                       and takes no --option or --hint. The last four are the
 //                                       plain-words explanation (decisions.mjs explain); a file
 //                                       path, variable name or function call in it is a
 //                                       `warning:` line on stderr and a warn event, and the item
-//                                       is still added
+//                                       is still added; a --body that is a ship JSON line (the story
+//                                       skill passes one) is stored as its reason and pull request
+//                                       (engine/halt-reason.mjs shipLineBody), never as the object
 //   decide pending                      JSON array of items not yet applied, each with its answer or null
 //   decide list [--all]                 the open items in words, grouped as the Waiting on you
 //                                       tab groups them: Needs you now, Quick decisions (each
@@ -33,6 +37,7 @@ import { answerBundle, BUNDLES, bundleMessage } from '../../console/bundles.mjs'
 import { bundleOf, isFyiNote } from '../../console/waiting.mjs';
 import { openConsole } from '../../engine/console.mjs';
 import { EXPLAIN_PARTS, explainLine, explainProblems } from '../../console/decisions.mjs';
+import { shipLineBody } from '../../engine/halt-reason.mjs';
 import { addEvent, ownerWaiting } from '../../engine/state.mjs';
 import { flushStoryNotes } from '../../engine/story-notes.mjs';
 import { openProject, STORY_ID } from './console-shared.mjs';
@@ -41,7 +46,9 @@ const USAGE = `usage: foreman decide <sub>
   add --story <id> --kind decision|task --title <t> [--option <o>]... [--urgent] [--body <text>]
       [--summary <t>] [--hint <h>]... [--recommend <option>]
       [--purpose <t> --happened <t> [--damage <t>] --recommendation <t>]
-                                           one --hint per --option, in the same order, or none;
+                                           one --hint per --option, in the same order, or none; a task
+                                           always offers "Retry the story" and "Close the task", so
+                                           give it no --option or --hint;
                                            the explanation in plain words, each part one line
   pending                                  items not yet applied, as JSON
   list [--all]                             open items grouped, or every item with --all
@@ -170,7 +177,8 @@ export default {
         if (!STORY_ID.test(values.story)) return fail(`${values.story} is not a story id.`);
         const given = EXPLAIN_PARTS.filter((part) => values[part] !== undefined);
         const explain = given.length ? Object.fromEntries(given.map((part) => [part, values[part]])) : undefined;
-        const id = await decisions.add({ story: values.story, kind: values.kind, title: values.title, options: values.option ?? [], urgent: values.urgent === true, body: values.body ?? '', summary: values.summary, hints: values.hint ?? [], recommend: values.recommend, explain });
+        const body = shipLineBody(values.body ?? '') ?? (values.body ?? '');
+        const id = await decisions.add({ story: values.story, kind: values.kind, title: values.title, options: values.option ?? [], urgent: values.urgent === true, body, summary: values.summary, hints: values.hint ?? [], recommend: values.recommend, explain });
         stdout.write(`${id}\n`);
         flush();
         // The writing check: the skill learns to write plainer, and the item stands.

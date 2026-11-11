@@ -44,9 +44,9 @@ export const isPending = (v) => v != null && typeof v.then === 'function';
 // pulls later characters into the 200 that are shown. A cut head that is one word and that
 // redaction shortened shows as '•••'. Redacted before the 200 cut.
 const CAP = 4000;
-function clip(text) {
+function clip(text, max = 200) {
   const all = String(text);
-  if (all.length <= CAP) return redact(all).slice(0, 200);
+  if (all.length <= CAP) return redact(all).slice(0, max);
   let head = all.slice(0, CAP);
   let space = head.length - 1; // a loop, not a regex, so a long word cannot backtrack
   while (space >= 0 && !/\s/.test(head[space])) space--;
@@ -57,7 +57,7 @@ function clip(text) {
   }
   const out = redact(head);
   if (space < 0 && out.length < head.length) return '•••';
-  return out.slice(0, 200);
+  return out.slice(0, max);
 }
 const NO_MESSAGE = 'failed with no message';
 const message = (err) => {
@@ -219,23 +219,47 @@ export function prepareSlot({ slot, id, adapter, n, path, repair = null, pending
 // supervisor runs it every `everyMs` while no sweep runs. runEnvSweep never rejects: a throw, a
 // rejection or an answer that is not an object becomes one warning, and every warning is
 // redacted and cut to 200 characters, as it goes out as an event.
+//
+// At a stop the supervisor calls runEnvSweep(adapter, { limitMs }) once, which calls
+// adapter.sweep({ stopping: true, limitMs }) and waits for it for limitMs plus a backstop of 15 s
+// (STOP_BACKSTOP_MS), so a sweep that never settles cannot hold the stop. When the backstop wins,
+// the answer is one warning. Warnings at a stop are cut to 600 characters, not 200, so the
+// command a warning gives to run by hand stays whole.
 
 export function envSweepDue({ running, lastAt, now, everyMs }) {
   if (running) return false;
   return lastAt === 0 || now - lastAt >= everyMs;
 }
 
-export async function runEnvSweep(adapter) {
+export const STOP_BACKSTOP_MS = 15_000;
+const STOP_WARNING_MAX = 600;
+const LATE = Symbol('late');
+
+export async function runEnvSweep(adapter, stop = null) {
   if (typeof adapter?.sweep !== 'function') return { warnings: [] };
+  const max = stop ? STOP_WARNING_MAX : 200;
   let answer;
+  let timer = null;
   try {
-    answer = await adapter.sweep();
+    if (stop) {
+      const { limitMs, backstopMs = STOP_BACKSTOP_MS } = stop;
+      const sweep = Promise.resolve().then(() => adapter.sweep({ stopping: true, limitMs }));
+      const late = new Promise((resolve) => {
+        timer = setTimeout(() => resolve(LATE), limitMs + backstopMs);
+      });
+      answer = await Promise.race([sweep, late]);
+      if (answer === LATE) return { warnings: [`the sweep at the stop did not finish within ${Math.round((limitMs + backstopMs) / 1000)} s`] };
+    } else {
+      answer = await adapter.sweep();
+    }
   } catch (err) {
-    return { warnings: [clip(`the sweep failed: ${err?.message || (err == null ? NO_MESSAGE : String(err))}`)] };
+    return { warnings: [clip(`the sweep failed: ${err?.message || (err == null ? NO_MESSAGE : String(err))}`, max)] };
+  } finally {
+    clearTimeout(timer);
   }
-  if (answer === null || typeof answer !== 'object' || Array.isArray(answer)) return { warnings: [clip(`the sweep answered ${shown(answer)}, not { warnings }`)] };
+  if (answer === null || typeof answer !== 'object' || Array.isArray(answer)) return { warnings: [clip(`the sweep answered ${shown(answer)}, not { warnings }`, max)] };
   const list = Array.isArray(answer.warnings) ? answer.warnings : [];
-  return { warnings: list.filter((w) => typeof w === 'string' && w.trim()).map((w) => clip(w)) };
+  return { warnings: list.filter((w) => typeof w === 'string' && w.trim()).map((w) => clip(w, max)) };
 }
 
 // Learned skills.

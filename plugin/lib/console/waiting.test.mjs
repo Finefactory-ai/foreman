@@ -893,6 +893,56 @@ describe('headline on standby', () => {
     });
   });
 
+  describe('while a failed story holds up others', () => {
+    const RELEASE = ['Retry the release', "I'll take it", 'Drop'];
+    const REVIEW = ['Retry with a note to the architect', "I'll take it", 'Drop'];
+    const failed = (id, title = `${id} could not be released`, options = RELEASE, n = 1) => decision({ id: `d-20261110110000-000${n}`, story: id, title, options, createdAt: `2026-11-10T11:00:0${n}.000Z` });
+    const blockedStory = (id) => s(id, { status: 'blocked', blockedBy: 'CI never started' });
+    const dependent = (id, on) => s(id, { dependsOn: [on] });
+    const FAILED = 'Standby: nothing to build. ABC-1 failed and holds up 2 stories. Picks up new stories automatically.';
+
+    it('names the failed story and how many it holds up', () => {
+      const stories = [blockedStory('ABC-1'), dependent('ABC-2', 'ABC-1'), dependent('ABC-3', 'ABC-1')];
+      const items = build({ stories, decisions: { source: 'files', items: [failed('ABC-1')] } });
+      expect(headline({ items, loop: standby, slots: idle })).toEqual({ state: 'standby', text: FAILED, best: items.find((i) => i.kind === 'decision').id });
+    });
+
+    it('says the same for a story that could not pass review', () => {
+      const stories = [blockedStory('ABC-1'), dependent('ABC-2', 'ABC-1'), dependent('ABC-3', 'ABC-1')];
+      const items = build({ stories, decisions: { source: 'files', items: [failed('ABC-1', 'ABC-1 could not pass review', REVIEW)] } });
+      expect(text(items)).toBe(FAILED);
+    });
+
+    it('says one dependent in the singular', () => {
+      const items = build({ stories: [blockedStory('ABC-1'), dependent('ABC-2', 'ABC-1')], decisions: { source: 'files', items: [failed('ABC-1')] } });
+      expect(text(items)).toBe('Standby: nothing to build. ABC-1 failed and holds up 1 story. Picks up new stories automatically.');
+    });
+
+    it('names two failed stories and counts the stories they hold once', () => {
+      const stories = [blockedStory('ABC-1'), blockedStory('ABC-4'), dependent('ABC-2', 'ABC-1'), s('ABC-3', { dependsOn: ['ABC-1', 'ABC-4'] }), dependent('ABC-5', 'ABC-4')];
+      const items = build({ stories, decisions: { source: 'files', items: [failed('ABC-1', undefined, undefined, 2), failed('ABC-4', 'ABC-4 could not pass review', REVIEW, 1)] } });
+      expect(text(items)).toBe('Standby: nothing to build. ABC-1 and ABC-4 failed and hold up 3 stories. Picks up new stories automatically.');
+    });
+
+    it('keeps the old sentence when the failed story holds nothing up', () => {
+      const items = build({ stories: [blockedStory('ABC-1')], decisions: { source: 'files', items: [failed('ABC-1')] } });
+      expect(text(items)).toBe('Standby: nothing to build. 1 story waits on you. Picks up new stories automatically.');
+    });
+
+    it('wins over follow-up proposals', () => {
+      const follow = decision({ id: 'd-20261110110009-0009', story: 'ABC-9', title: 'Follow up on ABC-9: 2 minor finding(s)?', options: ['Create a follow-up story', 'Ignore'], summary: '2 minor: a; b' });
+      const stories = [blockedStory('ABC-1'), dependent('ABC-2', 'ABC-1'), dependent('ABC-3', 'ABC-1'), s('ABC-9', { status: 'done' })];
+      const items = build({ stories, decisions: { source: 'files', items: [failed('ABC-1'), follow] } });
+      expect(text(items)).toBe(FAILED);
+    });
+
+    it('still names the stranded stories after it', () => {
+      const stories = [blockedStory('ABC-1'), dependent('ABC-2', 'ABC-1'), dependent('ABC-3', 'ABC-1')];
+      const items = build({ stories, decisions: { source: 'files', items: [failed('ABC-1')] } });
+      expect(headline({ items, loop: standby, slots: idle, stranded: ['ABC-7'] }).text).toBe(`${FAILED} ABC-7 is In Progress with nothing running it.`);
+    });
+  });
+
   it('the stopped and idle texts are unchanged', () => {
     const stopped = { state: 'stopped', reason: 'Nothing left to build.' };
     expect(headline({ items: [], loop: stopped, slots: idle }).text).toBe('Idle: nothing left to build and nothing waits on you.');

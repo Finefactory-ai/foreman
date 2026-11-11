@@ -181,10 +181,12 @@ takes the failed path (`${CLAUDE_SKILL_DIR}/failed.md`).
 Run each `generated` entry's `regenerate` command, so the commit carries the current
 version and the tree is clean for the release step. Then run
 `foreman story finalize <ID> --note "<what now works, how it was verified>"`. When the
-project keeps its stories in the repo, it marks the story done in this checkout's copy of
-the story file and prints that file's path, so the base branch reads done exactly when the
-pull request merges; otherwise it prints "nothing to change for this story source". Then
-make one commit for the story, all of its files (the printed story file included), message
+project keeps its stories in the repo, it marks the story done in this checkout and prints
+the path of the file it wrote: the story file or, when pull requests merge into a branch
+other than `<base>`, the story's shipped record (`<stories dir>/.shipped/<ID>.json`), which
+leaves the story file alone. Either way the story reads done exactly when the pull request
+merges. Otherwise it prints "nothing to change for this story source". Then
+make one commit for the story, all of its files (the printed file included), message
 `<ID> <story title>`, with a short body from the pipeline's summary and any minor findings
 left open. Run `git status --porcelain` first: when it prints nothing, because the story
 changed no file and finalize printed "nothing to change for this story source", still make

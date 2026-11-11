@@ -20,7 +20,7 @@ const EXPECTED = {
   'packs/salesforce/isolation.mjs': 3,
   'packs/salesforce/rollback.mjs': 1,
   'packs/salesforce/setup.mjs': 2,
-  'packs/salesforce/env/sandbox-pool.mjs': 6,
+  'packs/salesforce/env/sandbox-pool.mjs': 9,
   'packs/salesforce/env/scratch.mjs': 6,
   'packs/salesforce/steps/ci-deploy-watch.mjs': 1,
   'packs/salesforce/steps/gearset-promote.mjs': 1,

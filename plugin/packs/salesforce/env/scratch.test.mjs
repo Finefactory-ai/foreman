@@ -1,8 +1,10 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { envAdapterContract } from '../../../lib/adapters/env/contract.mjs';
+import { runEnvSweep } from '../../../lib/engine/slot-prepare.mjs';
 import { setSlot } from '../../../lib/engine/state.mjs';
 import { create } from './scratch.mjs';
 import { readScratchOrgs, scratchFile, writeScratchOrg } from '../scratch-orgs.mjs';
@@ -594,5 +596,255 @@ describe('scratch sweep: delete on close', () => {
     const c = w.adapter.sweep();
     expect(c).not.toBe(a);
     await c;
+  });
+});
+
+describe('scratch sweep at a stop', () => {
+  const STOP = { stopping: true, limitMs: MIN };
+  const claim = (story, text = JSON.stringify({ holder: 'factory', pid: 4242 })) => {
+    fs.mkdirSync(path.join(stateDir, 'claims'), { recursive: true });
+    fs.writeFileSync(path.join(stateDir, 'claims', `${story}.json`), text);
+  };
+  const handCommand = (alias) => `FOREMAN_SF_HOME=${sfHomeDir} ${sfHomeDir}/.foreman/bin/sf org delete scratch --target-org ${alias} --no-prompt`;
+  // Two closed stories; each delete takes `takes` ms of the test clock.
+  const twoClosed = (takes) => {
+    writeScratchOrg(stateDir, readyRecord('ACME-1'));
+    writeScratchOrg(stateDir, readyRecord('ACME-2', { slot: 'w2' }));
+    let w;
+    const slow = (args) => {
+      w.clock.t += takes;
+      return deleted(args);
+    };
+    w = world({ story: null, sf: { 'org delete scratch': slow } });
+    return w;
+  };
+
+  it("deletes a shipped story's org at a stop 2 minutes after it shipped", async () => {
+    writeScratchOrg(stateDir, readyRecord('ACME-1'));
+    setSlot(stateDir, 'w1', { state: 'idle', story: null });
+    const w = world({ story: null });
+    expect(await w.adapter.sweep()).toEqual({ deleted: [], warnings: [] });
+    expect(w.count('org delete scratch')).toBe(0);
+    w.clock.t += 2 * MIN;
+    expect(await w.adapter.sweep(STOP)).toEqual({ deleted: ['ACME-1'], warnings: [] });
+    expect(w.lines()).toEqual([`org delete scratch --target-org ${ORGS['foreman-acme-1'].username} --no-prompt --json`]);
+    expect(w.find('org delete scratch').opts.timeout).toBe(MIN + 15_000);
+    expect(hasRecord('ACME-1')).toBe(false);
+  });
+
+  describe('keeps the org of a story that will resume', () => {
+    const keeps = async (w) => {
+      expect(await w.adapter.sweep(STOP)).toEqual({ deleted: [], warnings: [] });
+      expect(w.sh.calls).toEqual([]);
+      expect(hasRecord('ACME-1')).toBe(true);
+    };
+    beforeEach(() => writeScratchOrg(stateDir, readyRecord('ACME-1')));
+    it('an interrupted story: its slot is idle and its factory claim is kept', async () => {
+      setSlot(stateDir, 'w1', { state: 'idle', story: null });
+      claim('ACME-1');
+      await keeps(world({ story: null }));
+    });
+    it('an owner-claimed story', async () => {
+      claim('ACME-1', JSON.stringify({ holder: 'owner' }));
+      await keeps(world({ story: null }));
+    });
+    it('a story with an unparseable claim file', async () => {
+      claim('ACME-1', '{ broken');
+      await keeps(world({ story: null }));
+    });
+    it('a held story', async () => {
+      setSlot(stateDir, 'w1', { state: 'held', heldStory: 'ACME-1', story: null });
+      await keeps(world({ story: null }));
+    });
+    it('a story in a slot', async () => {
+      await keeps(world({ story: 'ACME-1' }));
+    });
+    it("deletes another story's org beside it", async () => {
+      claim('ACME-1');
+      writeScratchOrg(stateDir, readyRecord('ACME-2', { slot: 'w2' }));
+      const w = world({ story: null });
+      expect(await w.adapter.sweep(STOP)).toEqual({ deleted: ['ACME-2'], warnings: [] });
+      expect(hasRecord('ACME-1')).toBe(true);
+      expect(hasRecord('ACME-2')).toBe(false);
+    });
+  });
+
+  it('shares one budget between the deletes', async () => {
+    const w = twoClosed(30_000);
+    expect(await w.adapter.sweep(STOP)).toEqual({ deleted: ['ACME-1', 'ACME-2'], warnings: [] });
+    const timeouts = w.sh.calls.filter((c) => c.args.includes('delete')).map((c) => c.opts.timeout);
+    expect(timeouts).toEqual([75_000, 45_000]);
+  });
+
+  describe('out of time', () => {
+    it('makes no sf call for an org with under a second left, and warns with the command to run by hand', async () => {
+      const w = twoClosed(59_500);
+      const r = await w.adapter.sweep(STOP);
+      expect(r.deleted).toEqual(['ACME-1']);
+      expect(w.count('org delete scratch')).toBe(1);
+      expect(r.warnings).toHaveLength(1);
+      expect(r.warnings[0].startsWith(`could not delete the scratch org foreman-acme-2 of ACME-2 at the stop; delete it by hand with ${handCommand('foreman-acme-2')}`)).toBe(true);
+      expect(r.warnings[0]).toContain('no time was left before the stop');
+      expect(r.warnings[0]).not.toContain('@');
+      expect(hasRecord('ACME-2')).toBe(true);
+    });
+    it('keeps the whole hand command through the engine, unredacted and uncut', async () => {
+      const w = twoClosed(59_500);
+      const { warnings } = await runEnvSweep(w.adapter, { limitMs: MIN });
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain(`FOREMAN_SF_HOME=${sfHomeDir}`);
+      expect(warnings[0]).toContain(`${handCommand('foreman-acme-2')} (`);
+    });
+  });
+
+  it('warns with the hand command, and no username, when a delete fails', async () => {
+    writeScratchOrg(stateDir, readyRecord('ACME-1'));
+    const w = world({ story: null, sf: { 'org delete scratch': sfError('SfError', 'Request timed out for test-acme-1@scratch.acme.example') } });
+    const r = await w.adapter.sweep(STOP);
+    expect(r.deleted).toEqual([]);
+    expect(r.warnings).toHaveLength(1);
+    expect(r.warnings[0].startsWith(`could not delete the scratch org foreman-acme-1 of ACME-1 at the stop; delete it by hand with ${handCommand('foreman-acme-1')} (`)).toBe(true);
+    expect(r.warnings[0]).not.toContain('@');
+    expect(hasRecord('ACME-1')).toBe(true);
+  });
+
+  it('warns, not silently skips, a creating record still being made', async () => {
+    writeScratchOrg(stateDir, readyRecord('ACME-1', { state: 'creating', orgId: null, readyAt: undefined }));
+    const w = world({ story: null, sf: { 'org resume scratch': sfError('StillInProgressError', 'The scratch org is not ready yet (Status: Creating).') } });
+    const r = await w.adapter.sweep(STOP);
+    expect(r.deleted).toEqual([]);
+    expect(r.warnings).toHaveLength(1);
+    const jobId = ORGS['foreman-acme-1'].jobId;
+    expect(r.warnings[0]).toContain(`${sfHomeDir}/.foreman/bin/sf org resume scratch --job-id ${jobId} --wait 30`);
+    expect(r.warnings[0]).toContain(handCommand('foreman-acme-1'));
+    expect(r.warnings[0]).toContain('its org is still being made');
+    expect(w.find('org resume scratch').opts.timeout).toBe(MIN + 15_000);
+    expect(w.count('org delete scratch')).toBe(0);
+    expect(hasRecord('ACME-1')).toBe(true);
+  });
+
+  it('waits for a periodic sweep in flight', async () => {
+    writeScratchOrg(stateDir, readyRecord('ACME-1'));
+    let settled = false;
+    const seen = [];
+    const w = world({
+      story: null,
+      sf: {
+        'org delete scratch': (args) => {
+          if (argAfter(args, '--target-org') === ORGS['foreman-acme-2'].username) seen.push(settled);
+          return deleted(args);
+        },
+      },
+    });
+    await w.adapter.sweep();
+    writeScratchOrg(stateDir, readyRecord('ACME-2', { slot: 'w2' }));
+    w.clock.t += 5 * MIN;
+    const a = w.adapter.sweep();
+    // Registered before b exists, so the mark runs before b's chained callback.
+    a.then(() => {
+      settled = true;
+    });
+    const b = w.adapter.sweep(STOP);
+    expect(b).not.toBe(a);
+    expect(await a).toEqual({ deleted: ['ACME-1'], warnings: [] });
+    expect(await b).toEqual({ deleted: ['ACME-2'], warnings: [] });
+    // The stop sweep's work started only after the periodic promise had settled.
+    expect(seen).toEqual([true]);
+    expect(w.count('org delete scratch')).toBe(2);
+    expect(w.lines().filter((l) => l.includes('org delete scratch'))).toEqual([
+      `org delete scratch --target-org ${ORGS['foreman-acme-1'].username} --no-prompt --json`,
+      `org delete scratch --target-org ${ORGS['foreman-acme-2'].username} --no-prompt --json`,
+    ]);
+  });
+
+  describe('a sf home that is unsafe in a shell', () => {
+    const quoted = (s) => `'${s.replaceAll("'", "'\\''")}'`;
+    let home;
+    beforeEach(() => {
+      home = path.join(sfHomeDir, "Acme's sf home");
+      fs.mkdirSync(path.join(home, '.foreman', 'bin'), { recursive: true });
+      const sf = path.join(home, '.foreman', 'bin', 'sf');
+      fs.writeFileSync(sf, '#!/bin/sh\nprintf \'%s\\n\' "$FOREMAN_SF_HOME" "$@"\n');
+      fs.chmodSync(sf, 0o755);
+    });
+    const unsafeAdapter = (sf) =>
+      create({ adapter: 'scratch' }, { root: ROOT, stateDir, config: scratchConfig(), sh: fakeSfShell(routes(sf)), env: { FOREMAN_SF_HOME: home }, homedir: HOMEDIR, wait: async () => {}, now: () => T0 });
+    const cut = (warning, from, to) => {
+      const start = warning.indexOf(from) + from.length;
+      const end = warning.indexOf(to, start) + to.length;
+      return warning.slice(start, end);
+    };
+
+    it('shell-quotes a sf home with a space or a quote, and the hand command runs as pasted', async () => {
+      writeScratchOrg(stateDir, readyRecord('ACME-1'));
+      const { warnings } = await unsafeAdapter({ 'org delete scratch': sfError('SfError', 'Request timed out') }).sweep(STOP);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain(`FOREMAN_SF_HOME=${quoted(home)} ${quoted(path.join(home, '.foreman', 'bin', 'sf'))} org delete scratch`);
+      const cmd = cut(warnings[0], 'delete it by hand with ', '--no-prompt');
+      const out = execFileSync('/bin/sh', ['-c', cmd], { encoding: 'utf8' });
+      expect(out.split('\n').slice(0, -1)).toEqual([home, 'org', 'delete', 'scratch', '--target-org', 'foreman-acme-1', '--no-prompt']);
+    });
+
+    it('quotes the home in the resume form of a creating record, too', async () => {
+      writeScratchOrg(stateDir, readyRecord('ACME-1', { state: 'creating', orgId: null, readyAt: undefined }));
+      const { warnings } = await unsafeAdapter({ 'org resume scratch': sfError('StillInProgressError', 'The scratch org is not ready yet (Status: Creating).') }).sweep(STOP);
+      expect(warnings).toHaveLength(1);
+      const sf = `FOREMAN_SF_HOME=${quoted(home)} ${quoted(path.join(home, '.foreman', 'bin', 'sf'))}`;
+      expect(warnings[0]).toContain(`${sf} org resume scratch --job-id ${ORGS['foreman-acme-1'].jobId} --wait 30, then ${sf} org delete scratch --target-org foreman-acme-1 --no-prompt`);
+    });
+
+    it('keeps the quoted home whole through the engine', async () => {
+      writeScratchOrg(stateDir, readyRecord('ACME-1'));
+      const adapter = unsafeAdapter({ 'org delete scratch': sfError('SfError', 'Request timed out') });
+      const { warnings } = await runEnvSweep(adapter, { limitMs: MIN });
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain(`FOREMAN_SF_HOME=${quoted(home)} `);
+    });
+  });
+
+  it('never rejects: a throwing sh gives one warning and keeps the record', async () => {
+    writeScratchOrg(stateDir, readyRecord('ACME-1'));
+    const boom = () => {
+      throw new Error('spawn sf ENOENT');
+    };
+    const adapter = create({ adapter: 'scratch' }, { root: ROOT, stateDir, config: scratchConfig(), sh: boom, env: { FOREMAN_SF_HOME: sfHomeDir }, homedir: HOMEDIR, wait: async () => {}, now: () => T0 });
+    const r = await adapter.sweep(STOP);
+    expect(r.deleted).toEqual([]);
+    expect(r.warnings).toHaveLength(1);
+    expect(hasRecord('ACME-1')).toBe(true);
+  });
+
+  it('never rejects: a throwing clock gives one warning naming the error', async () => {
+    writeScratchOrg(stateDir, readyRecord('ACME-1'));
+    const now = () => {
+      throw new Error('clock broke');
+    };
+    const adapter = create({ adapter: 'scratch' }, { root: ROOT, stateDir, config: scratchConfig(), sh: fakeSfShell(routes()), env: { FOREMAN_SF_HOME: sfHomeDir }, homedir: HOMEDIR, wait: async () => {}, now });
+    const r = await adapter.sweep(STOP);
+    expect(r.deleted).toEqual([]);
+    expect(r.warnings).toHaveLength(1);
+    expect(r.warnings[0]).toContain('clock broke');
+  });
+
+  it.each([[{ stopping: true }], [{ stopping: true, limitMs: 0 }], [{ stopping: true, limitMs: -5 }], [{ stopping: true, limitMs: 1.5 }], [{ stopping: true, limitMs: '9' }]])('uses 60 s for a missing or invalid limit (%j)', async (opts) => {
+    writeScratchOrg(stateDir, readyRecord('ACME-1'));
+    const w = world({ story: null });
+    await w.adapter.sweep(opts);
+    expect(w.find('org delete scratch').opts.timeout).toBe(MIN + 15_000);
+  });
+
+  it('caps a delete at its own limit when the stop has more time', async () => {
+    writeScratchOrg(stateDir, readyRecord('ACME-1'));
+    const w = world({ story: null });
+    await w.adapter.sweep({ stopping: true, limitMs: 10 * MIN });
+    expect(w.find('org delete scratch').opts.timeout).toBe(120_000 + 15_000);
+  });
+
+  it('removes a record with no username and no org ID with no sf call', async () => {
+    writeScratchOrg(stateDir, readyRecord('ACME-1', { state: 'creating', username: null, orgId: null, jobId: null }));
+    const w = world({ story: null });
+    expect(await w.adapter.sweep(STOP)).toEqual({ deleted: ['ACME-1'], warnings: [] });
+    expect(w.sh.calls).toEqual([]);
+    expect(hasRecord('ACME-1')).toBe(false);
   });
 });

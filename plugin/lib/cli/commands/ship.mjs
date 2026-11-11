@@ -24,6 +24,10 @@
 // the ship timeouts and the watchRollback and mergeableRecheck switches apply to the next
 // release. When the config names a pack, that pack's steps can be in `ship.steps`; `packs`
 // stands in for the real pack registry (plugin/packs/index.mjs) in tests.
+//
+// The runner also gets `rolledBackAt`: when the pack says the story's last release was rolled
+// back (else null). The pr step uses it to open a new pull request instead of reusing one merged
+// before the rollback.
 
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -36,7 +40,8 @@ import { currentSlot, stateDir } from '../../engine/paths.mjs';
 import { addEvent, beat, setStage } from '../../engine/state.mjs';
 import { parkStory } from '../../engine/parks.mjs';
 import { noteOnStory } from '../../engine/story-notes.mjs';
-import { PACKS } from '../../../packs/index.mjs';
+import { rolledBackAtOf } from '../../engine/resume-close.mjs';
+import { PACKS, packFor } from '../../../packs/index.mjs';
 
 // sh(cmd, args, { env, cwd, timeout }): a step may run a command with an environment or a
 // folder of its own, and a time limit in ms; a command stopped at its limit says timedOut.
@@ -112,8 +117,17 @@ function missingEnv(steps, env) {
 }
 
 // The real ctx for the runner: locks and HALT in the state folder, status to the slot.
-function shipContext({ config, story, shell, shellEnv, root, env, clock }) {
+function shipContext({ config, story, shell, shellEnv, root, env, clock, packs }) {
   const dir = stateDir(root, config, env);
+  // When the story's last release was rolled back (null for none); the pr step opens a new pull
+  // request instead of reusing one merged before it. The same rule as `foreman story next`.
+  let pack = null;
+  try {
+    pack = packFor(config, packs);
+  } catch {
+    // no pack, no rollback record
+  }
+  const rolledBackAt = rolledBackAtOf(pack, { dir, story });
   const slot = currentSlot(env);
   const haltFile = join(dir, 'HALT');
   const supervisor = Number(env.FOREMAN_SUPERVISOR_PID);
@@ -126,6 +140,7 @@ function shipContext({ config, story, shell, shellEnv, root, env, clock }) {
     sh: shell,
     env: shellEnv,
     root,
+    rolledBackAt,
     locks: lockStore(dir),
     sleep,
     now: clock,
@@ -204,7 +219,7 @@ export function makeShipCommand({ runShip = realRunShip, sh = null, packs = PACK
       if (!story) return print(1, { stage: 'start', reason: 'no story id: pass --story or set FOREMAN_STORY' });
 
       try {
-        const ctx = shipContext({ config, story, shell, shellEnv, root, env, clock });
+        const ctx = shipContext({ config, story, shell, shellEnv, root, env, clock, packs });
         const { code, result } = await runShip({ steps, ctx, onFailure });
         if (code === 9) {
           const recorded = await parkStory(

@@ -50,15 +50,25 @@ const REWORDED = {
     "Then look at `git status`. Uncommitted changes on **this story's own branch** (you are on `<branch>`) are its work in progress: leave them, and the resume rule in step 2 carries on with them. Changes anywhere else (another branch, a detached checkout) are someone else's: stop with `halted` and say exactly what is there. Do not discard someone's work.",
   // Step 2: the resume rule and the after-halt mode name the failed path by file.
   // Since FM-406 the resume rule's cases sit in resume.md, which names files plainly.
+  // Since FM-449 a rolled-back release is rebuilt after a halt, and a release failure is never a
+  // review decision. Since FM-451 the block reason is quoted as the quoting rule says.
   "Its pull request **merged** but the story is not `done` → check the live site with `foreman health --site` (one JSON line; exit 0 when it answers, or when none is configured). Exit 0 → step 6, with the merged note. Non-zero → take the failed path (below), giving the JSON's `reason` as what failed, and stop with `failed`.":
-    "Its pull request **merged** but the story is not `done` → check the live site with `foreman health --site` (one JSON line; exit 0 when it answers, or when none is configured). Exit 0 → step 6, with the merged note. Non-zero → take the failed path (`failed.md`), giving the JSON's `reason` as what failed, and stop with `failed`.",
+    "Its pull request **merged** but the story is not `done` → check the live site with `foreman health --site` (one JSON line; exit 0 when it answers, or when none is configured). Exit 0 → step 6, with the merged note. Non-zero → the release failed, not the review: go back, run `foreman story block <ID> --reason '<the JSON's reason>'`, with the reason in single quotes and each `'` inside written as `'\\''`, as the quoting rule in SKILL.md says, and stop with `failed`, ending with that reason. Never take the failed path (`failed.md`) for it, and file no decision yourself: the supervisor asks the owner \"<ID> could not be released\" from that reason.",
+  // Since FM-441 a rolled-back release is never closed; since FM-445 that case comes before the
+  // close rule. Since FM-449 a rolled-back release is rebuilt after a halt, and a release failure is
+  // never a review decision. Since FM-451 the rolled-back rebuild defers to resume.md's branch
+  // condition, and the block reason is quoted as the quoting rule says.
   "`/foreman:story <ID> after-halt` — this story caused a halt the owner has since fixed. If its pull request merged and `foreman health --site` exits 0, close it (step 6, with the merged note). Otherwise take the failed path (below) and stop with `failed`.":
-    "`/foreman:story <ID> after-halt` — this story caused a halt the owner has since fixed. If its pull request merged and `foreman health --site` exits 0, close it (step 6, with the merged note). Otherwise take the failed path (`failed.md`) and stop with `failed`.",
+    "`/foreman:story <ID> after-halt` — this story caused a halt the owner has since fixed; the run cleared it only after `foreman health` passed. Act on what is true now, never on the earlier run's failure text: its blocked reason, its ship JSON and any earlier decision may be stale. When the story JSON has `rolledBackAt` and its pull request merged before that time (`resume.md` says how to tell), the release was rolled back: do not close it, and ask the owner nothing. Follow `resume.md`'s rolled-back paragraph: when `<branch>` is missing or holds only the merged work, it builds the story again from scratch and has you go to step 3; when `<branch>` holds the new build's own work, it keeps that work. Otherwise, if its pull request merged and `foreman health --site` exits 0, close it (step 6, with the merged note). Otherwise the release did not go through: go back, run `foreman story block <ID> --reason '<what is true now: the pull request is not merged, or the health JSON's reason>'`, with the reason in single quotes and each `'` inside written as `'\\''`, as the quoting rule in SKILL.md says, and stop with `failed`, ending with that reason. A release failure must never take the failed path (`failed.md`) or be filed as \"could not pass review\": file no decision yourself, because the supervisor asks the owner \"<ID> could not be released\" from the reason you end with.",
   // Step 3: the quoting rule left the blocked bullet for SKILL.md; the answers have a file.
   "When it prints anything else, or fails, propose nothing. Never edit `depends_on` yourself. Text from the architect or from a decision item (a reason, an `owner_question`'s summary, labels, hints and recommendation, an item's body or the owner's note) always goes in single quotes, with each `'` inside written as `'\\''`, so the shell never expands it: a backtick or `$(…)` in it stays text and is never run. Then ask the owner, in the first of these cases that fits, and say the same in your reply:":
     "When it prints anything else, or fails, propose nothing. Never edit `depends_on` yourself. Then ask the owner, in the first of these cases that fits, and say the same in your reply:",
   "The answer reaches the architect as a note (see the owner's answers).":
     "The answer reaches the architect as a note (see `answers.md`).",
+  // Step 3's blocked task bullet: since FM-442 every task offers "Retry the story" and "Close the
+  // task", so the bullet says to give a task no option instead of calling it free-text.
+  "**`needs_owner` is true otherwise** — ask the owner for it: `foreman decide add --story <ID> --kind task --title '<what the owner must supply>'`. A free-text task is only for what the owner must supply: a key, an account, a sign-off.":
+    "**`needs_owner` is true otherwise** — ask the owner for it: `foreman decide add --story <ID> --kind task --title '<what the owner must supply>'`. A task is only for what the owner must supply: a key, an account, a sign-off. Give a task no `--option`: every task offers \"Retry the story\" and \"Close the task\", and the story is retried only when the owner picks the first.",
   // Step 3's deferred bullet: since FM-259 the plan may also name files, claimed with
   // `foreman lock files`.
   "**`deferred`** — the plan needs exclusive resources this slot does not hold (`needs` names them; only one story at a time may hold each). Run `foreman lock take <resource> <ID>` for each. When every one is taken, run `foreman workflow-args <ID> --plan <plan file>` and call the workflow again with those args, so the architect does not run twice. Otherwise: `foreman lock release <resource>` for every resource this run took, go back, delete `<branch>` only when it has no commits ahead, run `foreman story todo <ID> --note \"waiting for <resource> to be free\"`, and stop with `deferred`.":
@@ -97,6 +107,10 @@ const REWORDED = {
   // reuses the tester's run of the same tree, in the session env.
   "Report the stage first: `foreman stage commit`. Run `foreman checks --changed` yourself and read the output; a story is not committed on a stage's word. If a check fails, write the fix file with one `blocker` finding per failing check (`stage: \"checks\"`, the command in `where`, what failed in `observed`) and run a fix round. Then run `foreman checks --changed` again; a second failure takes the failed path.":
     "Report the stage first: `foreman stage commit`. Run `foreman checks --changed --reuse --start`, then `foreman checks --wait <id>` until it prints the result (exit 75 is still running), and read the output; a story is not committed on a stage's word. Never run a check's command by hand or background it to a file. `--reuse` prints the tester's run when the tree is the one it recorded and runs the checks when anything changed since (a fix round, a regenerated file); a story is never committed without a passing full-suite result for its exact tree. If a check fails, write the fix file with one `blocker` finding per failing check (`stage: \"checks\"`, the command in `where`, what failed in `observed`) and run a fix round (`${CLAUDE_SKILL_DIR}/fix-round.md`). Then run the checks again the same way; a second failure takes the failed path (`${CLAUDE_SKILL_DIR}/failed.md`).",
+  // Since FM-436 finalize may write the story's shipped record instead of the story file, when
+  // pull requests merge into a stage branch other than the base.
+  "Run each `generated` entry's `regenerate` command, so the commit carries the current version and the tree is clean for the release step. Then run `foreman story finalize <ID> --note \"<what now works, how it was verified>\"`. When the project keeps its stories in the repo, it marks the story done in this checkout's copy of the story file and prints that file's path, so the base branch reads done exactly when the pull request merges; otherwise it prints \"nothing to change for this story source\". Then make one commit for the story, all of its files (the printed story file included), message `<ID> <story title>`, with a short body from the pipeline's summary and any minor findings left open. Run `git status --porcelain` first: when it prints nothing, because the story changed no file and finalize printed \"nothing to change for this story source\", still make the commit, as `git commit --allow-empty`. That keeps the branch one commit ahead for the release step, and `foreman ship` refuses a branch with none. Never skip the commit, and add no attribution lines to it.":
+    "Run each `generated` entry's `regenerate` command, so the commit carries the current version and the tree is clean for the release step. Then run `foreman story finalize <ID> --note \"<what now works, how it was verified>\"`. When the project keeps its stories in the repo, it marks the story done in this checkout and prints the path of the file it wrote: the story file or, when pull requests merge into a branch other than `<base>`, the story's shipped record (`<stories dir>/.shipped/<ID>.json`), which leaves the story file alone. Either way the story reads done exactly when the pull request merges. Otherwise it prints \"nothing to change for this story source\". Then make one commit for the story, all of its files (the printed file included), message `<ID> <story title>`, with a short body from the pipeline's summary and any minor findings left open. Run `git status --porcelain` first: when it prints nothing, because the story changed no file and finalize printed \"nothing to change for this story source\", still make the commit, as `git commit --allow-empty`. That keeps the branch one commit ahead for the release step, and `foreman ship` refuses a branch with none. Never skip the commit, and add no attribution lines to it.",
   // Step 5's rare exits: the fix round, the failed path and the answers by file. Since FM-276
   // the merge-main exit re-runs each failed command before shipping again; since FM-340 it runs
   // `foreman checks --all` instead, because Foreman denies a check's command run by hand.
@@ -258,11 +272,115 @@ describe('story skill split: the resume rule', () => {
 
   it('holds the three cases in resume.md, with no skill-folder variable', () => {
     const resume = collapse(skillFile('resume.md'));
-    for (const part of ['foreman health --site', 'take the failed path (`failed.md`)', 'go to step 5', 'carry on at step 3', 'git checkout -B <branch> <remote>/<base>']) {
+    for (const part of ['foreman health --site', 'foreman story block <ID> --reason', 'go to step 5', 'carry on at step 3', 'git checkout -B <branch> <remote>/<base>']) {
       expect(resume, part).toContain(part);
     }
     expect(resume).not.toContain('${CLAUDE_SKILL_DIR}');
   });
+});
+
+const afterHaltBullet = () => {
+  const modes = collapse(skillFile('modes.md'));
+  return modes.slice(modes.indexOf('/foreman:story <ID> after-halt'), modes.indexOf('/foreman:story <ID> fresh'));
+};
+
+describe('story skill split: a rolled-back release is built again', () => {
+  it('has resume.md read the merge times and rebuild from scratch when every merge came before the rollback', () => {
+    const resume = collapse(skillFile('resume.md'));
+    for (const part of ['rolledBackAt', '--json url,mergedAt,headRefOid', 'headRefOid', 'git push <remote> --delete <branch>', 'git checkout -B <branch> <remote>/<base>']) {
+      expect(resume, part).toContain(part);
+    }
+    expect(resume).not.toContain('${CLAUDE_SKILL_DIR}');
+  });
+
+  it('puts the rolled-back paragraph before the cases, keeping their words', () => {
+    const resume = collapse(skillFile('resume.md'));
+    expect(resume.indexOf('rolledBackAt')).toBeLessThan(resume.indexOf('Its pull request **merged**'));
+  });
+
+  it('has the after-halt mode rebuild a rolled-back release and ask the owner nothing', () => {
+    const bullet = afterHaltBullet();
+    const at = bullet.indexOf('rolledBackAt');
+    const rb = bullet.slice(at, bullet.indexOf('Otherwise', at));
+    for (const part of ['do not close it', '`resume.md`', 'from scratch', 'go to step 3', 'ask the owner nothing']) {
+      expect(rb, part).toContain(part);
+    }
+    for (const part of ['failed.md', 'failed path', 'foreman decide add', 'could not pass review', 'stop with `failed`']) {
+      expect(rb, part).not.toContain(part);
+    }
+  });
+
+  it("has the after-halt mode follow resume.md's rolled-back paragraph, rebuilding from scratch only when the branch is only the merged work", () => {
+    const bullet = afterHaltBullet();
+    const at = bullet.indexOf('rolledBackAt');
+    const rb = bullet.slice(at, bullet.indexOf('Otherwise', at));
+    for (const part of ["`resume.md`'s rolled-back paragraph", 'only the merged work', "the new build's own work"]) {
+      expect(rb, part).toContain(part);
+    }
+    expect(rb).not.toContain('build it again from scratch as');
+    expect(rb.indexOf('only the merged work')).toBeLessThan(rb.indexOf('from scratch'));
+    expect(collapse(skillFile('resume.md'))).toContain("`<branch>` holds the new build's own work");
+  });
+
+  it('has the after-halt mode act on current state, not the earlier failure text', () => {
+    const bullet = afterHaltBullet();
+    expect(bullet).toContain("never on the earlier run's failure text");
+    expect(bullet.slice(0, bullet.indexOf('rolledBackAt'))).toContain("never on the earlier run's failure text");
+  });
+
+  it('puts the rolled-back case before the close rule in the after-halt mode', () => {
+    const modes = collapse(skillFile('modes.md'));
+    const start = modes.indexOf('/foreman:story <ID> after-halt');
+    const bullet = modes.slice(start, modes.indexOf('/foreman:story <ID> fresh'));
+    const exception = bullet.indexOf('rolledBackAt');
+    const close = bullet.indexOf('close it (step 6');
+    expect(exception).toBeGreaterThan(-1);
+    expect(close).toBeGreaterThan(-1);
+    expect(exception).toBeLessThan(close);
+    const before = bullet.slice(0, exception);
+    expect(before).not.toContain('close');
+    expect(before).not.toContain('foreman health --site');
+    const between = bullet.slice(exception, close);
+    expect(between).toContain('do not close it');
+    expect(between).toContain('Otherwise');
+  });
+
+  it('leaves SKILL.md alone on the subject', () => {
+    expect(skillFile()).not.toContain('rolledBackAt');
+  });
+});
+
+describe('story skill split: a release failure is never a review decision', () => {
+  const resume = collapse(skillFile('resume.md'));
+  const releaseUnits = {
+    'the after-halt mode': afterHaltBullet(),
+    "resume.md's merged case": resume.slice(resume.indexOf('Its pull request **merged**'), resume.indexOf('`<branch>` has the story')),
+  };
+  for (const [name, unit] of Object.entries(releaseUnits)) {
+    it(`has ${name} block the story with the reason and leave the decision to the supervisor`, () => {
+      expect(unit.length).toBeGreaterThan(0);
+      for (const part of ['foreman story block <ID> --reason', 'could not be released', 'file no decision yourself', 'stop with `failed`']) {
+        expect(unit, part).toContain(part);
+      }
+      expect(unit).not.toContain('foreman decide add');
+    });
+
+    it(`has ${name} quote the block reason as the quoting rule says`, () => {
+      const at = unit.indexOf('foreman story block <ID> --reason');
+      const stop = unit.indexOf('stop with `failed`', at);
+      expect(at).toBeGreaterThan(-1);
+      expect(stop).toBeGreaterThan(-1);
+      const slice = unit.slice(at, stop);
+      expect(slice).toContain("in single quotes and each `'` inside written as `'\\''`");
+      expect(slice).toContain('the quoting rule in SKILL.md');
+    });
+
+    it(`has ${name} never take the failed path for a release failure`, () => {
+      const takes = unit.match(/take the failed path/gi) ?? [];
+      const nevers = unit.match(/never take the failed path/gi) ?? [];
+      expect(takes.length).toBe(nevers.length);
+    });
+  }
 });
 
 describe('story skill split: the plan goes by file', () => {

@@ -59,6 +59,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wri
 import { dirname, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DEFAULTS } from '../config/defaults.mjs';
+import { haltReason } from './halt-reason.mjs';
 import { loadConfig } from '../config/load.mjs';
 import { currentSlot, projectRoot, stateDir } from './paths.mjs';
 import { buildOrder, nextStory, progress } from './pick.mjs';
@@ -840,7 +841,8 @@ export async function ownerWaiting(dir = DIR, now = new Date(), { root = ROOT, s
     const file = join(dir, 'HALT');
     if (!existsSync(file)) return null;
     return {
-      reason: redact(readFileSync(file, 'utf8')).trim().slice(0, 300) || 'A release failed.',
+      // The reason in HALT, not its JSON: parse first, then redact, so redaction cannot break the JSON.
+      reason: redact(haltReason(readFileSync(file, 'utf8'))).trim().slice(0, 300) || 'A release failed.',
       at: statSync(file).mtime.toISOString(),
       fixProblem: readState(dir).fixProblem ?? null,
       held: slotList.filter((s) => s.state === 'held' && s.haltedBy && s.heldStory).map((s) => s.heldStory),

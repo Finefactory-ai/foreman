@@ -413,9 +413,38 @@ describe('sf-delta', () => {
         postDestructive: path.join(out, 'postDestructiveChanges.xml'),
         deletes: [{ type: 'ApexClass', member: 'AcmeA' }, { type: 'ApexClass', member: 'AcmeZ' }],
         byHand: [{ type: 'Flow', member: 'Acme_Intake' }, { type: 'RecordType', member: 'Case.Acme_Claim' }],
+        held: [],
         sha256: sha(path.join(out, 'destructiveChanges', 'destructiveChanges.xml')),
       });
       expect(manifestTypes(r.postDestructive)).toEqual({ ApexClass: ['AcmeA', 'AcmeZ'] });
+    });
+
+    it('buildDelta keeps a held delete out of deletes and postDestructiveChanges.xml and returns it in held, still hashing the whole destructiveChanges.xml', () => {
+      const out = path.join(state, 'hold-delta');
+      const { iso } = isoFor([[/^sf sgd source delta /, sgd({ destructive: { ApexClass: ['AcmeY', 'AcmeX'], AiAuthoringBundle: ['Acme_Order_Helper'] } })]]);
+      const hold = [{ type: 'ApexClass', member: 'AcmeX', agent: 'Acme_Order_Helper' }, { type: 'AiAuthoringBundle', member: 'Acme_Order_Helper', agent: 'Acme_Order_Helper' }, { type: 'ApexClass', member: 'AcmeNotDeleted' }];
+      const r = buildDelta(iso, { from: 'm1', to: 'r1', dir: out, hold });
+      expect(r.deletes).toEqual([{ type: 'ApexClass', member: 'AcmeY' }]);
+      expect(r.held).toEqual([{ type: 'AiAuthoringBundle', member: 'Acme_Order_Helper', agent: 'Acme_Order_Helper' }, { type: 'ApexClass', member: 'AcmeX', agent: 'Acme_Order_Helper' }]);
+      expect(manifestTypes(r.postDestructive)).toEqual({ ApexClass: ['AcmeY'] });
+      expect(r.sha256).toBe(sha(path.join(out, 'destructiveChanges', 'destructiveChanges.xml')));
+    });
+
+    it('buildDelta matches a hold on type and member, so a class named like a held bundle is still deleted', () => {
+      const out = path.join(state, 'hold-type-delta');
+      const { iso } = isoFor([[/^sf sgd source delta /, sgd({ destructive: { ApexClass: ['AcmeX'] } })]]);
+      const r = buildDelta(iso, { from: 'm1', to: 'r1', dir: out, hold: [{ type: 'AiAuthoringBundle', member: 'AcmeX' }] });
+      expect(r.deletes).toEqual([{ type: 'ApexClass', member: 'AcmeX' }]);
+      expect(r.held).toEqual([]);
+    });
+
+    it('buildDelta leaves a held Flow in byHand', () => {
+      const out = path.join(state, 'hold-flow-delta');
+      const { iso } = isoFor([[/^sf sgd source delta /, sgd({ destructive: { Flow: ['Acme_Intake'] } })]]);
+      const r = buildDelta(iso, { from: 'm1', to: 'r1', dir: out, hold: [{ type: 'Flow', member: 'Acme_Intake' }] });
+      expect(r.byHand).toEqual([{ type: 'Flow', member: 'Acme_Intake' }]);
+      expect(r.held).toEqual([]);
+      expect(r.deletes).toEqual([]);
     });
 
     it('buildDelta passes no cwd when none is given', () => {

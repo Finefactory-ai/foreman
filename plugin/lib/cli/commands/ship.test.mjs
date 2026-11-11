@@ -219,6 +219,41 @@ describe('foreman ship', () => {
     expect(out).not.toContain('acme_file');
   });
 
+  describe('the time the story was last rolled back (ctx.rolledBackAt)', () => {
+    const AT = '2026-11-10T18:00:00Z';
+    const acme = { version: 1, project: { name: 'Acme' }, pack: 'acme', ship: { steps: ['acme-deploy'] } };
+    const shipWith = async ({ config = acme, packs }) => {
+      fs.writeFileSync(path.join(dir, 'foreman.config.json'), JSON.stringify(config));
+      const state = path.join(dir, 'state');
+      const seen = [];
+      const command = makeShipCommand({ sh: fakeSh([]), packs, runShip: async ({ ctx }) => (seen.push(ctx), { code: 0, result: { stage: 'shipped' } }) });
+      let out = '';
+      const code = await command.run(['--story', 'S-1'], { cwd: dir, root: dir, env: { FOREMAN_PROJECT_DIR: dir, FOREMAN_STATE_DIR: state }, stdout: { write: (s) => { out += s; } }, stderr: { write: () => {} } });
+      return { code, seen, state };
+    };
+
+    it('is what the pack says, asked for the state folder and the story', async () => {
+      const asked = [];
+      const { code, seen, state } = await shipWith({ packs: { acme: fakePack({ rolledBackAt: (a) => (asked.push(a), AT) }) } });
+      expect(code).toBe(0);
+      expect(seen).toHaveLength(1);
+      expect(seen[0].rolledBackAt).toBe(AT);
+      expect(asked).toEqual([{ dir: state, story: 'S-1' }]);
+    });
+
+    it.each([
+      ['the config names no pack', { config: { version: 1, project: { name: 'Acme' } }, packs: { acme: fakePack({ rolledBackAt: () => AT }) } }],
+      ['the pack gives none', { packs: { acme: fakePack({ rolledBackAt: () => null }) } }],
+      ['the pack throws', { packs: { acme: fakePack({ rolledBackAt: () => { throw new Error('boom'); } }) } }],
+      ['the pack gives something that is not a time', { packs: { acme: fakePack({ rolledBackAt: () => 'not a time' }) } }],
+    ])('is null, and the release still runs, when %s', async (_name, opts) => {
+      const { code, seen } = await shipWith(opts);
+      expect(code).toBe(0);
+      expect(seen).toHaveLength(1);
+      expect(seen[0].rolledBackAt).toBeNull();
+    });
+  });
+
   it('stops with a JSON line naming .env.foreman when that file cannot be read', async () => {
     fs.mkdirSync(path.join(dir, '.env.foreman'));
     const r = await harness().run(['--story', 'S-1']);

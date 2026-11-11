@@ -18,6 +18,9 @@
 //     { stage, org, orgId, jobId, story, commit, at }
 //     the last thing Foreman deployed to that stage: a story's merge, or a rollback's revert.
 //
+// rolledBackAt(dir, story) reads the rollback's time, which the pack hands the supervisor so a
+// pull request merged before it does not count as shipped.
+//
 // steps/sf-deploy.mjs and steps/sf-verify.mjs mark stages reached; sf-deploy writes the stage
 // record and the first deploy, agentforce.mjs the agents, and rollback.mjs the rollback. Like
 // deploy-jobs.mjs, it imports only node built-ins and the two helpers below, and never throws
@@ -62,6 +65,13 @@ function update(dir, story, patch) {
   const record = { ...(readRelease(dir, story) ?? fresh(story, null)), ...patch };
   write(releaseFile(dir, story), record);
   return record;
+}
+
+// When the story's last release was rolled back and no release since replaced it (the `at` of its
+// rolledBack), else null. Never throws.
+export function rolledBackAt(dir, story) {
+  const rolledBack = readRelease(dir, story)?.rolledBack;
+  return isObject(rolledBack) && typeof rolledBack.at === 'string' && rolledBack.at ? rolledBack.at : null;
 }
 
 export const recordFirstDeploy = (dir, story, first) => update(dir, story, { first, rolledBack: null });

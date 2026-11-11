@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ALIAS } from './config.mjs';
-import { readScratchOrgs, removeScratchOrg, scratchAlias, scratchFile, storiesInSlots, writeScratchOrg } from './scratch-orgs.mjs';
+import { claimedStories, readScratchOrgs, removeScratchOrg, scratchAlias, scratchFile, storiesInSlots, writeScratchOrg } from './scratch-orgs.mjs';
 
 let dir;
 beforeEach(() => {
@@ -85,5 +85,28 @@ describe('storiesInSlots', () => {
   it('is empty with no slots folder', () => {
     expect(storiesInSlots(dir).size).toBe(0);
     expect(storiesInSlots(undefined).size).toBe(0);
+  });
+});
+
+describe('claimedStories', () => {
+  it('lists every claims/*.json name, whoever holds it and whether or not it parses', () => {
+    const claims = path.join(dir, 'claims');
+    fs.mkdirSync(claims, { recursive: true });
+    fs.writeFileSync(path.join(claims, 'ACME-1.json'), JSON.stringify({ holder: 'factory', pid: 1 }));
+    fs.writeFileSync(path.join(claims, 'ACME-2.json'), JSON.stringify({ holder: 'owner' }));
+    fs.writeFileSync(path.join(claims, 'ACME-3.json'), '{ broken');
+    fs.writeFileSync(path.join(claims, 'ACME-4.txt'), 'not a claim');
+    fs.writeFileSync(path.join(claims, 'ACME-5.json.tmp'), 'not a claim');
+    expect([...claimedStories(dir)].sort()).toEqual(['ACME-1', 'ACME-2', 'ACME-3']);
+  });
+  it('is empty with no claims folder, or when the state folder is not text', () => {
+    expect(claimedStories(dir).size).toBe(0);
+    expect(claimedStories(undefined).size).toBe(0);
+    expect(claimedStories(42).size).toBe(0);
+    expect(claimedStories('').size).toBe(0);
+  });
+  it('is empty when claims is a file, not a folder', () => {
+    fs.writeFileSync(path.join(dir, 'claims'), 'x');
+    expect(claimedStories(dir).size).toBe(0);
   });
 });

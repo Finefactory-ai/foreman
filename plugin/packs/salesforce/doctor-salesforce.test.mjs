@@ -236,7 +236,7 @@ describe('the salesforce doctor group', () => {
     const res = await runAll(acmeConfig(), ctxFor({ env: {} }));
     for (const [name, r] of Object.entries(res)) expect(r, name).toMatchObject(OK);
   });
-  it('in scratch mode, warns once for the build orgs and checks no pool, tracking or Dev Hub', async () => {
+  it('in scratch mode, the build check reads the Dev Hub sign-in from the org list and checks no pool or tracking', async () => {
     const edit = (b) => {
       b.orgs['acme-hub'] = { orgId: ACME_UAT_ID };
       b.build = { scratch: { devHub: 'acme-hub', definition: 'config/project-scratch-def.json' } };
@@ -262,7 +262,8 @@ describe('the salesforce doctor group', () => {
       'salesforce telemetry',
       'salesforce CONFIRM_PROD',
     ]);
-    expect(res['salesforce org build']).toEqual(expect.objectContaining({ ...WARN, detail: 'scratch mode: build orgs are made per story and are not checked here' }));
+    expect(res['salesforce org build']).toEqual(expect.objectContaining({ ...FAIL }));
+    expect(res['salesforce org build'].detail).toMatch(/^the Dev Hub acme-hub is not signed in/);
     expect(ctx.sh.sfLines().some((l) => l.includes('acme-hub') || l.includes('SourceMember'))).toBe(false);
     expect(res['salesforce layout'].detail).toMatch(/^build scratch orgs from acme-hub; /);
   });
@@ -292,6 +293,81 @@ describe('the salesforce doctor group', () => {
     const empty = ctxFor();
     await expect(runAll({}, empty)).resolves.toBeTypeOf('object');
     await expect(runAll({ salesforce: null, checks: 'x' }, empty)).resolves.toBeTypeOf('object');
+  });
+});
+
+describe('the scratch Dev Hub sign-in', () => {
+  const BUILD = 'salesforce org build';
+  const hubEdit = (devHub = 'acme-hub') => (b) => {
+    b.orgs['acme-hub'] = { orgId: ACME_UAT_ID };
+    b.build = { scratch: { devHub, definition: 'config/project-scratch-def.json' } };
+  };
+  const listWith = (hub) => ({ [ORG_LIST]: orgList([acmeOrg('acme-qa', ACME_QA_ID), acmeOrg('acme-dev1', ACME_DEV1_ID), ...(hub ? [hub] : [])]) });
+  const jwtHub = { ...acmeOrg('acme-hub', ACME_UAT_ID), clientId: '3MVG9acmeKey', privateKey: '/keys/acme/server.key' };
+  const webHub = { ...acmeOrg('acme-hub', ACME_UAT_ID), clientId: 'PlatformCLI' };
+  const sfPrefix = () => `HOME=${sfHome} SF_USE_GENERIC_UNIX_KEYCHAIN=true sf`;
+  const LOGIN = () => `${sfPrefix()} org login web --alias acme-hub --instance-url https://login.salesforce.com`;
+  const HINT = "sign the Dev Hub in to Foreman's sf home with `sf org login web`, not JWT";
+
+  it('refuses a Dev Hub signed in by JWT and names the fix', async () => {
+    const ctx = ctxFor({ routes: listWith(jwtHub) });
+    const res = await runAll(acmeConfig(hubEdit()), ctx);
+    const r = res[BUILD];
+    expect(r).toMatchObject(FAIL);
+    expect(r.detail).toContain('acme-hub is signed in by JWT');
+    expect(r.detail).toContain(`${sfPrefix()} org logout --target-org acme-hub --no-prompt`);
+    expect(r.detail).toContain(LOGIN());
+    for (const secret of ['/keys/acme/server.key', '3MVG9acmeKey', '@']) expect(r.detail).not.toContain(secret);
+    expect(r.fix.hint).toBe(HINT);
+  });
+  it('passes a Dev Hub signed in on the web', async () => {
+    const res = await runAll(acmeConfig(hubEdit()), ctxFor({ routes: listWith(webHub) }));
+    expect(res[BUILD]).toEqual({ ...OK, detail: "the Dev Hub acme-hub is signed in without JWT, so sf can make the stories' scratch orgs" });
+  });
+  it('fails a Dev Hub that is not signed in, with the login line', async () => {
+    const res = await runAll(acmeConfig(hubEdit()), ctxFor());
+    expect(res[BUILD]).toMatchObject(FAIL);
+    expect(res[BUILD].detail.startsWith('the Dev Hub acme-hub is not signed in to the isolated sf home')).toBe(true);
+    expect(res[BUILD].detail).toContain(`${sfPrefix()} org login web --alias acme-hub`);
+    expect(res[BUILD].fix.hint).toBe(HINT);
+  });
+  it('fails a list that cannot be read, naming no username', async () => {
+    const res = await runAll(acmeConfig(hubEdit()), ctxFor({ routes: { [ORG_LIST]: sfError('SfError', 'broken for x@acme.example') } }));
+    expect(res[BUILD]).toMatchObject(FAIL);
+    expect(res[BUILD].detail).toContain('could not list the orgs in the isolated sf home');
+    expect(res[BUILD].detail).not.toContain('@');
+    expect(res[BUILD].fix.hint).toBe("check that `sf org list` runs in Foreman's sf home, then run the doctor again");
+    expect(res[BUILD].fix.hint).not.toBe(HINT);
+  });
+  it('fails a Dev Hub alias that points at an org not in salesforce.orgs', async () => {
+    const res = await runAll(acmeConfig(hubEdit()), ctxFor({ routes: listWith(acmeOrg('acme-hub', '00D000000000009AAA')) }));
+    expect(res[BUILD]).toMatchObject(FAIL);
+    expect(res[BUILD].detail).toContain('not in salesforce.orgs');
+    expect(res[BUILD].fix.hint).toBe("keep only the sandboxes in salesforce.orgs in Foreman's sf home");
+    expect(res[BUILD].fix.hint).not.toBe(HINT);
+  });
+  it('fails a home that is not an absolute path', async () => {
+    const res = await runAll(acmeConfig(hubEdit()), ctxFor({ env: { FOREMAN_SF_HOME: '~/sf-home' } }));
+    expect(res[BUILD]).toMatchObject({ ...FAIL, detail: 'FOREMAN_SF_HOME must be an absolute path, not ~/sf-home' });
+    expect(res[BUILD].fix.hint).toBe('set FOREMAN_SF_HOME to an absolute path, or unset it');
+    expect(res[BUILD].fix.hint).not.toBe(HINT);
+  });
+  it('fails a Dev Hub that is no alias or is not named, without throwing', async () => {
+    const bad = await runAll(acmeConfig(hubEdit('-o')), ctxFor());
+    expect(bad[BUILD]).toMatchObject({ ...FAIL, detail: 'scratch mode: salesforce.build.scratch.devHub is not a valid org alias' });
+    expect(bad[BUILD].detail).not.toContain('-o');
+    expect(bad[BUILD].fix.hint).toBe('set salesforce.build.scratch.devHub to the alias of your Dev Hub in salesforce.orgs');
+    const none = await runAll(acmeConfig((b) => { b.build = { scratch: {} }; }), ctxFor());
+    expect(none[BUILD]).toMatchObject(FAIL);
+    expect(none[BUILD].detail).toContain('names no Dev Hub');
+    expect(none[BUILD].fix.hint).toBe('set salesforce.build.scratch.devHub to the alias of your Dev Hub in salesforce.orgs');
+  });
+  it('makes no sf call beyond the shared org list', async () => {
+    const ctx = ctxFor({ routes: listWith(jwtHub) });
+    await runAll(acmeConfig(hubEdit()), ctx);
+    const lines = ctx.sh.sfLines();
+    expect(lines.filter((l) => l.startsWith('org list'))).toHaveLength(1);
+    for (const none of ['org create scratch', 'org login', 'org list auth']) expect(lines.some((l) => l.includes(none)), none).toBe(false);
   });
 });
 

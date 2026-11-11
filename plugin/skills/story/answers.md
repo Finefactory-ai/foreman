@@ -25,6 +25,17 @@ three options below) is applied like this, `<ID>` being its `story`:
   `<branchPrefix><ID in lower case>`), delete that branch on `<remote>`
   (`git push <remote> --delete <its branch>`; ignore the failure when it is not there), then `foreman story block <ID> --reason "Dropped by the owner on <date>"`.
 
+An answered item titled `<ID> could not be released` (the supervisor asks it when a story ended
+failed and blocked with nothing else open for it, and closes it when the story ships) is applied
+like this, `<ID>` being its `story`:
+
+- **"Retry the release"** —
+  `foreman story todo <ID> --note 'The owner asked to retry the release: resume from the built branch and ship it again.< Note for the architect: the note from the answer, when given>'`.
+  The next session's resume rule finds the branch and goes to the release.
+- **"I'll take it"** and **"Drop"** — as for the review options above.
+
+Then `foreman decide applied <item id>`.
+
 An answered item titled `Add depends_on: <ids> to <ID>?` is applied like this:
 
 - **"Apply"** — `foreman story set <ID> --depends-on <the story's current depends_on plus
@@ -78,12 +89,23 @@ from step 3, and any session applies it, whatever its `story`: `foreman story to
 then `foreman decide applied <item id>`. That note is how the choice reaches the architect, in
 the words the supervisor uses when it applies the answer itself.
 
+An answered item whose `kind` is `task` is applied like this, and any session applies it,
+whatever its `story`:
+
+- **"Retry the story"** — `foreman story todo <ID> --note 'Note for the architect: the owner
+  answered "<the title of the item>" with "Retry the story".< the note from the answer, when given>'`,
+  then `foreman decide applied <item id>`.
+- **"Close the task"**, or a task answered only in words (one asked before tasks had these
+  options) — change nothing on the story, even when it is blocked, and run
+  `foreman decide applied <item id>`.
+
 The supervisor also applies, on its next tick even while sessions run, the answers to
-`Close <ID>: nothing to build?`, `Decide for <ID>: ...` and any other task or decision about
+`Close <ID>: nothing to build?`, `Decide for <ID>: ...` and any other decision about
 a story that is blocked for a reason in words or in progress, when no claim, session or slot holds
-that story: it closes the story or puts it back to todo with the answer in a note for the
-architect. Before applying one of these, run `foreman decide pending` again and apply it only
-if it is still listed.
+that story, and tasks count only when answered "Retry the story": it closes the story or puts it
+back to todo with the answer in a note for the architect. It also marks a closed task applied
+whatever its story's state. Before applying one of these, run `foreman decide pending` again and
+apply it only if it is still listed.
 
 An answered item titled `Allow deletes for <ID>?` comes from step 5 (ship exit 10), and any
 session applies it, whatever its `story`:

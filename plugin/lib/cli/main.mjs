@@ -20,7 +20,14 @@
 // folder they would act on has a live supervisor that started this process, so an environment
 // stripped back to the owner's shape still cannot reach the run; `alive` and `parents` stand in
 // for that check's process lookups in tests.
+// First of all, in a story session (FOREMAN_RUN=1), the CLI checks that it runs from the plugin
+// folder the supervisor gave the session (FOREMAN_PLUGIN_ROOT) and, when it does not, adds one
+// warn event on the slot, once per session (lib/engine/foreman-command.mjs selfCheck). That is how
+// a shell alias for `foreman` shows. It never changes the exit code, stdout or stderr; `pluginRoot`
+// stands in for the CLI's own folder in tests.
 
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import config from './commands/config.mjs';
 import story from './commands/story.mjs';
 import stage from './commands/stage.mjs';
@@ -52,6 +59,7 @@ import keys from './commands/keys.mjs';
 import claude from './commands/claude.mjs';
 import { CONTROL_COMMANDS } from './commands/control.mjs';
 import { projectRoot } from '../engine/paths.mjs';
+import { selfCheck } from '../engine/foreman-command.mjs';
 import { guardedWrite, refuseAnchorWrite, refuseOwnerControl, refuseRunState, sessionPlace, unknownPlace } from '../engine/run-guard.mjs';
 import { PACKS, packCommands } from '../../packs/index.mjs';
 import { stateMode, withState } from '../state-store/with-state.mjs';
@@ -70,6 +78,9 @@ export function commandList(core, packs = PACKS) {
 const CORE = [run, service, init, doctor, setup, config, settings, features, jira, cloud, keys, claude, story, stage, lock, checks, review, ship, release, health, notify, status, report, dashboard, ...CONTROL_COMMANDS, decide, learn, learning, workflowArgs, traits];
 const COMMANDS = commandList(CORE);
 
+// The plugin folder this CLI runs from.
+const SELF_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+
 const EXIT_USAGE = 64;
 // Commands whose subcommand goes in the state commit's message.
 const BY_SUB_NAMES = new Set(['decide', 'story', 'settings', 'learn', 'learning', 'release', 'claude']);
@@ -84,7 +95,8 @@ function usage() {
   return ['usage: foreman <command> [args]', '', 'commands:', ...lines, ''].join('\n');
 }
 
-export async function main(argv, { cwd, env, stdout, stderr, now, sh, sleep, alive, parents }) {
+export async function main(argv, { cwd, env, stdout, stderr, now, sh, sleep, alive, parents, pluginRoot }) {
+  if (env?.FOREMAN_RUN === '1') selfCheck({ env, self: pluginRoot ?? SELF_ROOT, now: now ? now() : new Date() });
   const [name, ...args] = argv;
   if (name === undefined || name === '--help' || name === 'help') {
     stdout.write(usage());

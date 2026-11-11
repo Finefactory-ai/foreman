@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import watch from './watch.mjs';
+import watch, { runCommand } from './watch.mjs';
 import deployGithub from './deploy-github.mjs';
 import { onFailureFor } from './registry.mjs';
 import { runShip } from '../../engine/ship.mjs';
@@ -29,7 +29,8 @@ describe('watch step', () => {
     expect(watch.name).toBe('watch');
     expect(watch.needs).toEqual(['sh']);
     expect(watch.halts).toBe(true);
-    expect(typeof watch.label).toBe('string');
+    expect(typeof watch.label).toBe('function');
+    expect(watch.label({ config: {} })).toBe('watching production after the deploy');
   });
 
   it('by default runs the command every 60 s for 10 minutes and passes when it never complains', async () => {
@@ -90,6 +91,14 @@ describe('watch step', () => {
     expect(r.reason).toContain('auth failed');
   });
 
+  it('runCommand gives the last stdout line as printed, for parsing, and redacts only the tail', () => {
+    const ctx = ctxFor([{ status: 0, stdout: 'done\n{"manualSteps":["Rotate ACME_TOKEN=s3cr3tvalue"]}\n', stderr: '' }]);
+    const r = runCommand(ctx, CMD, 120);
+    expect(r.last).toBe('{"manualSteps":["Rotate ACME_TOKEN=s3cr3tvalue"]}');
+    expect(r.tail).not.toContain('s3cr3tvalue');
+    expect(r.ok).toBe(true);
+  });
+
   it('says the exit code when the command prints nothing', async () => {
     const r = await watch.run(ctxFor([3]));
     expect(r.reason).toBe(`${CMD} reported a problem after the deploy: it exited 3 with no output.`);
@@ -147,6 +156,8 @@ describe('watch with rollback, in a release', () => {
     expect(result).toMatchObject({ stage: 'watch', rolledBack: true });
     expect(result.reason).toBe(`Production was rolled back with \`${ROLLBACK}\`. ${CMD} reported a problem after the deploy: 5xx rate 12%`);
     expect(JSON.parse(fs.readFileSync(ctx.haltFile, 'utf8'))).toEqual(result);
+    expect(ctx.reports).toContain('watching production after the deploy');
+    expect(ctx.reports).toContain('rolling production back');
   });
 
   it('says production may be broken when the rollback fails, and HALT stays written', async () => {
@@ -162,6 +173,74 @@ describe('watch with rollback, in a release', () => {
     const { result } = await release(releaseCtx({ status: 1, timedOut: true }));
     expect(result.rolledBack).toBe(false);
     expect(result.reason).toMatch(/^Rollback failed \(`vercel rollback --yes` did not finish within 300 s\); production may be broken\. /);
+  });
+});
+
+describe('watch and rollback with the Salesforce pack', () => {
+  const ROLLBACK = 'foreman sf rollback "$FOREMAN_STORY"';
+  const merge = { name: 'merge', pointOfNoReturn: true, needs: [], run: () => ({ ok: true, sha: 'abc' }) };
+  const deploy = { name: 'sf-deploy-qa', needs: [], deploys: true, run: () => ({ ok: true, sfDeploys: { qa: { org: 'acme-qa', jobId: 'j' } } }) };
+  const configFor = (watchOptions = { command: CMD, minutes: 2 }) => ({
+    pack: 'salesforce',
+    salesforce: { orgs: { 'acme-qa': { orgId: '00D000000000001AAA' } }, stages: [{ name: 'qa', org: 'acme-qa' }] },
+    ship: { watch: watchOptions, rollback: { command: ROLLBACK } },
+  });
+  const ctxFor = (rollbackAnswer = 0, watchOptions) => fakeCtx({
+    config: configFor(watchOptions),
+    rules: [
+      [`sh -c ${CMD}`, () => ({ status: 1, stdout: '3 new errors' })],
+      [`sh -c ${ROLLBACK}`, () => rollbackAnswer],
+    ],
+    env: ENV,
+    root: '/project',
+  });
+  const release = (ctx) => runShip({ steps: [merge, deploy, watch], ctx, onFailure: onFailureFor(ctx.config) });
+
+  it('names the stage and its org in the watch and rollback reports and in the reason, never production', async () => {
+    const ctx = ctxFor();
+    const { code, result } = await release(ctx);
+    expect(code).toBe(5);
+    expect(ctx.reports).toContain('watching qa (acme-qa) after the deploy');
+    expect(ctx.reports).toContain('rolling S-1 back on qa (acme-qa)');
+    expect(ctx.reports.filter((r) => /production/i.test(r))).toEqual([]);
+    expect(result).toMatchObject({ stage: 'watch', rolledBack: true });
+    expect(result.reason).toMatch(/^qa \(acme-qa\) was rolled back with `foreman sf rollback "\$FOREMAN_STORY"`\. /);
+    expect(result.reason).not.toMatch(/production/i);
+    expect(ctx.halts.map((h) => h.reason).filter((r) => /production/i.test(r))).toEqual([]);
+  });
+
+  it('says the stage may be broken when the rollback fails', async () => {
+    const { result } = await release(ctxFor(1));
+    expect(result.rolledBack).toBe(false);
+    expect(result.reason).toContain('qa (acme-qa) may be broken');
+    expect(result.reason).not.toMatch(/production/i);
+  });
+
+  it('says the stage was not watched when the watch command is not set', async () => {
+    const { code, result } = await release(ctxFor(0, {}));
+    expect(code).toBe(5);
+    expect(result.reason).toContain('ship.watch.command is not set, so qa (acme-qa) was not watched.');
+    expect(result.reason).not.toMatch(/production/i);
+  });
+
+  it('says the stage could not be checked when a run takes too long, in the release and in health', async () => {
+    const ctx = fakeCtx({ config: configFor({ command: CMD, timeoutSeconds: 30 }), rules: [[`sh -c ${CMD}`, () => ({ status: 1, timedOut: true })]], env: ENV, root: '/project' });
+    expect((await watch.run(ctx)).reason).toBe(`${CMD} did not finish within 30 s, so qa (acme-qa) could not be checked.`);
+    expect((await watch.healthy(ctx)).reason).toBe(`${CMD} did not finish within 30 s, so qa (acme-qa) could not be checked.`);
+  });
+
+  it('follows the deploy facts: with a later stage deployed, names that stage', () => {
+    const config = configFor();
+    config.salesforce.orgs['acme-uat'] = { orgId: '00D000000000002AAA' };
+    config.salesforce.stages.push({ name: 'uat', org: 'acme-uat' });
+    expect(watch.label({ config, sfDeploys: { qa: {}, uat: {} } })).toBe('watching uat (acme-uat) after the deploy');
+    expect(watch.label({ config, sfDeploys: { qa: {} } })).toBe('watching qa (acme-qa) after the deploy');
+  });
+
+  it('says production for a pack with no stages, and for an unknown pack', () => {
+    const none = { ...configFor(), salesforce: { orgs: {}, stages: [] } };
+    expect(watch.label({ config: none })).toBe('watching production after the deploy');
+    expect(watch.label({ config: { ...configFor(), pack: 'nope' } })).toBe('watching production after the deploy');
   });
 });
 

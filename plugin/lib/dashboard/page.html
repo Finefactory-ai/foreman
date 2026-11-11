@@ -2169,6 +2169,7 @@ select option{background:var(--deep);color:var(--text)}
     }
 
     const options = Array.isArray(it.options) ? it.options : [];
+    const asDone = it.kind === 'task' && !options.length;
     const d = drafts[it.id] || (drafts[it.id] = { choice: null, text: '', error: '' });
     if (options.length) {
       const opts = el('div', 'opts'); opts.setAttribute('role', 'group'); opts.setAttribute('aria-label', 'Options');
@@ -2186,7 +2187,7 @@ select option{background:var(--deep);color:var(--text)}
     ta.value = d.text;
     card.append(ta);
     const row = el('div', 'row');
-    const save = el('button', 'btn', it.kind === 'task' ? 'Mark done' : 'Save answer'); save.type = 'button';
+    const save = el('button', 'btn', asDone ? 'Mark done' : 'Save answer'); save.type = 'button';
     const key = 'dec:' + it.id + ':save'; save.dataset.key = key;
     const ready = () => (options.length ? !!d.choice : it.kind === 'task' || !!d.text.trim());
     const refresh = () => { save.disabled = !canAct() || busy.has(key) || !ready(); };
@@ -2206,7 +2207,7 @@ select option{background:var(--deep);color:var(--text)}
       await loadDecisions();
       renderDecisions();
     });
-    row.append(withHelp(save, helpFor(help, 'form', it.kind === 'task' ? 'mark-done' : 'save-answer'), key, { hint: false }));
+    row.append(withHelp(save, helpFor(help, 'form', asDone ? 'mark-done' : 'save-answer'), key, { hint: false }));
     if (changing.has(it.id)) {
       const keep = el('button', 'btn ghost', 'Keep the old answer'); keep.type = 'button'; keep.dataset.key = 'dec:' + it.id + ':keep';
       keep.addEventListener('click', () => { changing.delete(it.id); delete drafts[it.id]; renderDecisions(); });

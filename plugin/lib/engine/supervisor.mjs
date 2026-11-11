@@ -321,7 +321,9 @@
 // event at start (not after a restart) says so, the same sentence `foreman doctor` shows. A
 // session's init event, read once from the head of its log, is then checked: a warn event on its
 // slot says when it loaded Foreman from anywhere but PLUGIN_DIR, or not at all. A session kept
-// across a restart is not checked again. A restart on new code moves the sessions too.
+// across a restart is not checked again. A restart on new code moves the sessions too. Every
+// session also gets FOREMAN_PLUGIN_ROOT, the resolved PLUGIN_DIR, whether or not --plugin-dir is
+// passed: the `foreman` CLI warns on the slot when it runs from another folder (foreman-command.mjs).
 //
 // Secrets: this process loads neither the project's env file nor Foreman's own keys file
 // (.env.foreman). Only the children that need keys load them (`foreman notify` and the
@@ -342,6 +344,10 @@
 // until HH:MM". The environment wait has its own end time (counters.envUntil), never the API
 // wait's, so a slot held for the API keeps its own retry time and is released only when the API
 // wait ends; state.json's envWait ({ since, until, step }) shows while it lasts, as an FYI.
+//
+// Every failed ending whose story will not be picked again by itself (blocked for a reason in
+// words, or unreadable) raises '<ID> could not be released' on Waiting on you unless an item about
+// the story is already open (engine/failed-ask.mjs); a shipped ending closes any open one.
 //
 // Only a story the pipeline rejected counts toward the three-in-a-row pause. A crash, a watchdog
 // stop and a failed end with `foreman story end failed --cause environment` (CI that never started,
@@ -381,9 +387,10 @@ import { adoptLegacySchemaLock, breakIfStale, claimFile, claims, dropOwnerClaim,
 import { byPriority, needsExclusive, nextStory, waitsOnStories } from './pick.mjs';
 import { dropReservations, reserveForStart, spendWait, waitOf, waitsOnFiles } from './file-locks.mjs';
 import { reconcile, recoverySteps } from './reconcile.mjs';
-import { afterFixCheck, afterOutcome, apiHeldText, backoffMs, backoffShown, canPick, canResume, envWhy, failCauseOf, hung, LET_GO_PATCH, looseClaims, looseClaimText, lastProgressText, newestStep, NOTHING_LEFT, outcome, OWNER_CLAIM_POLL_SECONDS, ownerClaimText, pendingCommands, releaseAfterWait, releaseHeld, resumeHeld, SETTLED, settledOwnerClaims, signinRun, slotStoryId, spentResult, STANDBY, whenNothingLeft } from './scheduler.mjs';
-import { closeInstead, mergedPrOfAsync } from './resume-close.mjs';
-import { doneChange, openStorySource, preferCachedStories, storyUpdate } from './story-source.mjs';
+import { afterFixCheck, afterOutcome, apiHeldText, backoffMs, backoffShown, canPick, canResume, dropSteps, envWhy, failCauseOf, hung, LET_GO_PATCH, looseClaims, looseClaimText, lastProgressText, newestStep, NOTHING_LEFT, outcome, OWNER_CLAIM_POLL_SECONDS, ownerClaimText, pendingCommands, releaseAfterWait, releaseHeld, resumeHeld, SETTLED, settledOwnerClaims, signinRun, slotStoryId, spentResult, STANDBY, whenNothingLeft, workStop, workStopText } from './scheduler.mjs';
+import { checkBeforeEnv, closeInstead, mergedPrOfAsync, rolledBackAtOf } from './resume-close.mjs';
+import { packFor } from '../../packs/index.mjs';
+import { doneChange, fetchStoryTarget, openStorySource, preferCachedStories, storyUpdate } from './story-source.mjs';
 import { EXPIRED_MESSAGE } from '../jira/auth.mjs';
 import { jiraEnv } from '../jira/cache.mjs';
 import { foremanEnvName, sessionKeys } from './foreman-keys.mjs';
@@ -392,6 +399,7 @@ import { creditProbeDue, creditRetryMs, resumeAtFor, retrySentence, retryWhen } 
 import { PROBE_EVERY_TICKS, probeDue, SIGNIN_PAUSE } from './signin-probe.mjs';
 import { jiraRefresher } from '../jira/refresher.mjs';
 import { SF_EXPIRED_MESSAGE, salesforceRefresher } from '../adapters/stories/salesforce-refresher.mjs';
+import { haltReason } from './halt-reason.mjs';
 import { loadResolved } from '../settings/load.mjs';
 import { liveSettings, recordsRuns, watchdogLimits } from './live-settings.mjs';
 import { saveLastGood } from './config-health.mjs';
@@ -407,6 +415,7 @@ import { preparePackSessions } from './pack-session.mjs';
 import { configDir, sessionScope } from './session-scope.mjs';
 import { copyWarning, initPluginWarning, installedCopies, ownCopy, sessionPlugin } from './plugin-copy.mjs';
 import { openConsole } from './console.mjs';
+import { failedAsk, releaseAsksFor, resumesByItself } from './failed-ask.mjs';
 import { flushStoryNotes, noteOnStory } from './story-notes.mjs';
 import { sessionEnding } from './story-note-text.mjs';
 import { answerNote, queueStoryNote } from './story-notes-queue.mjs';
@@ -418,7 +427,7 @@ import { sessionRecords } from './session-records.mjs';
 import { standbyWatch } from './standby.mjs';
 import { storyClaims } from './story-claims.mjs';
 import * as session from './session.mjs';
-import { closableMergedIds, keepAwake, keepAwakeCommand, mustFinishFor, remoteHasBranch } from './startup.mjs';
+import { closableMergedIds, keepAwake, keepAwakeCommand, mustFinishFor, remoteHasBranch, shippedBranches } from './startup.mjs';
 import { loopRest, tickMs } from './wake.mjs';
 import { takeOver } from './move-work.mjs';
 import { renameWritten } from './read-cache.mjs';
@@ -435,7 +444,7 @@ import { heldSpawnSync, recordSyncChildren } from './loop-holds.mjs';
 import { ownerCommands } from './owner-commands.mjs';
 import { NODE_CHECK_MS, nodeWatch, restartFor, serviceNodeOf, spawnSh } from './node-path.mjs';
 import { doubleText, holderFor, listStorySessions, logFor, planLive } from './live-sessions.mjs';
-import { answerSkips, answersToApply, applyAnswers, EVERY_TICK, failedAnswer, heldForAnswer, mayApplyAnswers, waitsForAnswer } from './answers.mjs';
+import { answerSkips, answersToApply, applyAnswers, EVERY_TICK, failedAnswer, heldForAnswer, mayApplyAnswers, releaseTitle, waitsForAnswer } from './answers.mjs';
 import { endedLate, outlived, outliveMs, readHead, readTail } from './session-outlive.mjs';
 import { ownerEnv } from './run-guard.mjs';
 import { clearAdopted, clearPid, dropAdopted, writeAdopted, writePid } from './supervisor-pid.mjs';
@@ -483,6 +492,8 @@ if (!loaded.config) {
   process.exit(1);
 }
 const CONFIG = loaded.config;
+// The pack the config names (the config is already valid): asked when a story's last release was rolled back.
+const PACK = packFor(CONFIG);
 const SLOT_IDS = slotIds(CONFIG);
 // The state folder the config names (FOREMAN_STATE_DIR wins), passed on to every child so the
 // sessions, `foreman notify` and the owner's commands all use the same one.
@@ -624,6 +635,7 @@ const work = []; // queued work: { slot: 'wN'|null, id, mode, resume?, from?, ra
 const crashes = new Map(); // story id -> crashes this run
 const signins = new Map(); // story id -> sign-in deaths in a row this run while the check passed
 const skipped = new Set(CARRIED?.skipped ?? []); // stories skipped by the owner this run
+const closedShipped = new Set(); // stories closed this run because they had shipped, kept out of the pick
 const answerFailures = new Map(); // decision id -> failedAnswer (answers.mjs): an answer that could not be applied, tried again after a growing wait or when the owner presses Retry
 const downs = new Map(); // slot -> environment failures in a row
 let counters = CARRIED?.counters ?? { misses: 0, missed: [], backoffs: 0, backoffUntil: 0, envUntil: 0, envEndings: 0, envList: [], envWaits: 0 };
@@ -713,14 +725,16 @@ const pullAnchor = guarded('bringing in new code', () => {
   if (w.changed) saveRun({ anchorWait: w.wait });
 });
 // The merged pull request of a story's branch, asked in a child of its own: a promise of its url
-// (the branch when gh gives none), or null when none merged or gh cannot tell. It never rejects
+// (the branch when gh gives none), or null when none merged, when every one merged before the
+// story's last rollback (none of it is live), or when gh cannot tell. It never rejects
 // (resume-close.mjs). One look-up per story id at a time, so a caller that starts it and carries
 // on next tick never starts a second.
+const rolledBackOf = (id) => rolledBackAtOf(PACK, { dir: DIR, story: id });
 const lookUpMerged = (id) => {
   if (!lookups.has(id)) {
     lookups.set(
       id,
-      mergedPrOfAsync(branchOf(id), (args) => runAsync('gh', args, { cwd: ROOT, timeoutMs: 30_000, track: loopChildren })).finally(() => lookups.delete(id)),
+      mergedPrOfAsync(branchOf(id), (args) => runAsync('gh', args, { cwd: ROOT, timeoutMs: 30_000, track: loopChildren }), { rolledBackAt: rolledBackOf(id) }).finally(() => lookups.delete(id)),
     );
   }
   return lookups.get(id);
@@ -729,6 +743,16 @@ const lookUpMerged = (id) => {
 function statusOf(id) {
   try {
     return stories().list().find((x) => x.id === id)?.status ?? null;
+  } catch {
+    return null;
+  }
+}
+// What a story looks like in the source, { status, blockedBy }, or null when it is not listed or
+// the source cannot be read. A slot records it when it goes held (see startWork).
+function heldSnapshot(id) {
+  try {
+    const s = stories().list().find((x) => x.id === id);
+    return s ? { status: s.status, blockedBy: s.blockedBy ?? '' } : null;
   } catch {
     return null;
   }
@@ -852,7 +876,7 @@ function notify(kind, fields = {}) {
 // ── background jobs ───────────────────────────────────────────────────────────────────────
 
 // `foreman release watch`, the slot environment's sweep and the learning tick, none of which the loop waits on.
-const { parkWatch, startParkWatch, envSweep, startEnvSweep, learning } = backgroundJobs({ root: ROOT, dir: DIR, bin: FOREMAN_BIN, node: NODE, envAdapter, settings: () => LIVE, dry: DRY, once: ONCE, state, saveRun, event, guarded, now });
+const { parkWatch, startParkWatch, envSweep, startEnvSweep, sweepAtStop, learning } = backgroundJobs({ root: ROOT, dir: DIR, bin: FOREMAN_BIN, node: NODE, envAdapter, settings: () => LIVE, dry: DRY, once: ONCE, state, saveRun, event, guarded, now });
 
 // ── the Claude account checks ─────────────────────────────────────────────────────────────
 
@@ -907,7 +931,7 @@ function envReady(slot, id, outcome) {
 // when the folder or the environment answers later; then the session starts when it settles, and
 // `onFail` is called if it does not. A folder that must be created or installed (a few minutes of
 // git and `npm ci`) is prepared by children (prepareWorktree), so the loop keeps ticking.
-function launch(slot, id, mode = '', { onFail } = {}) {
+function launchNow(slot, id, mode = '', { onFail } = {}) {
   // Preparing a new slot (worktree, npm ci, its stack) can take a few minutes; show it.
   setSlot(DIR, slot, { state: 'building', reason: '', story: readSlot(DIR, slot).story ?? { id, title: '', stage: 'starting', detail: 'preparing the slot', startedAt: now().toISOString(), rounds: 0, committedAt: null } }, now());
   const notStarted = () => {
@@ -937,6 +961,50 @@ function launch(slot, id, mode = '', { onFail } = {}) {
       slotDown(slot, `Its worktree could not be prepared: ${err.message}`);
       notStarted();
       onFail?.();
+    }),
+  );
+  return 'pending';
+}
+
+// A slot never makes or resets an environment for a story whose pull request merged, or that is
+// settled (done or retired): with an adapter that makes one, a plain start first looks the story
+// up (one gh child, so the loop keeps ticking) and closes it with no environment made. The slot is
+// preparing meanwhile, so no pick, sweep or restart takes it. A look-up that fails says nothing
+// merged, and the story starts; so does one whose pull request merged before its last rollback.
+// `onClosed` is called when the story was closed instead; `onFail`
+// as launchNow's. 'started', 'failed' or 'pending' as launchNow.
+function launch(slot, id, mode = '', { onFail, onClosed } = {}) {
+  if (!checkBeforeEnv({ adapter: CONFIG.env?.adapter, mode })) return launchNow(slot, id, mode, { onFail });
+  setSlot(DIR, slot, { state: 'building', reason: '', story: readSlot(DIR, slot).story ?? { id, title: '', stage: 'starting', detail: 'preparing the slot', startedAt: now().toISOString(), rounds: 0, committedAt: null } }, now());
+  const token = preparing.add(slot, { id });
+  launches++;
+  const settled = SETTLED.includes(statusOf(id));
+  (settled ? Promise.resolve(null) : lookUpMerged(id)).then(
+    guarded('a shipped check', (pr) => {
+      if (!preparing.settle(slot, token)) return;
+      const closed = closeInstead(id, {
+        statusOf,
+        mergedPr: () => pr,
+        markDone: (p) => stories().update(id, doneChange(`Its pull request ${p} merged; marked done by Foreman before making its environment.`, now())),
+        close: () => {
+          releaseClaim(id);
+          releaseToken(slot);
+          dropReservations(DIR, id);
+          crashes.delete(id);
+          signins.delete(id);
+          dropCheckpoint(slot, id);
+          const st = readSlot(DIR, slot);
+          setSlot(DIR, slot, st.parkAfter === true ? notStartedPatch(st) : { state: 'idle', reason: '', story: null, result: null }, now());
+        },
+        event: (text, kind) => event(text, kind, slot),
+        instead: 'environment',
+      });
+      if (closed) {
+        closedShipped.add(id);
+        onClosed?.();
+        return;
+      }
+      if (launchNow(slot, id, mode, { onFail }) === 'failed') onFail?.();
     }),
   );
   return 'pending';
@@ -990,7 +1058,7 @@ function startSession(slot, id, mode, path) {
   setSlot(DIR, slot, sessionStartPatch(readSlot(DIR, slot), id, now().toISOString()), now());
   // After the platform credits ran out, every session leaves ANTHROPIC_API_KEY out.
   const signIn = readSignIn(DIR);
-  const run = session.command({ id, mode, config: CONFIG, slot, n: slotIndex(slot) + 1, root: ROOT, stateDir: DIR, supervisorPid: ME, envAdapter, baseEnv: process.env, packSession: PACK_SESSION, scope: SESSION_SCOPE, pluginDir: SESSION_PLUGIN.dir, fileKeys: sessionKeys({ root: ROOT, config: CONFIG }), useSubscription: signIn.using === 'subscription', testCores: session.testCoreShare(os.availableParallelism(), workers) });
+  const run = session.command({ id, mode, config: CONFIG, slot, n: slotIndex(slot) + 1, root: ROOT, stateDir: DIR, supervisorPid: ME, envAdapter, baseEnv: process.env, packSession: PACK_SESSION, scope: SESSION_SCOPE, pluginDir: SESSION_PLUGIN.dir, pluginRoot: resolve(PLUGIN_DIR), fileKeys: sessionKeys({ root: ROOT, config: CONFIG }), useSubscription: signIn.using === 'subscription', testCores: session.testCoreShare(os.availableParallelism(), workers) });
   // Where Claude Code writes this session's files: from its own env, which may differ from ours.
   const projects = sessionProjectsDir(run.env);
   const child = session.start({ ...run, cwd: path, logFile: log });
@@ -1162,7 +1230,7 @@ function pick(slot) {
     }
   }
   // Queued work is in hand: the picker must not start a queued, unclaimed In Progress story as a new one.
-  story ??= pickStory({ skip: [...taken, ...skipped, ...work.map((w) => w.id)], exclude: keptOut({ extra, free, waiters: fileWaiters() }) });
+  story ??= pickStory({ skip: [...taken, ...skipped, ...closedShipped, ...work.map((w) => w.id)], exclude: keptOut({ extra, free, waiters: fileWaiters() }) });
   if (!story) {
     nothingLeft = true;
     return null;
@@ -1222,6 +1290,17 @@ function startPicked(slot, story, asked, { counted = false } = {}) {
       if (asked && nextStarting?.slot === slot) {
         nextStarting = null;
         nextFailed(asked, readSlot(DIR, slot).reason || 'its slot could not be prepared');
+      }
+    },
+    // A story that shipped does not count toward --max, and the owner's "build next" for it is settled.
+    onClosed: () => {
+      started--;
+      unkeep();
+      if (asked && nextStarting?.slot === slot) {
+        nextStarting = null;
+        settleNextRequest(DIR, asked, 'refused', now());
+        nextTrack = null;
+        clearNextNote();
       }
     },
   });
@@ -1472,6 +1551,10 @@ function endSession(slot, s, spans, answer) {
   learning.start();
   // The ship's findings are in findings.jsonl already; its follow-ups should exist while others build.
   if (run.result === 'shipped') owner.learn({ queue: true });
+  if (run.result === 'shipped') closeReleaseAsks(slot, id);
+  // A failed ending asks the owner what to do with the story, unless an item about it is open or
+  // the story goes back in line by itself.
+  if (run.result === 'failed') askAboutFailed(slot, id, done, failCause);
   finished++;
   if (run.result === 'shipped') shipped++;
   if (run.result === 'empty') nothingLeft = true;
@@ -1499,7 +1582,7 @@ function endSession(slot, s, spans, answer) {
     setSlot(DIR, slot, { state: 'parked', parkedFor: 'crash', parkedStory: id, reason: parkedWhy, story: null, result: null }, now());
   } else if (o.slot === 'held') {
     const why = run.result === 'halted' ? 'This story stopped the release line; waiting for you to fix the cause.' : run.cause ? apiHeldText(null) : 'Committed; releases are frozen by a halt.';
-    setSlot(DIR, slot, { state: 'held', reason: why, heldStory: id, haltedBy: run.result === 'halted', heldFor: run.cause ? 'api' : null, story: { id, title: done?.title ?? '', stage: 'release', detail: why }, result: null }, now());
+    setSlot(DIR, slot, { state: 'held', reason: why, heldStory: id, haltedBy: run.result === 'halted', heldFor: run.cause ? 'api' : null, heldWas: heldSnapshot(id), story: { id, title: done?.title ?? '', stage: 'release', detail: why }, result: null }, now());
   } else {
     tidyFolder(slot, id);
     setSlot(DIR, slot, { state: parkAfter ? 'parked' : 'idle', parkedFor: parkAfter ? 'owner' : null, parkAfter: false, reason: parkAfter ? 'Parked by you.' : '', story: null, result: null }, now());
@@ -1547,6 +1630,49 @@ function endSession(slot, s, spans, answer) {
 
   if (o.notify === 'parked') notify('parked', { slot, story: id, parkedFor: 'crash', reason: parkedWhy, log: s.log });
   else if (o.notify) notify(o.notify, { slot, story: id, log: s.log });
+}
+
+// A story ended failed: raise "<ID> could not be released" on Waiting on you unless an item about
+// the story is already open (the session's own "could not pass review", a "Decide for <ID>"), or
+// the story goes back in line by itself (to do, in progress, done, or waiting on another story),
+// where the decision would outlive it. Not awaited: a throw is one warn event, never the end of
+// the loop.
+function askAboutFailed(slot, id, done, cause) {
+  (async () => {
+    let story = null;
+    let idPattern;
+    try {
+      const source = stories();
+      story = source.list().find((x) => x.id === id) ?? null;
+      idPattern = source.idPattern;
+    } catch {
+      // unreadable: still ask
+    }
+    if (resumesByItself(story, { idPattern })) {
+      event(`${id} failed; its story is ${story.status}, so nothing was asked on Waiting on you.`, 'info', slot);
+      return;
+    }
+    const con = openConsole({ config: CONFIG, ctx: { stateDir: DIR, now } });
+    const pending = await con.decisions.pending();
+    const earlierFailures = (state().recent ?? []).filter((r) => r.id === id && r.result === 'failed' && r.endedAt !== done?.endedAt).length;
+    const mine = done?.id === id;
+    const item = failedAsk({ id, title: done?.title ?? '', reason: mine ? done.note : '', pr: mine ? done.pr : '', cause, pending, earlierFailures });
+    if (!item) return;
+    await con.decisions.add(item);
+    event(`${id} failed; asked you what to do with it on Waiting on you.`, 'info', slot);
+  })().catch((err) => {
+    try {
+      event(`Could not ask you about ${id}: ${String(err?.message ?? err).slice(0, 200)}`, 'warn', slot);
+    } catch {
+      // nothing more to do
+    }
+  });
+}
+
+// A story shipped: close the "<ID> could not be released" items still open for it (answered or
+// not), so a stale Retry or Drop never runs against a shipped story. Not awaited, like the above.
+function closeReleaseAsks(slot, id) {
+  (async () => { const con = openConsole({ config: CONFIG, ctx: { stateDir: DIR, now } }); const items = releaseAsksFor(await con.decisions.pending(), id); for (const item of items) await con.decisions.applied(item.id); if (items.length) event(`${id} shipped; closed "${releaseTitle(id)}" on Waiting on you.`, 'info', slot); })().catch((err) => { try { event(`Could not close the release decision of ${id}: ${String(err?.message ?? err).slice(0, 200)}`, 'warn', slot); } catch {} });
 }
 
 // ── the owner's commands ─────────────────────────────────────────────────────────────────────
@@ -1980,10 +2106,10 @@ function recoveryPlan() {
   const ship = holderOf(SHIP(DIR));
   const all = stories().list();
   let merged = [];
-  const prs = sh('gh', ['pr', 'list', '--state', 'merged', '--limit', '50', '--json', 'headRefName'], { cwd: ROOT, ...NET_LIMIT });
+  const prs = sh('gh', ['pr', 'list', '--state', 'merged', '--limit', '50', '--json', 'headRefName,mergedAt'], { cwd: ROOT, ...NET_LIMIT });
   if (prs.status === 0) {
     try {
-      merged = closableMergedIds(JSON.parse(prs.stdout).map((p) => p.headRefName), all, CONFIG.branchPrefix);
+      merged = closableMergedIds(shippedBranches(JSON.parse(prs.stdout), all, CONFIG.branchPrefix, rolledBackOf), all, CONFIG.branchPrefix);
     } catch {
       // carry on without it
     }
@@ -2014,7 +2140,7 @@ function reconcileStart() {
     else if (e.do === 'queue') {
       quiet = inHand.has(e.id);
       if (quiet) continue;
-      const w = { slot: e.slot, id: e.id, mode: e.mode, ...(e.from ? { from: e.from } : {}), ...(e.ranked ? { ranked: true } : {}) };
+      const w = { slot: e.slot, id: e.id, mode: e.mode, ...(e.from ? { from: e.from } : {}), ...(e.ranked ? { ranked: true } : { finish: true }) };
       work.push(w);
       if (w.ranked) ranked.push(w);
     } else if (e.do === 'event') {
@@ -2137,7 +2263,47 @@ const adoptLive = guarded('the live sessions scan', (found, skip = []) => {
   }
 });
 
+// Every path that starts queued work comes through here: releaseHeld, resumeHeld, releaseAfterWait,
+// start-up resumes, crash resumes, owner Resume and restart. So the gate is here: work for a story
+// the owner skipped this run, that is settled, or that the owner blocked since its slot was held,
+// does not start, and its slot is freed. A slot records `heldWas` when it goes held because a
+// story that halts the release line blocks itself first, so a block alone cannot mean the owner's.
+function queuedStop(w) {
+  try {
+    const source = stories();
+    return workStop(w, { skipped: [...skipped], stories: source.list(), idPattern: source.idPattern });
+  } catch {
+    return workStop(w, { skipped: [...skipped], stories: null });
+  }
+}
+
+// Frees the slot of work that must not start: the slot's pinned story and the story's claim, token
+// and reservations go, unless the story is still in hand elsewhere (queued, held in another slot): see dropSteps.
+// A story that a session runs, a slot prepares or any other slot carries is already resumed by that
+// slot (a held slot's resume leaves a ranked start-up resume for the same story behind): the
+// duplicate is dropped quietly and nothing is let go, so the live session keeps its claim.
+function dropWork(slot, w, stop) {
+  const running = inHandSessions().some((s) => s.id === w.id) || SLOT_IDS.some((other) => other !== slot && readSlot(DIR, other).story?.id === w.id);
+  const pinned = readSlot(DIR, slot).heldStory === w.id;
+  const elsewhere = work.some((x) => x.id === w.id) || SLOT_IDS.some((other) => other !== slot && readSlot(DIR, other).heldStory === w.id);
+  // dropSteps decides (see scheduler.mjs): a story still in hand elsewhere leaves its own item to
+  // decide and say, so a "not resumed" here could be followed by that story resuming.
+  const d = dropSteps({ running, pinned, elsewhere });
+  if (d.free) setSlot(DIR, slot, { state: 'idle', reason: '', story: null, result: null, heldStory: null, heldWas: null, haltedBy: false, heldFor: null }, now());
+  if (d.letGo) {
+    releaseClaim(w.id);
+    dropReservations(DIR, w.id);
+  }
+  if (d.tidy) {
+    releaseToken(slot);
+    tidyFolder(slot, w.id);
+  }
+  if (d.say) event(workStopText({ id: w.id, slot, stop }), 'info', slot);
+}
+
 function startWork(slot, w) {
+  const stop = queuedStop(w);
+  if (stop) return dropWork(slot, w, stop);
   // Work rehomed from a slot over the worker count: this slot's folder must be fit to use, and the
   // claim and locks follow the work. The claim is checked before the old folder is freed, and once
   // the work has moved it no longer carries `from`, so a retry is a plain resume (move-work.mjs).
@@ -2183,7 +2349,8 @@ function startWork(slot, w) {
   if (step !== 'start') return;
   const t = holderOf(SCHEMA(DIR));
   if (t?.story === w.id) takeTokenFor(slot, w.id);
-  const r = launch(slot, w.id, w.mode, { onFail: () => work.unshift(w) });
+  // A story closed instead used its work item up: it is not queued again.
+  const r = launch(slot, w.id, w.mode, { onFail: () => work.unshift(w), onClosed: () => {} });
   if (r === 'failed') work.unshift(w);
 }
 
@@ -2276,7 +2443,8 @@ function checkStrays() {
 }
 
 // Stops the sessions still running (SIGTERM, then SIGKILL for any still there after 10 s),
-// records why, emails, and exits. `loop` is the state left for the console.
+// deletes the slot environments of the stories that closed (up to 60 s; an interrupted, held or
+// claimed story keeps its own), records why, emails, and exits. `loop` is the state left for the console.
 async function stop(code, reason, { loop = code === 2 ? 'halted' : 'stopped' } = {}) {
   if (exiting) return;
   exiting = 'stop';
@@ -2301,6 +2469,8 @@ async function stop(code, reason, { loop = code === 2 ? 'halted' : 'stopped' } =
       }
     }
     for (const t of loopErrors.clear(now())) event(t, 'warn');
+    // The sessions are gone, so the slot environments of closed stories can go too (up to 60 s).
+    await sweepAtStop();
     awake?.release();
     setLoop(DIR, loop, reason);
     clearAgents(DIR);
@@ -2510,7 +2680,7 @@ async function tick() {
   const halted = existsSync(HALT);
   if (halted && !haltSeen) {
     haltSeen = true;
-    setLoop(DIR, 'halted', readFileSync(HALT, 'utf8').slice(0, 300));
+    setLoop(DIR, 'halted', redact(haltReason(readFileSync(HALT, 'utf8'))).slice(0, 300));
     notify('halted', { reason: 'A release failed; releases are frozen until you press "I\'ve fixed it".' });
   }
   // Paused for the sign-in: probe it now and then, and at once after a restart.
@@ -2668,7 +2838,7 @@ async function main() {
   awake = keepAwake(keepAwakeCommand(CONFIG, process.platform, ME), { spawn, onError: () => event('Could not keep the computer awake.', 'warn') });
   awake.take();
   // A run restarted while halted is still halted (its halt was seen, so the tick will not say so again).
-  if (haltSeen && existsSync(HALT)) setLoop(DIR, 'halted', readFileSync(HALT, 'utf8').slice(0, 300));
+  if (haltSeen && existsSync(HALT)) setLoop(DIR, 'halted', redact(haltReason(readFileSync(HALT, 'utf8'))).slice(0, 300));
   else setLoop(DIR, 'running', '');
   for (const w of loaded.localWarnings) event(w, 'warn');
   for (const e of START.events) event(e.text, e.kind);
@@ -2714,6 +2884,10 @@ async function main() {
     await Promise.race([jira.refresh(), sleep(30_000)]);
     jira.start();
   }
+  // With stage branches, the records of what other runs shipped are on the stage branch: fetch it,
+  // so a reused clone or a laptop with no state does not build a story again.
+  const shippedWarning = fetchStoryTarget({ root: ROOT, config: LIVE, sh: anchorSh });
+  if (shippedWarning) event(shippedWarning, 'warn');
   reconcileStart();
   while (!exiting) {
     let loopError = null;

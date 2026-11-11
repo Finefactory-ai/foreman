@@ -1,9 +1,9 @@
 // The park watch, the environment sweep and the learning tick, called directly.
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { backgroundJobs } from './background-jobs.mjs';
+import { backgroundJobs, STOP_SWEEP_MS } from './background-jobs.mjs';
 
 const made = [];
 afterEach(() => {
@@ -45,6 +45,64 @@ describe('startEnvSweep', () => {
     await until(() => !envSweep.running);
     expect(envSweep.running).toBe(false);
     expect(event).toHaveBeenCalledWith('Slot environment: org gone', 'warn');
+  });
+});
+
+describe('sweepAtStop', () => {
+  it('calls the adapter sweep once with { stopping: true, limitMs: STOP_SWEEP_MS } and logs each warning', async () => {
+    const sweep = vi.fn(async () => ({ warnings: ['org gone', 'org stuck'] }));
+    const { event, sweepAtStop } = setup({ envAdapter: { sweep } });
+    await sweepAtStop();
+    expect(STOP_SWEEP_MS).toBe(60_000);
+    expect(sweep).toHaveBeenCalledTimes(1);
+    expect(sweep).toHaveBeenCalledWith({ stopping: true, limitMs: 60_000 });
+    expect(event.mock.calls).toEqual([
+      ['Slot environment: org gone', 'warn'],
+      ['Slot environment: org stuck', 'warn'],
+    ]);
+  });
+  it('calls nothing and logs nothing on a dry run, or for an adapter with no sweep', async () => {
+    const sweep = vi.fn(async () => ({ warnings: ['x'] }));
+    const dry = setup({ dry: true, envAdapter: { sweep } });
+    await dry.sweepAtStop();
+    expect(sweep).not.toHaveBeenCalled();
+    expect(dry.event).not.toHaveBeenCalled();
+    const none = setup({ envAdapter: {} });
+    await none.sweepAtStop();
+    expect(none.event).not.toHaveBeenCalled();
+    const absent = setup({ envAdapter: undefined });
+    await expect(absent.sweepAtStop()).resolves.toBeUndefined();
+  });
+  it('never throws, even when the adapter or the event log does', async () => {
+    const boom = setup({
+      envAdapter: {
+        sweep: () => {
+          throw new Error('boom');
+        },
+      },
+    });
+    await expect(boom.sweepAtStop()).resolves.toBeUndefined();
+    expect(boom.event).toHaveBeenCalledWith('Slot environment: the sweep failed: boom', 'warn');
+    const loud = setup({
+      envAdapter: { sweep: async () => ({ warnings: ['a'] }) },
+      event: () => {
+        throw new Error('log broke');
+      },
+    });
+    await expect(loud.sweepAtStop()).resolves.toBeUndefined();
+  });
+  it('is awaited by the supervisor stop, after the sessions are ended and before the loop is set stopped, and not by a restart', () => {
+    const src = readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const stop = src.slice(src.indexOf('async function stop('), src.indexOf('async function restartOnNewCode('));
+    const ended = stop.indexOf("process.kill(-s.pid, 'SIGKILL')");
+    const sweep = stop.indexOf('await sweepAtStop()');
+    const loop = stop.indexOf('setLoop(DIR, loop, reason)');
+    expect(ended).toBeGreaterThan(0);
+    expect(sweep).toBeGreaterThan(ended);
+    expect(loop).toBeGreaterThan(sweep);
+    const restart = src.slice(src.indexOf('async function restartOnNewCode('), src.indexOf('function newCodeAccepts('));
+    expect(restart.length).toBeGreaterThan(100);
+    expect(restart).not.toContain('sweepAtStop');
   });
 });
 

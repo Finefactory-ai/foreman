@@ -7,6 +7,9 @@
 //                     names, stack traces or the raw result. sf gives each list as one object or
 //                     an array; both are read. At most 20 failures, each message tidied and cut
 //                     to 300 characters.
+//   componentFailureCount(result)
+//                     the number of component failures in the raw result, counted the same way
+//                     summary reads them but not cut at 20. It copies nothing from the result.
 //   waitForJob(ctx, sh, { jobId, org, minutes, label })
 //                     polls `sf project deploy report --job-id <id> --target-org <org>` every 10
 //                     seconds, with ctx.sleep, until the job reaches a FINAL status or `minutes`
@@ -59,6 +62,13 @@ export function summary(result) {
     tests: { completed: count(r.numberTestsCompleted), errors: count(r.numberTestErrors) },
     failures,
   };
+}
+
+// How many component failures the raw result holds, counted as summary reads them: past the 20
+// summary keeps. Copies nothing from the result.
+export function componentFailureCount(result) {
+  const details = isObject(result) && isObject(result.details) ? result.details : {};
+  return list(details.componentFailures).length;
 }
 
 export async function waitForJob(ctx, sh, { jobId, org, minutes, label = `waiting for Salesforce job ${jobId} on ${org}` }) {

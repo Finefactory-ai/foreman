@@ -9,6 +9,8 @@ import { doctorChecks as groupChecks } from './doctor-salesforce.mjs';
 import { setUp } from './isolation.mjs';
 import * as scratchEnv from './env/scratch.mjs';
 import { PACKS } from '../index.mjs';
+import { recordRollback } from './releases.mjs';
+import { closeInstead, mergedPrOfAsync, rolledBackAtOf } from '../../lib/engine/resume-close.mjs';
 import { detect as coreDetect } from '../../lib/engine/init-helpers.mjs';
 import { makeInitCommand } from '../../lib/cli/commands/init.mjs';
 import { makeShipCommand } from '../../lib/cli/commands/ship.mjs';
@@ -298,7 +300,7 @@ describe('foreman ship --preflight on a copy of the Acme fixture', () => {
     expect(code).toBe(0);
     expect(json.steps.map((s) => s.name)).toEqual(['sf-org-guard', 'merge-main', 'sf-delta', 'push', 'pr', 'ci', 'sf-validate', 'mergeable-recheck', 'merge', 'sf-deploy-dev']);
     expect(json.steps.find((s) => s.name === 'sf-validate').needs).toEqual(['sf']);
-    expect(json.steps.find((s) => s.name === 'sf-deploy-dev').needs).toEqual(['sf']);
+    expect(json.steps.find((s) => s.name === 'sf-deploy-dev').needs).toEqual(['sf', 'git']);
   });
 
   it('with the pack defaults, lists the whole stage 1 path and the rollback on failure, with no rollback warning', async () => {
@@ -307,7 +309,7 @@ describe('foreman ship --preflight on a copy of the Acme fixture', () => {
     expect(code).toBe(0);
     expect(json.steps).toEqual([
       ...NO_CI_STEPS.map((name) => ({ name, needs: expect.any(Array) })),
-      { name: 'sf-deploy-dev', needs: ['sf'] },
+      { name: 'sf-deploy-dev', needs: ['sf', 'git'] },
       { name: 'sf-verify-dev', needs: ['sf'] },
       { name: 'rollback', needs: ['sh'], when: 'on failure' },
     ]);
@@ -338,7 +340,7 @@ describe('foreman ship --preflight on a copy of the Acme fixture', () => {
       expect(code).toBe(0);
       expect(json.steps).toEqual([
         ...common(),
-        { name: 'sf-deploy-qa', needs: ['sf'] },
+        { name: 'sf-deploy-qa', needs: ['sf', 'git'] },
         { name: 'sf-verify-qa', needs: ['sf'] },
         { name: 'sf-deploy-uat', needs: ['sf', 'git'] },
         { name: 'sf-verify-uat', needs: ['sf'] },
@@ -455,5 +457,80 @@ describe('through core init, with the real registry', () => {
     expect(code).toBe(0);
     expect(err).toBe('');
     expect(JSON.parse(out).suggested.pack).toBe('salesforce');
+  });
+});
+
+describe('rolledBackAt', () => {
+  let state;
+  let pr;
+  beforeEach(() => {
+    state = fs.mkdtempSync(path.join(os.tmpdir(), 'foreman-sfrb-'));
+  });
+  afterEach(() => fs.rmSync(state, { recursive: true, force: true }));
+
+  const MERGED_AT = '2026-11-01T10:00:00Z';
+  const ROLLED_BACK_AT = '2026-11-01T11:00:00.000Z';
+  const PR = 'https://example.com/acme/pull/1';
+  const gh = async () => ({ status: 0, stdout: JSON.stringify([{ url: PR, mergedAt: MERGED_AT }]) });
+  const recorder = () => {
+    const did = [];
+    return {
+      did,
+      deps: { statusOf: () => 'todo', mergedPr: () => (did.push('mergedPr'), pr), markDone: (u) => did.push(['markDone', u]), close: () => did.push('close'), event: () => {} },
+    };
+  };
+
+  it('reads the record recordRollback wrote', () => {
+    expect(pack.rolledBackAt({ dir: state, story: 'ACME-1' })).toBeNull();
+    recordRollback(state, 'ACME-1', { revert: 'r1', jobId: null, at: ROLLED_BACK_AT });
+    expect(pack.rolledBackAt({ dir: state, story: 'ACME-1' })).toBe(ROLLED_BACK_AT);
+  });
+
+  it('keeps a rolled-back story from being closed as shipped before its environment is made', async () => {
+    recordRollback(state, 'ACME-1', { revert: 'r1', jobId: null, at: ROLLED_BACK_AT });
+    pr = await mergedPrOfAsync('story/acme-1', gh, { rolledBackAt: rolledBackAtOf(pack, { dir: state, story: 'ACME-1' }) });
+    expect(pr).toBeNull();
+    const { did, deps } = recorder();
+    expect(closeInstead('ACME-1', { ...deps, instead: 'environment' })).toBe(false);
+    expect(did).toEqual(['mergedPr']);
+  });
+
+  it('still marks it done with no record', async () => {
+    pr = await mergedPrOfAsync('story/acme-1', gh, { rolledBackAt: rolledBackAtOf(pack, { dir: state, story: 'ACME-1' }) });
+    expect(pr).toBe(PR);
+    const { did, deps } = recorder();
+    expect(closeInstead('ACME-1', { ...deps, instead: 'environment' })).toBe(true);
+    expect(did).toContainEqual(['markDone', PR]);
+  });
+});
+
+describe('liveStage', () => {
+  const two = { pack: 'salesforce', salesforce: { orgs: { 'acme-qa': { orgId: ACME_QA_ID }, 'acme-uat': { orgId: ACME_UAT_ID } }, stages: [{ name: 'qa', org: 'acme-qa' }, { name: 'uat', org: 'acme-uat' }] } };
+  const QA = { name: 'qa', org: 'acme-qa' };
+  const UAT = { name: 'uat', org: 'acme-uat' };
+
+  it('is the first stage when no deploy fact is known', () => {
+    expect(pack.liveStage(two)).toEqual(QA);
+    expect(pack.liveStage(two, {})).toEqual(QA);
+  });
+  it('is the last stage a deploy fact names, in layout order', () => {
+    expect(pack.liveStage(two, { sfDeploys: { uat: {}, qa: {} } })).toEqual(UAT);
+    expect(pack.liveStage(two, { sfDeploys: { qa: {} } })).toEqual(QA);
+  });
+  it('reads the CI deploys and the Gearset promotions too', () => {
+    expect(pack.liveStage(two, { ciDeploys: { qa: {} } })).toEqual(QA);
+    expect(pack.liveStage(two, { gearsetPromotions: { uat: {} } })).toEqual(UAT);
+  });
+  it('ignores facts that are not plain objects, and names that are no stage', () => {
+    expect(pack.liveStage(two, { sfDeploys: 'uat', ciDeploys: ['uat'], gearsetPromotions: null })).toEqual(QA);
+    expect(pack.liveStage(two, { sfDeploys: { prod: {} } })).toEqual(QA);
+  });
+  it('is null when the block has no stages, or there is no block', () => {
+    expect(pack.liveStage({ pack: 'salesforce', salesforce: { orgs: {}, stages: [] } })).toBeNull();
+    expect(pack.liveStage({ pack: 'salesforce' })).toBeNull();
+    expect(pack.liveStage(undefined)).toBeNull();
+  });
+  it('is on the default export', () => {
+    expect(typeof pack.liveStage).toBe('function');
   });
 });

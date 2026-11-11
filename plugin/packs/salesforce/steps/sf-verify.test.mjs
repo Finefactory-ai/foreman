@@ -11,7 +11,7 @@ import { runShip } from '../../../lib/engine/ship.mjs';
 import { makeHealthCommand } from '../../../lib/cli/commands/health.mjs';
 import { fakeCtx, fakeSh } from '../../../../test/ship-fakes.mjs';
 import { ACME_DEV1_ID, ACME_QA_ID, ACME_UAT_ID, orgRecord, sfError, sfOk } from '../../../../test/fake-sf.mjs';
-import { evalRules, fakeFetch, failing } from '../../../../test/fake-agent-eval.mjs';
+import { evalRules, fakeFetch, failing, fakeRealSf, tempPath } from '../../../../test/fake-agent-eval.mjs';
 
 const JOB = '0Af000000000001AAA';
 const JOB15 = JOB.slice(0, 15);
@@ -64,7 +64,7 @@ function make({ salesforce = LAYOUT_B, query = newest(JOB), rules = [], deploys 
     config: { pack: 'salesforce', salesforce, slots: 1 },
     rules: [...rules, [QUERY, query]],
     root: '/acme/repo',
-    env: { FOREMAN_SF_HOME: sfHome, FOREMAN_STATE_DIR: state },
+    env: { FOREMAN_SF_HOME: sfHome, FOREMAN_STATE_DIR: state, PATH: tempPath(state, fakeRealSf(state)) },
     ...rest,
   });
   if (deploys) ctx.sfDeploys = deploys;
@@ -388,6 +388,7 @@ describe('sfVerify(stage)', () => {
         ],
       });
       ctx.sfDelta = { to: 'bbb', manifest: pkg };
+      ctx.sha = COMMIT;
       ctx.fetch = fakeFetch();
       const r = await sfVerify('qa').run(ctx);
       expect(r).toEqual({ ok: true, sfVerify: { qa: { org: 'acme-qa', jobId: JOB, checks: ['agentforce'] } } });
@@ -414,6 +415,7 @@ describe('sfVerify(stage)', () => {
         ],
       });
       ctx.sfDelta = { to: 'bbb', manifest: pkg };
+      ctx.sha = COMMIT;
       ctx.manualSteps = [];
       ctx.fetch = fakeFetch({ evals: (call) => failing(call.body, { greeting: ['outcome'] }) });
       const r = await sfVerify('qa').run(ctx);
@@ -589,6 +591,8 @@ describe('through the runner', () => {
     });
     ctx.config.ship = { ...ctx.config.ship, rollback: defaults(LAYOUT_B).ship.rollback };
     ctx.sfDelta = { to: 'bbb', manifest: pkg, postDestructive: path.join(state, 'post.xml'), deletes: [] };
+    // The deploy refuses a merge sha it does not know, and this test means sf-verify to fail.
+    ctx.sha = NEWER;
     const { code, result } = await runShip({ steps: [sfDeploy('qa'), sfVerify('qa')], ctx, onFailure: rollback });
     expect(code).toBe(5);
     expect(result).toMatchObject({ stage: 'sf-verify-qa', rolledBack: true });

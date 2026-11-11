@@ -43,6 +43,12 @@
 //                   backoffUntil keeps for the page's idle slots
 //   resumeHeld      the held slots Resume, or the end of the Claude API wait, may release: never one a halt holds
 //   releaseAfterWait the held slots to release once the backoff ends and nothing pauses, halts or stops
+//   workStop        whether queued work must not start: its story was skipped this run, is settled,
+//                   or was blocked by the owner since the slot was held (a halting story blocks
+//                   itself, so a block that is as it was at the hold does not count)
+//   workStopText    the info event's words for one of them
+//   dropSteps       which steps dropping stopped work takes (free the slot, let the story go, tidy
+//                   the slot, say so), from whether the story runs, is pinned here or is in hand elsewhere
 //   looseClaims     the factory claims whose slot moved on (idle, parked without the story, or
 //                   building another), let go of every tick, even under a live pid
 //   looseClaimText  the warn event's words for one of them
@@ -54,6 +60,7 @@
 //                   fixed, handback, and answer-retry: a failed owner answer to try again now)
 
 import { RESULTS } from './classify.mjs';
+import { blockedNow } from './pick.mjs';
 
 export const QUIET_MS = 30 * 60_000;
 export const BUILD_MS = 2 * 60 * 60_000;
@@ -478,8 +485,51 @@ export function releaseHeld(slots) {
     .map(({ slot, st }) => ({
       slot,
       patch: { state: 'idle', reason: '', haltedBy: false, heldFor: null, story: null },
-      work: { slot, id: st.heldStory, mode: st.haltedBy ? 'after-halt' : '' },
+      // `was` is what the story looked like when the slot was held (workStop compares it).
+      work: { slot, id: st.heldStory, mode: st.haltedBy ? 'after-halt' : '', ...(st.heldWas ? { was: st.heldWas } : {}) },
     }));
+}
+
+// The modes of queued work that build a story: '' and 'fresh' (a build or resume) and 'after-halt'.
+// Summary modes run for done stories and are never stopped.
+export const GATED_MODES = ['', 'after-halt', 'fresh'];
+
+// Whether queued work must not start: null when it may, else { why: 'skipped' }, { why: 'settled',
+// status } or { why: 'blocked' }. Finish-release and close work (`finish`) and the summary modes
+// pass. An unreadable source (`stories` not an array) or a story it does not list passes too,
+// except that a skip always counts. A settled story's automatic resume (`resume`) is left to
+// resume-close.mjs closeInstead. A blocked story stops unless the picker would take it again, or
+// it is as it was when its slot was held: a story that halts the release line blocks itself first,
+// so only a change since then is the owner's block. Work from a slot held before `heldWas`
+// existed (no `was`) resumes after a halt as it always did.
+export function workStop(w, { skipped = [], stories = null, idPattern } = {}) {
+  if (w.finish === true || !GATED_MODES.includes(w.mode ?? '')) return null;
+  if (skipped.includes(w.id)) return { why: 'skipped' };
+  if (!Array.isArray(stories)) return null;
+  const story = stories.find((s) => s.id === w.id);
+  if (!story) return null;
+  if (SETTLED.includes(story.status) && !w.resume) return { why: 'settled', status: story.status };
+  if (story.status !== 'blocked') return null;
+  const blocked = typeof idPattern === 'string' && idPattern !== '' ? blockedNow(story, stories, { idPattern }) : true;
+  if (!blocked) return null;
+  if (w.was?.status === 'blocked' && (w.was.blockedBy ?? '') === (story.blockedBy ?? '')) return null;
+  if (!w.was && w.mode === 'after-halt') return null;
+  return { why: 'blocked' };
+}
+
+export function workStopText({ id, slot, stop }) {
+  const why = stop.why === 'skipped' ? 'you skipped it for this run' : `its story is ${stop.why === 'settled' ? stop.status : 'blocked'}`;
+  return `${id} not resumed: ${why}; slot ${slot} is free.`;
+}
+
+// The steps dropping work that must not start takes. `running`: a session or preparation elsewhere
+// already resumes the story, so nothing is touched and nothing is said. `pinned`: this slot holds
+// the story. `elsewhere`: the story is also queued or held in another slot, so that copy decides.
+// free: the slot's held pin is cleared. letGo: the claim and reservations are released. tidy: the
+// slot's schema token and folder are released. say: the "not resumed" event is sent.
+export function dropSteps({ running = false, pinned = false, elsewhere = false } = {}) {
+  if (running) return { free: false, letGo: false, tidy: false, say: false };
+  return { free: pinned, letGo: !elsewhere, tidy: pinned && !elsewhere, say: !elsewhere };
 }
 
 // The held slots that Resume, or the end of the Claude API wait, may release: as releaseHeld, but

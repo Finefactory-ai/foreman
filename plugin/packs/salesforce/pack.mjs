@@ -36,7 +36,9 @@
 // which refuses a workflow deploying to an org off the allow-list, is in workflows.mjs. What
 // each org already fails before any story (its local tests and coverage), which the doctor
 // records and sf-validate and sf-deploy read to call such a failure inherited, is in
-// baseline.mjs.
+// baseline.mjs. Its liveStage hook says which stage the release is live on, so the core watch and
+// rollback steps name that stage and its org, not production. Its rolledBackAt hook gives the time
+// a story's last release was rolled back, so a pull request merged before it is not called shipped.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -45,6 +47,7 @@ import { STAGE_NAME, checkConfig, defaults, layout, slotLimit } from './config.m
 import { doctorChecks } from './doctor-salesforce.mjs';
 import { guard } from './guard.mjs';
 import { setUp } from './isolation.mjs';
+import { rolledBackAt } from './releases.mjs';
 import * as sandboxPool from './env/sandbox-pool.mjs';
 import * as scratch from './env/scratch.mjs';
 import sfCommand from './sf-command.mjs';
@@ -175,6 +178,22 @@ export function steps(config) {
   return table;
 }
 
+// The stage the release is live on, which the core watch and rollback steps name in their words
+// and reasons instead of "production": { name, org }, or null when the layout has no stage. It is
+// the last stage (in layout order) that a deploy fact of the release names (sfDeploys, ciDeploys,
+// gearsetPromotions in ctx, each only when a plain object), else the first stage. Never throws.
+export function liveStage(config, ctx = {}) {
+  const stages = layout(config?.salesforce, config).stages;
+  if (!stages.length) return null;
+  const named = new Set();
+  for (const key of ['sfDeploys', 'ciDeploys', 'gearsetPromotions']) {
+    const facts = ctx?.[key];
+    if (facts !== null && typeof facts === 'object' && !Array.isArray(facts)) for (const name of Object.keys(facts)) named.add(name);
+  }
+  const live = stages.findLast((stage) => named.has(stage.name)) ?? stages[0];
+  return { name: live.name, org: live.org };
+}
+
 export { checkConfig, defaults, doctorChecks, guard, slotLimit };
 
-export default { name: 'salesforce', requires: { tools: ['openssl'] }, detect, defaults, checkConfig, slotLimit, doctorChecks, guard, prepareSessions: setUp, commands: [sfCommand], steps, envAdapters: { 'sandbox-pool': sandboxPool, scratch }, traitsDir: fileURLToPath(new URL('./traits/', import.meta.url)) };
+export default { name: 'salesforce', requires: { tools: ['openssl'] }, detect, defaults, checkConfig, slotLimit, doctorChecks, guard, prepareSessions: setUp, commands: [sfCommand], steps, liveStage, rolledBackAt: ({ dir, story }) => rolledBackAt(dir, story), envAdapters: { 'sandbox-pool': sandboxPool, scratch }, traitsDir: fileURLToPath(new URL('./traits/', import.meta.url)) };

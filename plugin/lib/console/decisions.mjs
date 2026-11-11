@@ -22,8 +22,10 @@
 // which whoever flushes next posts as a comment when features.jiraComments is on (or
 // salesforceComments, for a Case). The queue never fails an add or an answer.
 //
-// A decision with options takes one of them; anything else (a task, or a decision with no
-// options) takes free text, kept as the answer's note.
+// A task always has two options, Retry the story and Close the task, and takes one of them (the
+// generic options branch of answer()); only the first puts the story back in line. add() refuses
+// a task given options or hints of its own. A decision with options takes one of them; a decision
+// with no options, or an old task stored with none, takes free text, kept as the answer's note.
 
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
@@ -32,6 +34,10 @@ import { answerNote, decisionNote, queueStoryNote } from '../engine/story-notes-
 import { listNames, readText } from '../engine/read-cache.mjs';
 
 export const KINDS = ['decision', 'task'];
+export const RETRY_STORY = 'Retry the story';
+export const CLOSE_TASK = 'Close the task';
+export const TASK_OPTIONS = [RETRY_STORY, CLOSE_TASK];
+export const TASK_HINTS = ['Puts the story back in line with your note, so it is built again.', 'Marks this task done and leaves the story as it is, even when it is blocked.'];
 const ID = /^d-\d{14}-[0-9a-f]{4}$/;
 
 export const decisionsDir = (dir) => join(dir, 'decisions');
@@ -189,11 +195,18 @@ function extras(options, { summary, hints, recommend, explain }) {
   return out;
 }
 
+export const TASK_REFUSAL = 'A task always offers "Retry the story" and "Close the task"; add it without options or hints.';
+
 export function add(dir, { story, kind, title, options = [], urgent = false, body = '', summary, hints = [], recommend, explain } = {}, now = new Date()) {
   if (!isText(story)) throw new Error('A decision needs the story it is about.');
   if (!KINDS.includes(kind)) throw new Error(`The kind must be decision or task, not ${kind}.`);
   if (!isText(title)) throw new Error('A decision needs a title.');
   if (!Array.isArray(options) || !options.every(isText)) throw new Error('Each option must be some text.');
+  if (kind === 'task') {
+    if (options.length || hints?.length) throw new Error(TASK_REFUSAL);
+    options = TASK_OPTIONS;
+    hints = TASK_HINTS;
+  }
   const more = extras(options.map((o) => o.trim()), { summary, hints, recommend, explain });
   const item = {
     id: newId(dir, now),

@@ -117,6 +117,8 @@ describe('foreman cloud run, end to end', () => {
     expect(r.stdout).toMatch(/^ok {4}claude answers$/m);
     expect(r.stdout).toMatch(/^warn {2}pull request checks — acme\/app has no pull request yet/m);
     expect(r.stdout).toContain('Reached the 1 story asked for.');
+    // the run's events reach the container's log: the real supervisor's story start
+    expect(r.stdout).toMatch(/^\S+ story w1 Slot w1: S-1$/m);
     expect(r.stdout).toMatch(new RegExp(`Dashboard: http://0\\.0\\.0\\.0:${port}/`));
     expect(existsSync(join(work, 'repo', 'stories', 'S-1.md'))).toBe(true);
     expect(sessions()).toEqual(['claude S-1 resend=unset']);

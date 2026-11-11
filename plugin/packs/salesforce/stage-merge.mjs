@@ -13,7 +13,8 @@
 // not merged again, so a resumed run gives the same commit. Otherwise, in a temporary worktree
 // of the stage branch, never the project's own checkout, it merges the pinned sha with --no-ff,
 // and pushes the merge to the stage branch. A conflict is aborted and names the files; nothing
-// is pushed. The worktree is removed on every path.
+// is pushed. The worktree is removed on every path, and git's record of it is pruned when the
+// remove fails.
 //
 // Returns { ok: true, sha, merged } (sha: the stage branch head that holds the story) or
 // { ok: false, reason }, and never throws for an expected failure. A message names only
@@ -25,6 +26,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { BRANCH, layout } from './config.mjs';
 import { redact } from '../../lib/secrets/redact.mjs';
+import { removeTempTree } from './temp-tree.mjs';
 
 const firstLine = (text) => String(text ?? '').split('\n').map((l) => l.trim()).find(Boolean) ?? 'git gave no reason';
 const fail = (reason) => ({ ok: false, reason });
@@ -87,7 +89,6 @@ export async function mergeIntoStage(ctx, stage) {
     if (pushed.status !== 0) return fail(`could not push the merge of ${story} to ${into}, so ${into} was not changed: ${said(pushed)}`);
     return { ok: true, sha, merged: true };
   } finally {
-    git(['worktree', 'remove', '--force', tree]);
-    fs.rmSync(tmp, { recursive: true, force: true });
+    removeTempTree(git, tree, tmp);
   }
 }

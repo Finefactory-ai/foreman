@@ -3,6 +3,11 @@
 // stops here rather than waiting for one. Facts: `pr` (url) and `prNumber`.
 // The pull request merges into `ship.pr.into` when set, else into `baseBranch` (prTarget).
 //
+// A pull request that merged before the story's recorded rollback (`ctx.rolledBackAt`) is not
+// reused: the story was rebuilt after the rollback, so a new pull request is opened from the same
+// branch and its number is used from then on. A pull request merged after the rollback, or any
+// merged one when no rollback is recorded, still fails the step as merged.
+//
 // Once the pull request is open it raises `review` on the story through the story source,
 // with the pull request's URL in the note, and the short commit it was opened at when git says
 // it (a Jira source comments and moves the issue). It
@@ -15,6 +20,7 @@
 // from its commits. The step fails only when the pull request cannot be marked ready.
 
 import { raiseStoryEvent } from '../../engine/story-events.mjs';
+import { mergedAfter } from '../../engine/resume-close.mjs';
 
 const STAGE = 'pr';
 const MERGEABLE_TRIES = 18;
@@ -30,7 +36,7 @@ export default {
   async run(ctx, { raiseStoryEvent: raise = raiseStoryEvent } = {}) {
     const { sh, branch } = ctx;
     const view = () => {
-      const r = sh('gh', ['pr', 'view', branch, '--json', 'number,url,state,isDraft']);
+      const r = sh('gh', ['pr', 'view', branch, '--json', 'number,url,state,isDraft,mergedAt']);
       if (r.status !== 0) return null;
       try {
         return JSON.parse(r.stdout);
@@ -39,12 +45,22 @@ export default {
       }
     };
     let pr = view();
-    if (!pr) {
+    // A pull request that merged before the story's recorded rollback is not the story's release
+    // any more: gh still finds it by the branch, so open a new one from the same branch.
+    const stale = pr && pr.state === 'MERGED' && typeof ctx.rolledBackAt === 'string' && ctx.rolledBackAt !== '' && !mergedAfter(pr.mergedAt, ctx.rolledBackAt) ? pr : null;
+    if (stale) {
+      try {
+        ctx.event?.(`Pull request #${stale.number} merged before ${ctx.story}'s release was rolled back; opening a new one.`, 'info');
+      } catch {
+        // an event is never worth failing the release over
+      }
+    }
+    if (!pr || stale) {
       if (sh('gh', ['pr', 'create', '--base', prTarget(ctx.config), '--head', branch, '--fill']).status !== 0) {
         return { ok: false, code: 1, stage: STAGE, reason: 'Could not open the pull request.' };
       }
       pr = view();
-      if (!pr) return { ok: false, code: 1, stage: STAGE, reason: 'Opened the pull request but cannot find it.' };
+      if (!pr || (stale && pr.number === stale.number)) return { ok: false, code: 1, stage: STAGE, reason: 'Opened the pull request but cannot find it.' };
     }
     if (pr.state !== 'OPEN') return { ok: false, code: 1, stage: STAGE, reason: `Pull request #${pr.number} is ${pr.state}.`, pr: pr.url };
     if (pr.isDraft === true) {

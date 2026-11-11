@@ -1,11 +1,11 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { buildOrder, needsExclusive, nextStory, progress, waitsOnStories } from '../../engine/pick.mjs';
 import { storySourceContract } from './contract.mjs';
-import { create, DEFAULT_ID_PATTERN } from './markdown.mjs';
+import { create, DEFAULT_ID_PATTERN, SHIPPED_TTL_MS, storiesDirOf } from './markdown.mjs';
 
 // A notes vault: Stories/*.md with phase fields, owner tasks, and schema phases. The vault
 // sits outside the project, so its notes are edited in place.
@@ -295,6 +295,38 @@ describe('update (the note editing of the Obsidian vault)', () => {
     expect(source().note('P1-99', { title: 'design', summary: 'x' })).toBe(false);
   });
 
+  it('file mode adds the missing status line on the first update', () => {
+    const noStatus = join(vaultDir, 'Stories', 'P1-05 No status.md');
+    writeFileSync(noStatus, '---\ntitle: "No status"\nid: P1-05\nphase: "1"\nphase_order: 1\n---\n\n# P1-05\n');
+    expect(source().list().find((s) => s.id === 'P1-05').status).toBe('todo');
+    expect(plan().order).toContain('P1-05');
+    expect(pickNext({ skip: ['P1-09', 'P1-10'] })?.id).toBe('P1-05');
+    expect(pickNext({ id: 'P1-05', strict: true })?.id).toBe('P1-05');
+    expect(source().update('P1-05', { status: 'in-progress' })).toBe(true);
+    const frontmatter = readFileSync(noStatus, 'utf8').split('\n---\n')[0];
+    expect(frontmatter.split('\n').filter((l) => l === 'status: in-progress')).toHaveLength(1);
+    expect(frontmatter).not.toMatch(/status: todo/);
+    expect(source().list().find((s) => s.id === 'P1-05').status).toBe('in-progress');
+  });
+
+  it('file mode reads an empty status line as todo and fills it on the first update', () => {
+    const emptyStatus = join(vaultDir, 'Stories', 'P1-06 Empty status.md');
+    writeFileSync(emptyStatus, '---\ntitle: "Empty status"\nid: P1-06\nphase: "1"\nphase_order: 1\nstatus:\n---\n\n# P1-06\n');
+    expect(source().track).toBe('file');
+    expect(source().list().find((s) => s.id === 'P1-06').status).toBe('todo');
+    const { order, waiting } = plan();
+    expect(order).toContain('P1-06');
+    expect(waiting.map((w) => w.id)).not.toContain('P1-06');
+    expect(pickNext({ skip: ['P1-09', 'P1-10'] })?.id).toBe('P1-06');
+    expect(source().update('P1-06', { status: 'in-progress' })).toBe(true);
+    const frontmatter = readFileSync(emptyStatus, 'utf8').split('\n---\n')[0];
+    const lines = frontmatter.split('\n');
+    expect(lines.filter((l) => l === 'status: in-progress')).toHaveLength(1);
+    expect(lines).not.toContain('status:');
+    expect(frontmatter).not.toMatch(/status: todo/);
+    expect(source().list().find((s) => s.id === 'P1-06').status).toBe('in-progress');
+  });
+
   it('takes an event with a change and ignores an event on its own', () => {
     expect(source().update('P1-09', { ...OWNER_TOOK, event: 'blocked' })).toBe(true);
     expect(read()).toContain('status: blocked');
@@ -418,6 +450,21 @@ describe('plain options', () => {
     expect(plain().list().find((s) => s.id === 'S-1')).toMatchObject({ group: '', groupName: '', order: 0 });
     expect(plain().update('S-1', { status: 'done' })).toBe(true);
     expect(pick().id).toBe('S-2');
+  });
+
+  it('a story with no status line, or an empty one, is todo and is planned and picked', () => {
+    put('S-3.md', '---\nid: S-3\ntitle: Three\n---\n');
+    put('S-4.md', '---\nid: S-4\ntitle: Four\nstatus:\n---\n');
+    const list = plain().list();
+    expect(list.find((s) => s.id === 'S-3').status).toBe('todo');
+    expect(list.find((s) => s.id === 'S-4').status).toBe('todo');
+    const plan = buildOrder(list, { idPattern: plain().idPattern });
+    expect(plan.order).toEqual(expect.arrayContaining(['S-3', 'S-4']));
+    expect(plan.waiting.map((w) => w.id)).not.toContain('S-3');
+    expect(plan.waiting.map((w) => w.id)).not.toContain('S-4');
+    expect(plain().update('S-1', { status: 'done' })).toBe(true);
+    expect(plain().update('S-2', { status: 'done' })).toBe(true);
+    expect(nextStory(plain().list(), { idPattern: plain().idPattern }).id).toBe('S-3');
   });
 
   it('ownerTask: {} turns owner-task detection off', () => {
@@ -604,6 +651,17 @@ describe('track: state', () => {
     expect(src().list().find((s) => s.id === 'S-1').status).toBe('retired');
   });
 
+  it('a story file with no status takes the overlay status and stays byte-identical', () => {
+    const text = '---\nid: S-3\ntitle: Three\n---\n\n# S-3\n';
+    writeFileSync(file('S-3'), text);
+    const before = readFileSync(file('S-3'));
+    expect(src().list().find((s) => s.id === 'S-3').status).toBe('todo');
+    expect(src().update('S-3', { status: 'in-progress', note: 'Started.' })).toBe(true);
+    expect(src().list().find((s) => s.id === 'S-3').status).toBe('in-progress');
+    expect(readFileSync(file('S-3'))).toEqual(before);
+    expect(readFileSync(src().brief('S-3').path, 'utf8')).toContain('status: in-progress');
+  });
+
   it('brief returns the story file when there is no overlay', () => {
     expect(src().brief('S-1')).toEqual({ path: file() });
     src().update('S-1', { status: 'in-progress' });
@@ -725,6 +783,173 @@ describe('finalize in a worktree', () => {
 
   it('returns null for an unknown id', () => {
     expect(src().finalize('S-9', { note: 'x', cwd: tree })).toBeNull();
+  });
+});
+
+// With pull requests merging into a stage branch (ctx.shippedOn), finalize never edits a story
+// file that is on the base branch: it writes the story's shipped record, and list() reads the
+// records on <remote>/<branch> and in dir.
+describe('stage branches (ctx.shippedOn)', () => {
+  let base;
+  let main;
+  let tree;
+  let nowAt;
+  const git = (cwd, ...args) => {
+    const r = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8' });
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+  const note = (n) => `---\nid: S-${n}\ntitle: ${n === 1 ? 'One' : 'Two'}\nstatus: todo\ncompleted:\n---\n\n# S-${n}\n\n## Progress notes\n\n- **2026-10-01** — Written.\n`;
+  const S1 = note(1);
+  const ON = { remote: 'origin', branch: 'qa' };
+  beforeEach(() => {
+    base = realpathSync(mkdtempSync(join(tmpdir(), 'markdown-stages-unit-')));
+    main = join(base, 'main');
+    tree = join(base, 'w1');
+    nowAt = NOW();
+    mkdirSync(join(main, 'stories'), { recursive: true });
+    writeFileSync(join(main, 'stories', 'S-1.md'), S1);
+    writeFileSync(join(main, 'stories', 'S-2.md'), note(2));
+    writeFileSync(join(main, '.gitignore'), '.foreman/\n');
+    git(main, 'init', '-q', '-b', 'main');
+    git(main, 'add', '.');
+    git(main, 'commit', '-qm', 'init');
+    git(main, 'worktree', 'add', '-q', '--detach', tree);
+  });
+  afterEach(() => rmSync(base, { recursive: true, force: true }));
+  const src = (extra = {}, options = {}) =>
+    create({ dir: 'stories', ...options }, { root: main, stateDir: join(main, '.foreman'), now: () => nowAt, shippedOn: ON, ...extra });
+  const record = (id) => join(tree, 'stories', '.shipped', `${id}.json`);
+  const recordOf = (id) => JSON.parse(readFileSync(record(id), 'utf8'));
+  // refs/remotes/origin/qa points at a commit whose tree holds these records.
+  const putRecords = (ids) => {
+    const side = join(base, 'side');
+    git(main, 'worktree', 'add', '-q', '--detach', side);
+    mkdirSync(join(side, 'stories', '.shipped'), { recursive: true });
+    for (const id of ids) writeFileSync(join(side, 'stories', '.shipped', `${id}.json`), `${JSON.stringify({ id, status: 'done', completed: '2026-10-14', notes: [] })}\n`);
+    git(side, 'add', '-A', '-f');
+    git(side, 'commit', '-qm', 'records');
+    git(main, 'update-ref', 'refs/remotes/origin/qa', git(side, 'rev-parse', 'HEAD'));
+    git(main, 'worktree', 'remove', '--force', side);
+  };
+  const statuses = (source = src()) => Object.fromEntries(source.list().map((s) => [s.id, s.status]));
+
+  describe('finalize', () => {
+    it('leaves the story file alone and writes the shipped record', () => {
+      src().update('S-1', { status: 'in-progress', note: 'Started.' });
+      const { path } = src().finalize('S-1', { note: 'Login works.', cwd: tree });
+      expect(path).toBe(record('S-1'));
+      expect(readFileSync(join(tree, 'stories', 'S-1.md'), 'utf8')).toBe(S1);
+      expect(recordOf('S-1')).toEqual({ id: 'S-1', status: 'done', completed: '2026-10-15', notes: [{ date: '2026-10-15', text: 'Login works.' }, { date: '2026-10-15', text: 'Started.' }] });
+      expect(git(main, 'status', '--porcelain')).toBe('');
+    });
+
+    it('run twice with the same note it writes the same bytes; another note keeps both, newest first', () => {
+      src().update('S-1', { note: 'Started.' });
+      src().finalize('S-1', { note: 'Works.', cwd: tree });
+      const once = readFileSync(record('S-1'), 'utf8');
+      src().finalize('S-1', { note: 'Works.', cwd: tree });
+      expect(readFileSync(record('S-1'), 'utf8')).toBe(once);
+      src().finalize('S-1', { note: 'Fixed.', cwd: tree });
+      expect(recordOf('S-1').notes.map((n) => n.text)).toEqual(['Fixed.', 'Works.', 'Started.']);
+    });
+
+    it('with no note the record holds the overlay notes only', () => {
+      src().update('S-1', { note: 'Started.' });
+      src().finalize('S-1', { cwd: tree });
+      expect(recordOf('S-1').notes.map((n) => n.text)).toEqual(['Started.']);
+    });
+
+    it('writes a waiting note into the checkout, marked done, and its record too', () => {
+      const made = src().create({ title: 'New', what: 'x', doneWhen: 'y' });
+      const { path } = src().finalize(made.id, { note: 'Built.', cwd: tree });
+      expect(path).toBe(record(made.id));
+      const written = readFileSync(join(tree, 'stories', `${made.id}.md`), 'utf8');
+      expect(written).toContain('\nstatus: done\n');
+      expect(written).toContain('\ncompleted: 2026-10-15\n');
+      expect(written).toContain('— Built.');
+      expect(recordOf(made.id)).toMatchObject({ id: made.id, status: 'done' });
+    });
+
+    it('returns null for an unknown id', () => {
+      expect(src().finalize('S-9', { note: 'x', cwd: tree })).toBeNull();
+    });
+
+    it('ignores shippedOn in file mode: nothing is written', () => {
+      const file = src({}, { track: 'file' });
+      expect(file.finalize('S-1', { note: 'x', cwd: tree })).toEqual({ path: null });
+      expect(existsSync(join(tree, 'stories', '.shipped'))).toBe(false);
+    });
+  });
+
+  describe('list', () => {
+    it('reads a record on the remote stage branch as done', () => {
+      putRecords(['S-1']);
+      expect(statuses()).toEqual({ 'S-1': 'done', 'S-2': 'todo' });
+    });
+
+    it('a record beats an overlay saying in-progress or blocked', () => {
+      putRecords(['S-1']);
+      src().update('S-1', { status: 'in-progress' });
+      expect(statuses()['S-1']).toBe('done');
+      src().update('S-1', { status: 'blocked' });
+      expect(statuses()['S-1']).toBe('done');
+    });
+
+    it('does not override ready-to-promote or a retired note', () => {
+      putRecords(['S-1', 'S-2']);
+      src().update('S-1', { status: 'ready-to-promote' });
+      writeFileSync(join(main, 'stories', 'S-2.md'), note(2).replace('status: todo', 'status: retired'));
+      expect(statuses()).toEqual({ 'S-1': 'ready-to-promote', 'S-2': 'retired' });
+    });
+
+    it('reads a record already in the checkout (promoted to base) as done', () => {
+      mkdirSync(join(main, 'stories', '.shipped'));
+      writeFileSync(join(main, 'stories', '.shipped', 'S-2.json'), '{}\n');
+      expect(statuses()).toEqual({ 'S-1': 'todo', 'S-2': 'done' });
+    });
+
+    it('does not throw with no ref, or with a folder outside any git repo', () => {
+      src().update('S-1', { status: 'in-progress' });
+      expect(statuses()).toEqual({ 'S-1': 'in-progress', 'S-2': 'todo' });
+      const loose = mkdtempSync(join(tmpdir(), 'markdown-loose-'));
+      try {
+        mkdirSync(join(loose, 'stories'));
+        writeFileSync(join(loose, 'stories', 'S-1.md'), S1);
+        const outside = create({ dir: 'stories', track: 'state' }, { root: loose, stateDir: join(loose, '.foreman'), now: NOW, shippedOn: ON });
+        expect(Object.fromEntries(outside.list().map((s) => [s.id, s.status]))).toEqual({ 'S-1': 'todo' });
+      } finally {
+        rmSync(loose, { recursive: true, force: true });
+      }
+    });
+
+    it('does not throw when <stories dir>/.shipped is a file, with or without shippedOn', () => {
+      writeFileSync(join(main, 'stories', '.shipped'), 'stray\n');
+      src().update('S-1', { status: 'in-progress' });
+      expect(statuses()).toEqual({ 'S-1': 'in-progress', 'S-2': 'todo' });
+      expect(statuses(src({ shippedOn: undefined }))).toEqual({ 'S-1': 'in-progress', 'S-2': 'todo' });
+      putRecords(['S-2']);
+      nowAt = new Date(nowAt.getTime() + SHIPPED_TTL_MS + 1);
+      expect(statuses()['S-2']).toBe('done');
+    });
+
+    it('reads the remote ref again only after the cache time', () => {
+      expect(statuses()).toEqual({ 'S-1': 'todo', 'S-2': 'todo' });
+      putRecords(['S-1']);
+      expect(statuses()['S-1']).toBe('todo');
+      nowAt = new Date(nowAt.getTime() + SHIPPED_TTL_MS + 1);
+      expect(statuses()['S-1']).toBe('done');
+    });
+
+    it('ignores records in file mode', () => {
+      putRecords(['S-1']);
+      expect(statuses(src({}, { track: 'file' }))['S-1']).toBe('todo');
+    });
+
+    it('without shippedOn a record on the ref means nothing', () => {
+      putRecords(['S-1']);
+      expect(statuses(src({ shippedOn: undefined }))['S-1']).toBe('todo');
+    });
   });
 });
 
@@ -912,5 +1137,21 @@ describe('create a story, state mode (stories in the repo)', () => {
     expect(stories).toEqual([expect.objectContaining({ status: 'done', ref: join(main, 'stories', 'F-1.md') })]);
     expect(existsSync(pending())).toBe(false);
     expect(src().create(FOLLOW).id).toBe('F-2');
+  });
+});
+
+describe('storiesDirOf', () => {
+  const root = '/acme/project';
+  it('is the dir under the project root', () => {
+    expect(storiesDirOf({ dir: 'stories' }, { root, env: {} })).toBe(resolve(root, 'stories'));
+  });
+  it("is dirEnv's value joined with the suffix when the variable is set", () => {
+    const options = { dir: 'stories', dirEnv: 'ACME_VAULT', dirEnvSuffix: 'Stories' };
+    expect(storiesDirOf(options, { root, env: { ACME_VAULT: '/acme/vault' } })).toBe(resolve(root, '/acme/vault', 'Stories'));
+  });
+  it('falls back to dir when dirEnv is unset or empty', () => {
+    const options = { dir: 'stories', dirEnv: 'ACME_VAULT' };
+    expect(storiesDirOf(options, { root, env: {} })).toBe(resolve(root, 'stories'));
+    expect(storiesDirOf(options, { root, env: { ACME_VAULT: '' } })).toBe(resolve(root, 'stories'));
   });
 });

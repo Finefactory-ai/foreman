@@ -2,11 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ANSWER_RETRY_MS, answerRetryMs, answerSkips, answersToApply, applyAnswers, EVERY_TICK, failedAnswer, heldForAnswer, kindOf, learnedNote, mayApplyAnswers, requeueKind, slotHolds, STORYLESS, supervisorApplies, waitsForAnswer } from './answers.mjs';
+import { ANSWER_RETRY_MS, answerRetryMs, answerSkips, answersToApply, applyAnswers, EVERY_TICK, failedAnswer, failedStoryOf, heldForAnswer, kindOf, learnedNote, mayApplyAnswers, OPTIONS, RELEASE_RETRY_NOTE, releaseTitle, requeueKind, slotHolds, STORYLESS, supervisorApplies, waitsForAnswer } from './answers.mjs';
 import { openProjectStories } from './story-source.mjs';
 import { addItem, readLedger, updateItem } from './learning-store.mjs';
 import { main } from '../cli/main.mjs';
 import * as decisions from '../console/decisions.mjs';
+import { CLOSE_TASK, RETRY_STORY, TASK_OPTIONS } from '../console/decisions.mjs';
 
 const REVIEW = ['Retry with a note to the architect', "I'll take it", 'Drop'];
 
@@ -416,7 +417,7 @@ describe('applyAnswers', () => {
   it('leaves the skipped, unanswered and unknown items alone, calling nothing', async () => {
     const r = runners();
     const skipped = review('Drop');
-    const out = await applyAnswers([skipped, item({ answered: false }), item({ title: 'Which colour?', options: ['Red'], option: 'Red' }), item({ kind: 'task', options: [], note: 'x' })], { ...r.deps, skip: new Set([skipped.id]) });
+    const out = await applyAnswers([skipped, item({ answered: false }), item({ title: 'Which colour?', options: ['Red'], option: 'Red' }), task('x')], { ...r.deps, skip: new Set([skipped.id]) });
     expect(out).toEqual([]);
     expect(r.calls).toEqual([]);
   });
@@ -479,16 +480,33 @@ describe('a note about follow-ups Foreman created', () => {
 // nothing to build?" proposal about a story that is blocked in words or in progress.
 const CLOSE = ['Close it as Done', 'Build it anyway'];
 const STORES = ['The database', 'The cache'];
-const task = (note, over = {}) => item({ kind: 'task', title: 'ACME-1: which store?', options: [], option: null, note, ...over });
+const task = (note, over = {}) => item({ kind: 'task', title: 'ACME-1: which store?', options: TASK_OPTIONS, option: RETRY_STORY, note, ...over });
+const closed = (note, over = {}) => task(note, { option: CLOSE_TASK, ...over });
+// A task asked before tasks had the two options, answered in words.
+const oldTask = (note, over = {}) => item({ kind: 'task', title: 'ACME-1: which store?', options: [], option: null, note, ...over });
 const decideFor = (option, note = '') => item({ story: 'ACME-2', title: 'Decide for ACME-2: Which store?', options: STORES, option, note });
 const closeIt = (option, note = '') => ({ ...item({ title: 'Close ACME-1: nothing to build?', options: CLOSE, option, note }), body: 'The login\nalready works.' });
 const ID = '[A-Z]+-\\d+';
 const story = (over = {}) => ({ id: 'ACME-1', title: 'Story ACME-1', status: 'blocked', blockedBy: 'Owner decision needed: x', dependsOn: [], ownerTask: false, ...over });
 
 describe('requeueKind', () => {
-  it('is answer for a task answered in words and for a Decide for question answered with one of its options', () => {
+  it('is answer for a task answered Retry the story and for a Decide for question answered with one of its options', () => {
     expect(requeueKind(task('(A) fresh'))).toBe('answer');
     expect(requeueKind(decideFor('The cache'))).toBe('answer');
+  });
+
+  it('is closeTask for a task answered Close the task, and for an old task answered in words', () => {
+    expect(requeueKind(closed('handled'))).toBe('closeTask');
+    expect(requeueKind(closed(''))).toBe('closeTask');
+    expect(requeueKind(oldTask('(A) fresh'))).toBe('closeTask');
+  });
+
+  it('is null for an old task with a blank note, a task whose option is not in its options, and a task with options of its own', () => {
+    expect(requeueKind(oldTask('   \n '))).toBeNull();
+    expect(requeueKind(oldTask(undefined))).toBeNull();
+    expect(requeueKind(task('x', { option: 'Something else' }))).toBeNull();
+    expect(requeueKind(task('x', { options: ['Red'], option: 'Red' }))).toBeNull();
+    expect(requeueKind(task('x', { options: [CLOSE_TASK], option: RETRY_STORY }))).toBeNull();
   });
 
   it('is close for a nothing-to-build proposal answered with either of its options', () => {
@@ -523,8 +541,6 @@ describe('requeueKind', () => {
     expect(requeueKind(decideFor('The disk'))).toBeNull();
     expect(requeueKind(closeIt('Drop'))).toBeNull();
     expect(requeueKind({ ...closeIt('Close it as Done'), options: ['Build it anyway'] })).toBeNull();
-    expect(requeueKind(task('   \n '))).toBeNull();
-    expect(requeueKind(task(undefined))).toBeNull();
   });
 
   it('is null for any other kind of item', () => {
@@ -605,8 +621,8 @@ describe('heldForAnswer', () => {
 });
 
 describe('EVERY_TICK', () => {
-  it('is the storyless kinds plus the story answers, close and answer', () => {
-    expect(EVERY_TICK).toEqual([...STORYLESS, 'close', 'answer']);
+  it('is the storyless kinds plus the story answers, close and answer, and closeTask', () => {
+    expect(EVERY_TICK).toEqual([...STORYLESS, 'close', 'answer', 'closeTask']);
   });
 });
 
@@ -618,7 +634,7 @@ describe('applyAnswers on a story answer', () => {
     const it1 = task('(A) fresh\nOwner:  always run fresh');
     const out = await applyAnswers([it1], { ...r.deps, ...yes });
     expect(r.calls).toEqual([
-      ['foreman', 'story', 'todo', 'ACME-1', '--note', 'Note for the architect: the owner answered "ACME-1: which store?": (A) fresh Owner: always run fresh'],
+      ['foreman', 'story', 'todo', 'ACME-1', '--note', 'Note for the architect: the owner answered "ACME-1: which store?" with "Retry the story". (A) fresh Owner: always run fresh'],
       ['foreman', 'decide', 'applied', it1.id],
     ]);
     expect(out).toEqual([{ id: it1.id, story: 'ACME-1', title: 'ACME-1: which store?', ok: true, text: 'Applied your answer to "ACME-1: which store?": ACME-1 is back to todo with your answer.' }]);
@@ -706,7 +722,7 @@ describe('applyAnswers on a story answer', () => {
     const out = await applyAnswers([retry, story1], { ...r.deps, ...yes, kinds: EVERY_TICK });
     expect(out.map((x) => x.id)).toEqual([story1.id]);
     expect(r.calls).toEqual([
-      ['foreman', 'story', 'todo', 'ACME-1', '--note', 'Note for the architect: the owner answered "ACME-1: which store?": (A) fresh'],
+      ['foreman', 'story', 'todo', 'ACME-1', '--note', 'Note for the architect: the owner answered "ACME-1: which store?" with "Retry the story". (A) fresh'],
       ['foreman', 'decide', 'applied', story1.id],
     ]);
   });
@@ -732,6 +748,61 @@ describe('applyAnswers on a story answer', () => {
     const r = runners();
     const it1 = task('x');
     expect(await applyAnswers([it1], { ...r.deps, ...yes, skip: new Set([it1.id]) })).toEqual([]);
+    expect(r.calls).toEqual([]);
+  });
+});
+
+describe('applyAnswers on an owner task', () => {
+  const closedText = 'Applied your answer to "ACME-1: which store?": the task is closed and ACME-1 is left as it is.';
+
+  it('Close the task only marks the item applied, even when the story may not be put back', async () => {
+    const r = runners();
+    const it1 = closed('handled');
+    const out = await applyAnswers([it1], { ...r.deps, canRequeue: () => false });
+    expect(r.calls).toEqual([['foreman', 'decide', 'applied', it1.id]]);
+    expect(r.calls.some((c) => c[1] === 'story')).toBe(false);
+    expect(out).toEqual([{ id: it1.id, story: 'ACME-1', title: 'ACME-1: which store?', ok: true, text: closedText }]);
+  });
+
+  it('Close the task is applied on every tick while busy, and not on the storyless ticks', async () => {
+    const busy = runners();
+    const it1 = closed('handled');
+    const out = await applyAnswers([it1], { ...busy.deps, kinds: EVERY_TICK });
+    expect(out.map((x) => x.id)).toEqual([it1.id]);
+    expect(busy.calls).toEqual([['foreman', 'decide', 'applied', it1.id]]);
+    const none = runners();
+    expect(await applyAnswers([it1], { ...none.deps, kinds: STORYLESS })).toEqual([]);
+    expect(none.calls).toEqual([]);
+  });
+
+  it('an old task answered in words is closed, leaving the story alone', async () => {
+    const r = runners();
+    const it1 = oldTask('done it');
+    const [res] = await applyAnswers([it1], r.deps);
+    expect(r.calls).toEqual([['foreman', 'decide', 'applied', it1.id]]);
+    expect(res.text).toBe(closedText);
+  });
+
+  it('a close whose marking fails stays pending', async () => {
+    const r = runners({ 'foreman decide applied': { status: 1, stdout: '' } });
+    const [res] = await applyAnswers([closed('x')], r.deps);
+    expect(res).toMatchObject({ ok: false, step: 'marking it applied', text: 'Could not apply your answer to "ACME-1: which store?": marking it applied failed.' });
+  });
+
+  it('Retry the story puts the story back to todo with the note, then marks the item applied', async () => {
+    const r = runners();
+    const it1 = task('use it');
+    const [res] = await applyAnswers([it1], { ...r.deps, canRequeue: () => true });
+    expect(r.calls).toEqual([
+      ['foreman', 'story', 'todo', 'ACME-1', '--note', 'Note for the architect: the owner answered "ACME-1: which store?" with "Retry the story". use it'],
+      ['foreman', 'decide', 'applied', it1.id],
+    ]);
+    expect(res.text).toBe('Applied your answer to "ACME-1: which store?": ACME-1 is back to todo with your answer.');
+  });
+
+  it('Retry the story is skipped and stays pending when the story may not be put back', async () => {
+    const r = runners();
+    expect(await applyAnswers([task('use it')], { ...r.deps, canRequeue: () => false })).toEqual([]);
     expect(r.calls).toEqual([]);
   });
 });
@@ -1112,6 +1183,12 @@ describe('answersToApply', () => {
     expect(answersToApply([t], { canRequeue: yes })).toEqual([{ item: t, kind: 'answer' }]);
   });
 
+  it('keeps a closed task whatever canRequeue says', () => {
+    const c = closed('handled');
+    expect(answersToApply([c], { canRequeue: no })).toEqual([{ item: c, kind: 'closeTask' }]);
+    expect(answersToApply([c], {})).toEqual([{ item: c, kind: 'closeTask' }]);
+  });
+
   it('leaves out unanswered and unknown items', () => {
     expect(answersToApply([item({ answered: false })], {})).toEqual([]);
   });
@@ -1227,5 +1304,92 @@ describe('a failed answer is tried again after a growing wait', () => {
     const failures = new Map([[waiting.id, { retryAt: new Date(NOW + MIN).toISOString() }], [due.id, { retryAt: new Date(NOW - MIN).toISOString() }]]);
     const todo = answersToApply([due, waiting], { skip: answerSkips(failures, NOW), canRequeue: () => true });
     expect(todo.map((t) => t.item.id)).toEqual([due.id]);
+  });
+});
+
+describe('the release decision ("<ID> could not be released")', () => {
+  const RELEASE = ['Retry the release', "I'll take it", 'Drop'];
+  const release = (option, note = '', story = 'ACME-1') => item({ story, title: releaseTitle(story), options: RELEASE, option, note });
+
+  it('has the title, the options and the note the story skill uses', () => {
+    expect(releaseTitle('ACME-1')).toBe('ACME-1 could not be released');
+    expect(OPTIONS.release).toEqual(RELEASE);
+    expect(RELEASE_RETRY_NOTE).toBe('The owner asked to retry the release: resume from the built branch and ship it again.');
+  });
+
+  it("kindOf is release for the item's own story only", () => {
+    expect(kindOf({ story: 'ACME-1', title: 'ACME-1 could not be released' })).toBe('release');
+    expect(kindOf({ story: 'ACME-1', title: 'ACME-9 could not be released' })).toBeNull();
+  });
+
+  it('supervisorApplies each of its options, and nothing a review has not', () => {
+    for (const option of RELEASE) expect(supervisorApplies(release(option))).toBe(true);
+    expect(supervisorApplies(release('Retry with a note to the architect'))).toBe(false);
+    expect(supervisorApplies(item({ options: [...REVIEW, 'Retry the release'], option: 'Retry the release' }))).toBe(false);
+  });
+
+  it('requeueKind gives null, so the every-tick path never applies it', () => {
+    for (const option of RELEASE) expect(requeueKind(release(option))).toBeNull();
+    expect(answersToApply([release('Drop')], { kinds: EVERY_TICK, canRequeue: () => true })).toEqual([]);
+  });
+
+  it('Retry the release puts the story back to todo with the retry note, then marks it applied', async () => {
+    const r = runners();
+    const it1 = release('Retry the release');
+    const out = await applyAnswers([it1], r.deps);
+    expect(r.calls).toEqual([
+      ['foreman', 'story', 'todo', 'ACME-1', '--note', RELEASE_RETRY_NOTE],
+      ['foreman', 'decide', 'applied', it1.id],
+    ]);
+    expect(out).toEqual([{ id: it1.id, story: 'ACME-1', title: 'ACME-1 could not be released', ok: true, text: 'Applied your answer to "ACME-1 could not be released": Retry the release.' }]);
+  });
+
+  it("Retry the release adds the owner's note for the architect, on one line", async () => {
+    const r = runners();
+    await applyAnswers([release('Retry the release', ' CI is\n back ')], r.deps);
+    expect(r.calls[0]).toEqual(['foreman', 'story', 'todo', 'ACME-1', '--note', RELEASE_RETRY_NOTE + ' Note for the architect: CI is back']);
+  });
+
+  it("I'll take it claims the story for the owner and blocks it", async () => {
+    const r = runners();
+    const it1 = release("I'll take it");
+    await applyAnswers([it1], r.deps);
+    expect(r.calls).toEqual([
+      ['foreman', 'lock', 'owner-claim', 'ACME-1'],
+      ['foreman', 'story', 'block', 'ACME-1', '--reason', 'Taken by the owner'],
+      ['foreman', 'decide', 'applied', it1.id],
+    ]);
+  });
+
+  it('Drop closes the pull requests, deletes the branch and blocks the story', async () => {
+    const r = runners({ 'gh pr list': { status: 0, stdout: '[{"number":7}]' } });
+    const it1 = release('Drop');
+    const [res] = await applyAnswers([it1], r.deps);
+    expect(r.calls).toEqual([
+      ['gh', 'pr', 'list', '--head', 'story/acme-1', '--state', 'open', '--json', 'number'],
+      ['gh', 'pr', 'close', '7'],
+      ['git', 'push', 'origin', '--delete', 'story/acme-1'],
+      ['foreman', 'story', 'block', 'ACME-1', '--reason', 'Dropped by the owner on 2026-10-23'],
+      ['foreman', 'decide', 'applied', it1.id],
+    ]);
+    expect(res.ok).toBe(true);
+  });
+
+  it('Drop fails, and changes nothing more, when the pull requests cannot be listed', async () => {
+    const r = runners({ 'gh pr list': { status: 1, stdout: '' } });
+    const [res] = await applyAnswers([release('Drop')], r.deps);
+    expect(res.ok).toBe(false);
+    expect(r.calls.some((c) => c[1] === 'story' || c[1] === 'decide')).toBe(false);
+  });
+});
+
+describe('failedStoryOf', () => {
+  it('reads the id from both failed-story titles', () => {
+    expect(failedStoryOf('ACME-1 could not pass review')).toBe('ACME-1');
+    expect(failedStoryOf('ACME-4 could not be released')).toBe('ACME-4');
+  });
+
+  it('is null for any other title', () => {
+    for (const title of ['Which login?', 'ACME-1 could not ship', '', undefined]) expect(failedStoryOf(title), String(title)).toBeNull();
   });
 });

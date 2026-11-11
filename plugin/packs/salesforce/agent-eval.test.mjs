@@ -2,23 +2,27 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
   EVAL_LIMIT,
   EVAL_URL,
+  RETRY_WAIT_MS,
+  answerSnippet,
   evalPayload,
   evalRoom,
   evalsFile,
   gradeEval,
   junit,
   readEvalSpec,
+  agentSession,
   recordSuite,
 } from './agent-eval.mjs';
 import { agentforceCheck, versionsQuery } from './agentforce.mjs';
-import { isolatedSh } from './isolation.mjs';
+import { binDir, findRealSf, isolatedSh, wrapperScript } from './isolation.mjs';
 import { readRelease } from './releases.mjs';
-import { coolingDown, cooldownFile } from './sf.mjs';
+import { COOLDOWN_MS, coolingDown, cooldownFile } from './sf.mjs';
 import { fakeCtx, fakeSh } from '../../../test/ship-fakes.mjs';
-import { ACME_QA_ID, sfError, sfOk } from '../../../test/fake-sf.mjs';
+import { ACME_PROD_ID, ACME_QA_ID, sfError, sfOk } from '../../../test/fake-sf.mjs';
 import {
   ACME_INSTANCE,
   ACME_JWT,
@@ -30,11 +34,15 @@ import {
   evalRules,
   failing,
   fakeFetch,
+  fakeRealSf,
   orgDisplay,
+  orgList,
   passAll,
   planners,
   specText,
+  sessionOf,
   specWith,
+  tempPath,
 } from '../../../test/fake-agent-eval.mjs';
 
 const API = 'Acme_Order_Helper';
@@ -279,22 +287,24 @@ const publishRules = () => [
   [/^sf agent activate /, sfOk({ success: true })],
   [/FROM BotVersion/, inTurn(versions([[1, 'Active']]), versions([[1, 'Active'], [2, 'Inactive']]), versions([[1, 'Inactive'], [2, 'Active']]))],
 ];
-const ENV = () => ({ FOREMAN_SF_HOME: sfHome, FOREMAN_STATE_DIR: state });
+const ENV = () => ({ FOREMAN_SF_HOME: sfHome, FOREMAN_STATE_DIR: state, PATH: tempPath(dir, fakeRealSf(dir)) });
 
-function setup({ rules = [], fetch = fakeFetch(), spec = ACME_SPEC, display, planner } = {}) {
-  const raw = fakeSh([...rules, ...evalRules({ spec, ...(display ? { display } : {}), ...(planner ? { planner } : {}) }), ...publishRules()]);
-  const ctx = fakeCtx({ config: { pack: 'salesforce', salesforce: LAYOUT, slots: 1 }, root: '/acme/repo', env: ENV() });
+function setup({ rules = [], fetch = fakeFetch(), spec = ACME_SPEC, display, list, planner, layout = LAYOUT } = {}) {
+  const raw = fakeSh([...rules, ...evalRules({ spec, ...(display ? { display } : {}), ...(list ? { list } : {}), ...(planner ? { planner } : {}) }), ...publishRules()]);
+  const ctx = fakeCtx({ config: { pack: 'salesforce', salesforce: layout, slots: 1 }, root: '/acme/repo', env: ENV() });
   const file = path.join(dir, 'package.xml');
   fs.writeFileSync(file, xml({ AiAuthoringBundle: [API], ApexClass: ['AcmeOrderStatusAction'] }));
   ctx.sh = raw;
   ctx.fetch = fetch;
   ctx.sfDelta = { to: 'bbb', manifest: file };
+  ctx.sha = '0123456789abcdef0123456789abcdef01234567';
   const sh = isolatedSh(raw, ENV(), sfHome, os.homedir());
   return { ctx, raw, fetch, run: () => agentforceCheck.run({ ctx, sh, stage: STAGE }) };
 }
 const sfLines = (raw) => raw.calls.filter((l) => l.startsWith('sf '));
 const PLANNER_LINE = `sf data query --query SELECT Id FROM GenAiPlannerDefinition WHERE DeveloperName = '${API}_v2' --target-org acme-qa --json`;
 const DISPLAY_LINE = 'sf org display --target-org acme-qa --json';
+const LIST_LINE = 'sf org list --all --skip-connection-status --json';
 const published = (raw) => sfLines(raw).some((l) => l.startsWith('sf agent publish '));
 
 // Every file under a folder, as text.
@@ -319,10 +329,11 @@ function noSecrets(result) {
 
 describe('agentforceCheck runs the eval suite after the activate (gating)', () => {
   it('passes when every check passes, testing the activated version through its planner', async () => {
-    const { raw, fetch, run } = setup();
+    const { ctx, raw, fetch, run } = setup();
     const r = await run();
     expect(r).toEqual({ ok: true, changedOrg: true, agents: [{ apiName: API, previous: 1, version: 2 }] });
-    expect(sfLines(raw).slice(-2)).toEqual([DISPLAY_LINE, PLANNER_LINE]);
+    expect(ctx.sleeps).toEqual([]);
+    expect(sfLines(raw).slice(-3)).toEqual([LIST_LINE, DISPLAY_LINE, PLANNER_LINE]);
     const posts = fetch.posts();
     expect(posts).toHaveLength(1);
     expect(posts[0].body.tests.map((t) => t.steps[0].planner_id)).toEqual([PID, PID]);
@@ -387,6 +398,8 @@ describe('agentforceCheck runs the eval suite after the activate (gating)', () =
 });
 
 describe('the eval caller', () => {
+  const cooldownRecord = () => JSON.parse(fs.readFileSync(cooldownFile(sfHome, 'acme-qa'), 'utf8'));
+
   it('reads the sign-in with SF_TEMP_SHOW_SECRETS on that call alone, every sf call in the sf home', async () => {
     const { raw, run } = setup();
     await run();
@@ -430,6 +443,9 @@ describe('the eval caller', () => {
     ['an instance URL on another host', orgDisplay({ instanceUrl: 'https://acme-qa.evil.example' })],
     ['a host that only starts like Salesforce', orgDisplay({ instanceUrl: 'https://acme.salesforce.com.evil.example' })],
     ['no session token', orgDisplay({ accessToken: undefined })],
+    ['a redacted placeholder instead of a session', orgDisplay({ accessToken: "[REDACTED] Use 'sf org display --verbose' to see the access token" })],
+    ['a token with a space', orgDisplay({ accessToken: '00D000000000002!abc def' })],
+    ['a token of another org', orgDisplay({ accessToken: '00D000000000009!abc' })],
     ['an org display that fails', sfError('NoAuthInfoFound', 'No authorization information found for acme-qa.')],
   ];
   for (const [name, display] of refusedBeforeFetch) {
@@ -444,6 +460,103 @@ describe('the eval caller', () => {
       noSecrets(r);
     });
   }
+
+  it('names the redacted placeholder, never quotes it, and sends no request', async () => {
+    const { raw, fetch, run } = setup({ display: orgDisplay({ accessToken: "[REDACTED] Use 'sf org display --verbose' to see the access token" }) });
+    const r = await run();
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain('redacted');
+    expect(r.reason).toContain('acme-qa');
+    expect(r.reason).not.toContain('[REDACTED] Use');
+    expect(fetch.calls).toEqual([]);
+    expect(published(raw)).toBe(true);
+  });
+
+  it('reads the session through the real sf: the reveal call starts its PATH with the real sf folder, no wrapper folder, and every other sf call keeps the caller PATH', async () => {
+    const { raw, run } = setup();
+    await run();
+    const at = raw.calls.indexOf(DISPLAY_LINE);
+    const first = raw.opts[at].env.PATH.split(path.delimiter)[0];
+    expect(first).toBe(path.join(dir, 'real-bin'));
+    expect(raw.opts[at].env.PATH.split(path.delimiter)).not.toContain(binDir(sfHome));
+    raw.calls.forEach((line, i) => {
+      if (!line.startsWith('sf ') || i === at) return;
+      expect(raw.opts[i].env.PATH, line).toBe(ENV().PATH);
+    });
+  });
+
+  it('lists the orgs before the display, with no SF_TEMP_SHOW_SECRETS', async () => {
+    const { raw, run } = setup();
+    await run();
+    const list = raw.calls.indexOf(LIST_LINE);
+    expect(list).toBeGreaterThanOrEqual(0);
+    expect(list).toBeLessThan(raw.calls.indexOf(DISPLAY_LINE));
+    expect(raw.opts[list].env.SF_TEMP_SHOW_SECRETS).toBeUndefined();
+  });
+
+  const refusedBeforeDisplay = [
+    ['the alias listed under another org ID', orgList([{ alias: 'acme-qa', orgId: '00D000000000009AAA', username: 'admin@acme-qa.acme.example' }]), 'another org'],
+    ['the alias listed under the production org ID', orgList([{ alias: 'acme-qa', orgId: ACME_PROD_ID, username: 'admin@acme-qa.acme.example' }]), 'production'],
+    ['the alias missing from the list', orgList([]), 'not signed in'],
+    ['the list failing', sfError('SfError', 'Acme list broke'), 'could not read the sign-in of acme-qa'],
+  ];
+  for (const [name, list, reason] of refusedBeforeDisplay) {
+    it(`refuses with no display and no fetch for ${name}`, async () => {
+      const layout = { ...LAYOUT, orgs: { ...LAYOUT.orgs, 'acme-main': { orgId: ACME_PROD_ID, production: true } } };
+      const { raw, fetch, run } = setup({ list, layout });
+      const r = await run();
+      expect(r.ok).toBe(false);
+      expect(r.reason).toContain(reason);
+      expect(raw.calls).not.toContain(DISPLAY_LINE);
+      expect(fetch.calls).toEqual([]);
+      noSecrets(r);
+    });
+  }
+
+  it('refuses a session whose alias was re-pointed to production after the list: no fetch, and the production token in no reason or file', async () => {
+    const layout = { ...LAYOUT, orgs: { ...LAYOUT.orgs, 'acme-main': { orgId: ACME_PROD_ID, production: true } } };
+    const prodToken = sessionOf(ACME_PROD_ID);
+    // The list still maps acme-qa to the QA org, so the display answering the production org models the alias moving between the two.
+    const { raw, fetch, run } = setup({ layout, display: orgDisplay({ id: ACME_PROD_ID }) });
+    const r = await run();
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain('another org');
+    expect(r.reason).toContain('acme-qa');
+    expect(fetch.calls).toEqual([]);
+    expect(raw.calls).toContain(DISPLAY_LINE);
+    for (const t of [JSON.stringify(r), ...filesUnder(state), ...filesUnder(path.join(sfHome, '.foreman'))]) {
+      expect(t).not.toContain(prodToken);
+    }
+    noSecrets(r);
+  });
+
+  it('still passes when a production org is marked beside the stage org', async () => {
+    const layout = { ...LAYOUT, orgs: { ...LAYOUT.orgs, 'acme-main': { orgId: ACME_PROD_ID, production: true } } };
+    const { run } = setup({ layout });
+    expect((await run()).ok).toBe(true);
+  });
+
+  it('refuses a stage org that salesforce.orgs marks production: no display, no fetch', async () => {
+    const layout = { ...LAYOUT, orgs: { ...LAYOUT.orgs, 'acme-qa': { orgId: ACME_QA_ID, production: true } } };
+    const { raw, fetch, run } = setup({ layout });
+    const r = await run();
+    expect(r).toMatchObject({ ok: false, changedOrg: true });
+    expect(r.reason).toContain('production');
+    expect(raw.calls).not.toContain(DISPLAY_LINE);
+    expect(fetch.calls).toEqual([]);
+  });
+
+  it('refuses a production org ID under a non-production alias with no sf call at all', async () => {
+    const raw = fakeSh(evalRules());
+    const fetch = fakeFetch();
+    const block = { ...LAYOUT, orgs: { ...LAYOUT.orgs, 'acme-main': { orgId: ACME_PROD_ID, production: true } } };
+    const sh = isolatedSh(raw, ENV(), sfHome, os.homedir());
+    const r = await agentSession({ sh, rawSh: raw, env: ENV(), block, org: 'acme-qa', orgId: ACME_PROD_ID, fetch });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain('production');
+    expect(raw.calls).toEqual([]);
+    expect(fetch.calls).toEqual([]);
+  });
 
   it('fails when nameduser gives no JWT', async () => {
     const { fetch, run } = setup({ fetch: fakeFetch({ nameduser: { access_token: 'not-a-jwt' } }) });
@@ -461,35 +574,146 @@ describe('the eval caller', () => {
     expect(r.ok).toBe(false);
     expect(r.reason).toContain('login rate exceeded');
     expect(fetch.posts()).toEqual([]);
+    expect(fetch.calls).toHaveLength(2);
+    expect(ctx.sleeps).toEqual([]);
     expect(coolingDown(sfHome, 'acme-qa', ctx.now())).not.toBeNull();
     noSecrets(r);
   });
 
-  it('fails with the status only on a userinfo error', async () => {
-    const userinfo = () => new Response(`{"error":"bad ${ACME_SESSION}"}`, { status: 403 });
-    const { fetch, run } = setup({ fetch: fakeFetch({ userinfo }) });
+  it('retries userinfo once after RETRY_WAIT_MS when it answers 403 and then 200', async () => {
+    let n = 0;
+    const userinfo = () => (n++ === 0 ? new Response('{"error":"Forbidden"}', { status: 403 }) : { user_id: ACME_USER_ID });
+    const { ctx, fetch, run } = setup({ fetch: fakeFetch({ userinfo }) });
     const r = await run();
-    expect(r.ok).toBe(false);
-    expect(r.reason).toContain('HTTP 403');
-    expect(fetch.calls).toHaveLength(1);
+    expect(r.ok).toBe(true);
+    expect(fetch.calls.filter((c) => c.url.endsWith('/services/oauth2/userinfo'))).toHaveLength(2);
+    expect(ctx.sleeps).toEqual([RETRY_WAIT_MS]);
+    expect(fetch.posts()).toHaveLength(1);
     noSecrets(r);
   });
 
+  it('retries nameduser once when it answers 503 and then 200', async () => {
+    let n = 0;
+    const nameduser = () => (n++ === 0 ? new Response('Service Unavailable', { status: 503 }) : { access_token: ACME_JWT });
+    const { ctx, fetch, run } = setup({ fetch: fakeFetch({ nameduser }) });
+    const r = await run();
+    expect(r.ok).toBe(true);
+    expect(fetch.calls.filter((c) => c.url.endsWith('/agentforce/bootstrap/nameduser'))).toHaveLength(2);
+    expect(ctx.sleeps).toEqual([RETRY_WAIT_MS]);
+  });
+
+  it('retries userinfo once after a network error', async () => {
+    const inner = fakeFetch();
+    let thrown = false;
+    const flaky = async (url, init) => {
+      if (String(url).endsWith('/services/oauth2/userinfo') && !thrown) {
+        thrown = true;
+        throw new TypeError('fetch failed');
+      }
+      return inner(url, init);
+    };
+    const { ctx, run } = setup({ fetch: flaky });
+    const r = await run();
+    expect(r.ok).toBe(true);
+    expect(ctx.sleeps).toEqual([RETRY_WAIT_MS]);
+  });
+
+  it('fails on a second 403 from userinfo, quoting what Salesforce answered with no token in it', async () => {
+    const userinfo = () => new Response(`[{"errorCode":"INSUFFICIENT_ACCESS","message":"Session ${ACME_SESSION} denied"}]`, { status: 403 });
+    const { ctx, fetch, run } = setup({ fetch: fakeFetch({ userinfo }) });
+    const r = await run();
+    expect(r).toEqual({
+      ok: false,
+      reason: 'could not test the agents in acme-qa (qa): could not read the user of acme-qa (HTTP 403, after one retry): Salesforce answered "INSUFFICIENT_ACCESS: Session ••• denied"',
+      changedOrg: true,
+    });
+    expect(fetch.calls).toHaveLength(2);
+    expect(fetch.posts()).toEqual([]);
+    expect(ctx.sleeps).toEqual([RETRY_WAIT_MS]);
+    noSecrets(r);
+  });
+
+  it('says so when userinfo gets no answer twice', async () => {
+    const failingFetch = async () => {
+      throw new TypeError('fetch failed');
+    };
+    const { run } = setup({ fetch: failingFetch });
+    const r = await run();
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain('could not read the user of acme-qa: no answer, after one retry');
+  });
+
+  it('never retries a userinfo 403 whose body says login rate exceeded, and cools the org down', async () => {
+    const userinfo = () => new Response('{"error":"login rate exceeded"}', { status: 403 });
+    const { ctx, fetch, run } = setup({ fetch: fakeFetch({ userinfo }) });
+    const r = await run();
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain('login rate exceeded');
+    expect(fetch.calls).toHaveLength(1);
+    expect(ctx.sleeps).toEqual([]);
+    expect(coolingDown(sfHome, 'acme-qa', ctx.now())).not.toBeNull();
+    expect(cooldownRecord().at).toBe(ctx.now().toISOString());
+    noSecrets(r);
+  });
+
+  it('cools the org down when the retry itself answers login rate exceeded', async () => {
+    let n = 0;
+    const userinfo = () => (n++ === 0 ? new Response('down', { status: 503 }) : new Response('{"error":"login rate exceeded"}', { status: 400 }));
+    const { ctx, fetch, run } = setup({ fetch: fakeFetch({ userinfo }) });
+    const r = await run();
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain('login rate exceeded');
+    expect(fetch.calls).toHaveLength(2);
+    expect(ctx.sleeps).toEqual([RETRY_WAIT_MS]);
+    expect(coolingDown(sfHome, 'acme-qa', ctx.now())).not.toBeNull();
+    const rec = cooldownRecord();
+    expect(rec.at).toBe(ctx.now().toISOString());
+    expect(rec.until).toBe(new Date(ctx.now().getTime() + COOLDOWN_MS).toISOString());
+    expect(r.reason).toContain(rec.until);
+  });
+
+  it('counts both retry waits when userinfo and then nameduser are retried before login rate exceeded', async () => {
+    let u = 0;
+    let n = 0;
+    const userinfo = () => (u++ === 0 ? new Response('down', { status: 503 }) : { user_id: ACME_USER_ID });
+    const nameduser = () => (n++ === 0 ? new Response('down', { status: 503 }) : new Response('{"error":"login rate exceeded"}', { status: 400 }));
+    const { ctx, run } = setup({ fetch: fakeFetch({ userinfo, nameduser }) });
+    const r = await run();
+    expect(r.ok).toBe(false);
+    expect(ctx.sleeps).toEqual([RETRY_WAIT_MS, RETRY_WAIT_MS]);
+    expect(cooldownRecord().at).toBe(ctx.now().toISOString());
+    noSecrets(r);
+  });
+
+  it('does not retry a 401 or a 404 on userinfo', async () => {
+    for (const status of [401, 404]) {
+      const { ctx, fetch, run } = setup({ fetch: fakeFetch({ userinfo: () => new Response('nope', { status }) }) });
+      const r = await run();
+      expect(r.ok).toBe(false);
+      expect(r.reason).toContain(`HTTP ${status})`);
+      expect(r.reason).not.toContain('after one retry');
+      expect(fetch.calls).toHaveLength(1);
+      expect(ctx.sleeps).toEqual([]);
+    }
+  });
+
   it('fails after exactly one POST on an eval 429, and records no cool-down', async () => {
-    const { fetch, run } = setup({ fetch: fakeFetch({ evals: () => new Response('Too Many Requests', { status: 429 }) }) });
+    const { ctx, fetch, run } = setup({ fetch: fakeFetch({ evals: () => new Response('Too Many Requests', { status: 429 }) }) });
     const r = await run();
     expect(r.ok).toBe(false);
     expect(r.reason).toContain('the eval API is limiting calls (HTTP 429)');
     expect(fetch.posts()).toHaveLength(1);
+    expect(ctx.sleeps).toEqual([]);
     expect(fs.existsSync(cooldownFile(sfHome, 'acme-qa'))).toBe(false);
     noSecrets(r);
   });
 
   it('treats a body naming a request limit as the eval API limiting calls', async () => {
-    const { fetch, run } = setup({ fetch: fakeFetch({ evals: () => new Response('{"message":"REQUEST_LIMIT_EXCEEDED: TotalRequests Limit exceeded."}', { status: 403 }) }) });
+    const { ctx, fetch, run } = setup({ fetch: fakeFetch({ evals: () => new Response('{"message":"REQUEST_LIMIT_EXCEEDED: TotalRequests Limit exceeded."}', { status: 403 }) }) });
     const r = await run();
     expect(r.reason).toContain('the eval API is limiting calls (HTTP 403)');
     expect(fetch.posts()).toHaveLength(1);
+    expect(ctx.sleeps).toEqual([]);
     expect(fs.existsSync(cooldownFile(sfHome, 'acme-qa'))).toBe(false);
   });
 
@@ -498,6 +722,8 @@ describe('the eval caller', () => {
     const r = await run();
     expect(r.ok).toBe(false);
     expect(r.reason).toContain('HTTP 401');
+    expect(r.reason).toContain('Invalid token •••');
+    expect(r.reason).not.toContain(ACME_JWT);
     expect(fetch.posts()).toHaveLength(1);
     noSecrets(r);
   });
@@ -505,14 +731,74 @@ describe('the eval caller', () => {
   it('fails when a network error stops a call', async () => {
     const fetch = fakeFetch();
     const failingFetch = async (url, init) => {
-      if (String(url) === EVAL_URL) throw Object.assign(new Error(`connect ECONNREFUSED ${ACME_JWT}`), { name: 'TypeError' });
+      if (String(url) === EVAL_URL) {
+        failingFetch.posts += 1;
+        throw Object.assign(new Error(`connect ECONNREFUSED ${ACME_JWT}`), { name: 'TypeError' });
+      }
       return fetch(url, init);
     };
-    const { run } = setup({ fetch: failingFetch });
+    failingFetch.posts = 0;
+    const { ctx, run } = setup({ fetch: failingFetch });
     const r = await run();
     expect(r.ok).toBe(false);
-    expect(r.reason).toContain('eval API');
+    expect(r.reason).toContain('could not reach the eval API: no answer, after one retry');
+    expect(failingFetch.posts).toBe(2);
+    expect(ctx.sleeps).toEqual([RETRY_WAIT_MS]);
     noSecrets(r);
+  });
+
+  it('retries an eval POST once after a 503 and records one suite', async () => {
+    let n = 0;
+    const evals = (call) => (n++ === 0 ? new Response('Service Unavailable', { status: 503 }) : passAll(call.body));
+    const { ctx, fetch, run } = setup({ fetch: fakeFetch({ evals }) });
+    const r = await run();
+    expect(r.ok).toBe(true);
+    expect(fetch.posts()).toHaveLength(2);
+    expect(ctx.sleeps).toEqual([RETRY_WAIT_MS]);
+    expect(evalRoom(state, 'acme-qa', { now: ctx.now() }).used).toBe(1);
+    noSecrets(r);
+  });
+
+  it('quotes the redacted answer when an eval POST is refused twice', async () => {
+    const evals = () => new Response('{"message":"Forbidden for aaa.bbb.ccc"}', { status: 403 });
+    const { fetch, run } = setup({ fetch: fakeFetch({ evals }) });
+    const r = await run();
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain('the eval API refused the suite (HTTP 403, after one retry): Salesforce answered "Forbidden for •••"');
+    expect(fetch.posts()).toHaveLength(2);
+    noSecrets(r);
+  });
+
+  it('does not retry an eval POST that timed out', async () => {
+    const inner = fakeFetch();
+    let posts = 0;
+    const timing = async (url, init) => {
+      if (String(url) === EVAL_URL) {
+        posts += 1;
+        throw Object.assign(new Error('x'), { name: 'TimeoutError' });
+      }
+      return inner(url, init);
+    };
+    const { ctx, run } = setup({ fetch: timing });
+    const r = await run();
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain('timed out');
+    expect(r.reason).not.toContain('after one retry');
+    expect(posts).toBe(1);
+    expect(ctx.sleeps).toEqual([]);
+  });
+
+  it('retries each batch on its own', async () => {
+    let second = 0;
+    const evals = (call) => {
+      if (call.body.tests[0].id === 'case-6' && second++ === 0) return new Response('boom', { status: 500 });
+      return passAll(call.body);
+    };
+    const { ctx, fetch, run } = setup({ spec: specWith(7), fetch: fakeFetch({ evals }) });
+    const r = await run();
+    expect(r.ok).toBe(true);
+    expect(fetch.posts()).toHaveLength(3);
+    expect(ctx.sleeps).toEqual([RETRY_WAIT_MS]);
   });
 
   it('fails a 302 on userinfo as plain HTTP 302, following nothing', async () => {
@@ -558,6 +844,114 @@ describe('the eval caller', () => {
       expect(sfLines(raw)).toEqual([]);
       expect(fetch.calls).toEqual([]);
     }
+  });
+});
+
+// The wrapper in place with a production org marked, run for real: it unsets SF_TEMP_SHOW_SECRETS,
+// so only a read through the real sf gets the session.
+describe('agentSession with a production org marked and the wrapper in place, run for real', { timeout: 30_000 }, () => {
+  const REAL_TOKEN = '00D000000000002!REAL.TOKEN.FOR.TEST';
+  const REDACTED = "[REDACTED] Use 'sf org display --verbose' to see the access token";
+  let log;
+  let env;
+  let rawSh;
+  let sh;
+  const block = { ...LAYOUT, orgs: { ...LAYOUT.orgs, 'acme-main': { orgId: ACME_PROD_ID, production: true } } };
+
+  beforeEach(() => {
+    const realDir = path.join(dir, 'real');
+    fs.mkdirSync(realDir, { recursive: true });
+    log = path.join(dir, 'fake-sf.log');
+    const realSf = path.join(realDir, 'sf');
+    const script = [
+      '#!/bin/sh',
+      'echo "${SF_TEMP_SHOW_SECRETS-unset}|$*" >> "$FAKE_LOG"',
+      'if [ "$1 $2" = "org list" ]; then',
+      `  echo '{"status":0,"result":{"sandboxes":[{"alias":"acme-qa","orgId":"${ACME_QA_ID}","username":"admin@acme-qa.acme.example"},{"alias":"acme-main","orgId":"${ACME_PROD_ID}","username":"admin@acme-main.acme.example"}]}}'`,
+      '  exit 0',
+      'fi',
+      'if [ "$1 $2" = "org display" ]; then',
+      '  alias=""; prev=""',
+      '  for a in "$@"; do if [ "$prev" = "--target-org" ]; then alias="$a"; fi; prev="$a"; done',
+      `  if [ "$alias" = "acme-main" ]; then id="${ACME_PROD_ID}"; else id="${ACME_QA_ID}"; fi`,
+      `  if [ "$SF_TEMP_SHOW_SECRETS" = "true" ]; then t='${REAL_TOKEN}'; else t="${REDACTED}"; fi`,
+      `  echo "{\\"status\\":0,\\"result\\":{\\"id\\":\\"$id\\",\\"instanceUrl\\":\\"${ACME_INSTANCE}\\",\\"accessToken\\":\\"$t\\"}}"`,
+      '  exit 0',
+      'fi',
+      'exit 0',
+      '',
+    ].join('\n');
+    fs.writeFileSync(realSf, script, { mode: 0o755 });
+    fs.mkdirSync(binDir(sfHome), { recursive: true });
+    fs.writeFileSync(path.join(binDir(sfHome), 'sf'), wrapperScript({ realSf, dataDir: path.join(dir, 'data'), production: [{ alias: 'acme-main', orgId: ACME_PROD_ID }] }), { mode: 0o755 });
+    env = {
+      PATH: tempPath(dir, binDir(sfHome), realDir),
+      FOREMAN_SF_HOME: sfHome,
+      FAKE_LOG: log,
+    };
+    rawSh = (cmd, args, opts = {}) => spawnSync(cmd, args, { encoding: 'utf8', ...opts });
+    sh = isolatedSh(rawSh, env, sfHome, os.homedir());
+  });
+
+  const logged = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '');
+
+  it('gives a sandbox the real session: userinfo gets it as Bearer', async () => {
+    const fetch = fakeFetch();
+    const r = await agentSession({ sh, rawSh, env, block, org: 'acme-qa', orgId: ACME_QA_ID, fetch });
+    expect(r.ok, r.reason).toBe(true);
+    expect(fetch.calls[0].headers.Authorization).toBe(`Bearer ${REAL_TOKEN}`);
+    expect(logged()).toContain('true|org display --target-org acme-qa');
+    expect(logged()).toContain('unset|org list');
+  });
+
+  it('gives production nothing: no org display, no fetch', async () => {
+    const fetch = fakeFetch();
+    const r = await agentSession({ sh, rawSh, env, block, org: 'acme-main', orgId: ACME_PROD_ID, fetch });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain('production');
+    expect(fetch.calls).toEqual([]);
+    expect(logged()).not.toContain('org display');
+  });
+
+  it("builds every PATH from the test's temp folder alone, so the sf the session reads is the test's fake", () => {
+    for (const entry of env.PATH.split(path.delimiter)) {
+      expect(path.relative(dir, entry).startsWith('..'), entry).toBe(false);
+    }
+    expect(findRealSf(env, fs, binDir(sfHome))).toBe(path.join(dir, 'real', 'sf'));
+  });
+
+  it('refuses a PATH with only the wrapper, naming the missing sf, with no fetch', async () => {
+    const empty = path.join(dir, 'empty-bin');
+    fs.mkdirSync(empty, { recursive: true });
+    const wrapperOnly = { ...env, PATH: tempPath(dir, binDir(sfHome), empty) };
+    expect(findRealSf(wrapperOnly, fs, binDir(sfHome))).toBeNull();
+    const fetch = fakeFetch();
+    const r = await agentSession({ sh: isolatedSh(rawSh, wrapperOnly, sfHome, os.homedir()), rawSh, env: wrapperOnly, block, org: 'acme-qa', orgId: ACME_QA_ID, fetch });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain('no Salesforce CLI on PATH');
+    expect(fetch.calls).toEqual([]);
+    expect(logged()).not.toContain('org display');
+  });
+});
+
+describe('tempPath', () => {
+  it('joins folders inside the root with the path delimiter', () => {
+    expect(tempPath(dir, path.join(dir, 'a'), path.join(dir, 'b', 'c'))).toBe([path.join(dir, 'a'), path.join(dir, 'b', 'c')].join(path.delimiter));
+  });
+
+  it('throws on any folder that is not inside the root', () => {
+    for (const bad of ['/usr/bin', '/bin', path.dirname(process.execPath), 'bin', `${dir}-other/bin`, path.join(dir, '..', 'x'), dir]) {
+      expect(() => tempPath(dir, bad), bad).toThrow(/not inside/);
+    }
+  });
+
+  it('throws on a root outside the temp folder', () => {
+    const root = path.parse(os.tmpdir()).root;
+    expect(() => tempPath(root, path.join(root, 'bin'))).toThrow(/not inside the temp folder/);
+  });
+
+  it('throws when given no folders', () => {
+    expect(() => tempPath(dir)).toThrow();
   });
 });
 
@@ -610,5 +1004,61 @@ describe('the suite counter through agentforceCheck', () => {
     const q = `sf data query --query ${versionsQuery(API)} --target-org acme-qa --json`;
     expect(sfLines(raw).filter((l) => l === q)).toHaveLength(3);
     expect(sfLines(raw).indexOf(DISPLAY_LINE)).toBeGreaterThan(sfLines(raw).lastIndexOf(q));
+  });
+});
+
+describe('answerSnippet', () => {
+  it('reads the code and message of an error array, or of a plain object', () => {
+    expect(answerSnippet('[{"errorCode":"X","message":"m"}]')).toBe('X: m');
+    expect(answerSnippet('{"error":"invalid_request","error_description":"d"}')).toBe('invalid_request: d');
+    expect(answerSnippet('{"message":"only"}')).toBe('only');
+  });
+
+  it('trims plain text, strips tags, and gives nothing for no text', () => {
+    expect(answerSnippet('  plain   text \n')).toBe('plain text');
+    expect(answerSnippet('<html><body><h1>Forbidden</h1></body></html>')).toBe('Forbidden');
+    expect(answerSnippet('')).toBe('');
+    expect(answerSnippet(null)).toBe('');
+  });
+
+  it('blanks a passed secret and token shapes that were never passed', () => {
+    expect(answerSnippet('bad ACME-SESSION-SECRET here', ['ACME-SESSION-SECRET'])).toBe('bad ••• here');
+    expect(answerSnippet('Bearer abc')).not.toContain('abc');
+    expect(answerSnippet('x eyJhbGciOi.eyJzdWIiOiIx.c2lnbmF0dXJl y')).toBe('x ••• y');
+    expect(answerSnippet('sid 00D000000000001!AQ4AQFakeSessionValue end')).toBe('sid ••• end');
+  });
+
+  it('blanks a session id stuck to a word character or URL-encoded', () => {
+    const cases = [
+      ['sid x00D000000000001!AQ4AQFakeSessionValue end', 'sid x••• end'],
+      ['sid _00D000000000001!AQ4AQFakeSessionValue end', 'sid _••• end'],
+      ['sid 00D000000000001%21AQ4AQFakeSessionValue end', 'sid ••• end'],
+    ];
+    for (const [input, want] of cases) {
+      const got = answerSnippet(input);
+      expect(got).toBe(want);
+      expect(got).not.toContain('AQ4AQFakeSessionValue');
+    }
+  });
+
+  it('drops control and escape characters and collapses whitespace in a JSON message too', () => {
+    const got = answerSnippet('{"errorCode":"BAD","message":"line one\\nline two \\u001b[31mred\\u001b[0m\\u0007"}');
+    expect(got).toBe('BAD: line one line two red');
+    expect(got).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+    expect(answerSnippet('plain \x1b[1mbold\x1b[0m\r\ntext')).toBe('plain bold text');
+    expect(answerSnippet('{"message":"tok\\u001b[0m ACME-SESSION-SECRET"}', ['ACME-SESSION-SECRET'])).toBe('tok •••');
+  });
+
+  it('cuts to 160 characters with an ellipsis, after redacting', () => {
+    const long = answerSnippet('a'.repeat(400));
+    expect(long.length).toBeLessThanOrEqual(161);
+    expect(long.endsWith('…')).toBe(true);
+    const straddle = answerSnippet(`${'a'.repeat(150)}ACME-SESSION-SECRET${'b'.repeat(50)}`, ['ACME-SESSION-SECRET']);
+    expect(straddle).not.toContain('ACME-SESS');
+    expect(straddle).toContain('•••');
+  });
+
+  it('turns double quotes into single quotes', () => {
+    expect(answerSnippet('say "hi"')).toBe("say 'hi'");
   });
 });

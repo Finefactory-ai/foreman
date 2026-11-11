@@ -39,9 +39,9 @@
 //                       refuses a story that reached a later stage. It is the sf path's
 //                       ship.rollback.command, so it runs inside the ship runner's synchronous
 //                       `sh -c` and keeps the slot's heartbeat itself while it waits on the
-//                       deploy. A line for people, then the last line is JSON: the rollBack
+//                       deploy. A line for people, one line per manual step, then the last line is JSON: the rollBack
 //                       result, { ok: true, story, stage, org, merge, revert, jobId, components,
-//                       deletes, manualSteps } or { ok: false, refused?, reason }.
+//                       deletes, held, manualSteps } or { ok: false, refused?, reason }.
 //   foreman sf fixed <stage>
 //                       after the owner fixed a halted stage by hand, records the stage's last
 //                       deploy as the branch head and the org's newest real deploy
@@ -164,6 +164,7 @@ export function makeSfCommand({ sh = null, packs = null, tmpDir, now = () => new
       const deployed = r.jobId ? `deploy ${r.jobId}` : 'nothing to deploy';
       const by = r.manualSteps.length ? `; ${r.manualSteps.length} manual step(s) left` : '';
       ctx.stdout.write(`rolled ${id} back on ${r.org} (${r.stage}): reverted ${r.merge.slice(0, SHORT_COMMIT)} with ${r.revert.slice(0, SHORT_COMMIT)}, ${deployed}${by}\n`);
+      for (const step of r.manualSteps) ctx.stdout.write(`  by hand: ${step}\n`);
     } else {
       ctx.stdout.write(`${r.refused ? 'refused to roll' : 'could not roll'} ${id} back: ${r.reason}\n`);
     }

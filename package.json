@@ -1,6 +1,6 @@
 {
   "name": "foreman",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "private": true,
   "license": "FSL-1.1-ALv2",
   "description": "An autonomous story-to-production pipeline for Claude Code: architect, build, test, review, release.",

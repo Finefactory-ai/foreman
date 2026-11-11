@@ -1,5 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { commandList, main, projectRoot } from './main.mjs';
@@ -76,5 +78,63 @@ describe('main', () => {
     const res = spawnSync(bin, ['--help'], { encoding: 'utf8' });
     expect(res.status).toBe(0);
     expect(res.stdout).toContain('config');
+  });
+});
+
+describe('main: the self-check of the plugin folder in a story session', () => {
+  let tmp;
+  let state;
+  let sessionEnv;
+  const events = () => (fs.existsSync(path.join(state, 'events.jsonl'))
+    ? fs.readFileSync(path.join(state, 'events.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
+    : []);
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'foreman-main-'));
+    state = path.join(tmp, 'state');
+    fs.mkdirSync(state);
+    sessionEnv = {
+      FOREMAN_RUN: '1',
+      FOREMAN_PLUGIN_ROOT: path.join(tmp, 'expected'),
+      FOREMAN_STATE_DIR: state,
+      FOREMAN_SLOT: 'w1',
+      FOREMAN_STORY: 'ACME-3',
+      FOREMAN_PROJECT_DIR: path.join(tmp, 'project'),
+    };
+  });
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  it('writes one warn event for two calls, and changes neither the exit code nor the output', async () => {
+    const plain = await run(['--help']);
+    const first = await run(['--help'], { env: sessionEnv, pluginRoot: path.join(tmp, 'other') });
+    const second = await run(['--help'], { env: sessionEnv, pluginRoot: path.join(tmp, 'other') });
+    expect(first).toEqual(plain);
+    expect(second).toEqual(plain);
+    const warns = events().filter((e) => e.kind === 'warn');
+    expect(warns).toHaveLength(1);
+    expect(warns[0].slot).toBe('w1');
+    expect(warns[0].text).toContain(path.join(tmp, 'other', 'bin', 'foreman'));
+  });
+
+  it('writes nothing when it is the expected plugin', async () => {
+    await run(['--help'], { env: sessionEnv, pluginRoot: sessionEnv.FOREMAN_PLUGIN_ROOT });
+    expect(events()).toEqual([]);
+  });
+
+  it('the real launcher, run from another folder, warns once on the slot over two calls', () => {
+    const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+    const bin = path.join(root, 'bin', 'foreman');
+    const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('FOREMAN_')));
+    const launched = { ...env, ...sessionEnv, FOREMAN_PLUGIN_ROOT: path.join(tmp, 'other'), FOREMAN_SLOT: 'w2', FOREMAN_STORY: 'ACME-7' };
+    for (let i = 0; i < 2; i++) {
+      const res = spawnSync(process.execPath, [bin, '--help'], { encoding: 'utf8', env: launched });
+      expect(res.status).toBe(0);
+      expect(res.stdout).toContain('config');
+    }
+    const warns = events().filter((e) => e.kind === 'warn');
+    expect(warns).toHaveLength(1);
+    expect(warns[0].slot).toBe('w2');
+    expect(warns[0].text).toContain(bin);
+    expect(warns[0].text).toContain(path.join(tmp, 'other', 'bin', 'foreman'));
   });
 });

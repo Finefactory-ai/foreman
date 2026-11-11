@@ -42,6 +42,8 @@ import { readMark } from '../../engine/session-files.mjs';
 import { confirmedResult, READY, readPark, UNPARKED } from '../../engine/parks.mjs';
 import { noteOnStory } from '../../engine/story-notes.mjs';
 import { designData } from '../../engine/story-notes-queue.mjs';
+import { rolledBackAtOf } from '../../engine/resume-close.mjs';
+import { packFor } from '../../../packs/index.mjs';
 
 const EXIT_FAILED = 1;
 const EXIT_USAGE = 64;
@@ -289,7 +291,19 @@ export default {
     if (sub === 'next') {
       const skip = v.skip ? v.skip.split(',').filter(Boolean) : [];
       const picked = nextStory(stories, { id: v.id, strict: v.strict, skip, idPattern });
-      stdout.write(`${JSON.stringify(picked ?? { none: true })}\n`);
+      let out = picked ?? { none: true };
+      if (picked) {
+        // Its pull request may have merged before its release was rolled back; the skill reads this.
+        let pack = null;
+        try {
+          pack = packFor(config);
+        } catch {
+          // no pack, no rollback record
+        }
+        const rolledBackAt = rolledBackAtOf(pack, { dir, story: picked.id });
+        if (rolledBackAt !== null) out = { ...picked, rolledBackAt };
+      }
+      stdout.write(`${JSON.stringify(out)}\n`);
       return 0;
     }
 

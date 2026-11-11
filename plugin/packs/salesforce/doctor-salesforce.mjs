@@ -30,6 +30,11 @@
 //                                       has no role, so no baseline, Agentforce or source
 //                                       tracking check touches it. An unmarked scratch dev hub is
 //                                       not checked.
+//   salesforce org build                scratch mode only: the Dev Hub is signed in to the isolated sf
+//                                       home without JWT, read from the shared `sf org list` alone
+//                                       (no other sf call, no scratch org made). Fails a Dev Hub
+//                                       signed in by JWT, or not signed in, and names the
+//                                       `sf org login web` line to sign it in with.
 //   salesforce sf isolation             the isolated sf home the sessions use (isolation.mjs)
 //                                       holds only orgs in salesforce.orgs, each a sandbox or a
 //                                       production org salesforce.orgs marks, plus in scratch mode
@@ -146,7 +151,7 @@ import { ALIAS, BLOCK_DEFAULTS, BRANCH, RELEASES, TEST_LEVELS, layout } from './
 import { LIST_LIMIT, SF_TIMEOUT_MS, caseDescribe, listQuery, listViewTail, whereTail } from './cases.mjs';
 import { checkOptions as checkStoriesOptions } from '../../lib/adapters/stories/salesforce.mjs';
 import { coolingDown, isNotSignedIn, isUnreachable, runSf } from './sf.mjs';
-import { SF_PLUGIN, activeScratchQuery, aliasStray, binDir, findRealSf, homeProblem, homeVerdict, isolatedSh, listOrgs, sfHome } from './isolation.mjs';
+import { SF_PLUGIN, activeScratchQuery, aliasStray, binDir, findRealSf, homeProblem, homeVerdict, isolatedSh, listOrgs, listedEntry, sfHome } from './isolation.mjs';
 import { parsePluginList } from '../../lib/engine/plugin-list.mjs';
 import { CREDENTIALS_REASON, SKILL_NAME, hasCredentials, hashSkillDir, namedSkills, readLock } from './skills.mjs';
 import { SUCCESSFUL, TOKEN_VAR, environmentFor, gearsetDeployments, gearsetEnvironments, gearsetToken } from './gearset.mjs';
@@ -321,6 +326,37 @@ function judgeOrg(org, query, home) {
   const id = typeof record.Id === 'string' ? record.Id.slice(0, 15) : '';
   if (id !== orgId.slice(0, 15)) return fail(`${alias} is org ${id}, not ${orgId}`, { hint: `fix the org ID of ${alias} in salesforce.orgs, or sign the right org in` });
   return ok(org.production ? 'production (connected; deployments blocked)' : `sandbox ${orgId}`);
+}
+
+const DEV_HUB = { hint: "sign the Dev Hub in to Foreman's sf home with `sf org login web`, not JWT" };
+const DEV_HUB_NAMED = { hint: 'set salesforce.build.scratch.devHub to the alias of your Dev Hub in salesforce.orgs' };
+const SF_HOME_PATH = { hint: 'set FOREMAN_SF_HOME to an absolute path, or unset it' };
+const ORG_LIST_FAILED = { hint: "check that `sf org list` runs in Foreman's sf home, then run the doctor again" };
+const STRAY = { hint: "keep only the sandboxes in salesforce.orgs in Foreman's sf home" };
+
+// Scratch mode: how the Dev Hub is signed in to the isolated sf home. sf makes each story's
+// scratch org through it, and Salesforce cannot set up a JWT sign-in's app in a new scratch org.
+// Read from the shared `sf org list` alone (a JWT sign-in lists a privateKey): no other sf call,
+// and no scratch org made. The detail names the alias and the home, never the username, the
+// client ID or the key's path. Each failure carries its own fix hint.
+function scratchBuildCheck(b, plan, env, home, list) {
+  const hub = plan.devHub;
+  if (!isText(hub)) return fail('scratch mode: salesforce.build.scratch.devHub names no Dev Hub', DEV_HUB_NAMED);
+  if (!ALIAS.test(hub)) return fail('scratch mode: salesforce.build.scratch.devHub is not a valid org alias', DEV_HUB_NAMED);
+  const problem = homeProblem(env, home);
+  if (problem) return fail(problem, SF_HOME_PATH);
+  const l = list();
+  const stray = aliasStray({ home, block: b, list: l, alias: hub });
+  if (stray) return fail(stray, l?.ok === true ? STRAY : ORG_LIST_FAILED);
+  const sf = `HOME=${home} SF_USE_GENERIC_UNIX_KEYCHAIN=true sf`;
+  const login = `${sf} org login web --alias ${hub} --instance-url https://login.salesforce.com`;
+  const logout = `${sf} org logout --target-org ${hub} --no-prompt`;
+  const entry = listedEntry(l, hub);
+  if (!entry) return fail(`the Dev Hub ${hub} is not signed in to the isolated sf home; sign it in with the Salesforce CLI's own app: \`${login}\``, DEV_HUB);
+  if (isText(entry.privateKey)) {
+    return fail(`the Dev Hub ${hub} is signed in by JWT, so sf cannot make the stories' scratch orgs: Salesforce cannot set up that sign-in's app in a new scratch org. Sign it out, then in again with the Salesforce CLI's own app: \`${logout}\`, then \`${login}\``, DEV_HUB);
+  }
+  return ok(`the Dev Hub ${hub} is signed in without JWT, so sf can make the stories' scratch orgs`);
 }
 
 function productionBranchCheck(config, b, plan, ctx) {
@@ -811,7 +847,7 @@ export function doctorChecks(config, ctx) {
     const problem = homeProblem(env, home);
     if (problem) return fail(problem);
     const stray = aliasStray({ home, block: b, list: list(), alias: org.alias });
-    if (stray) return fail(stray, { hint: "keep only the sandboxes in salesforce.orgs in Foreman's sf home" });
+    if (stray) return fail(stray, STRAY);
     return judgeOrg(org, query(org.alias), home);
   };
 
@@ -819,7 +855,7 @@ export function doctorChecks(config, ctx) {
   add('salesforce layout', 'sf-layout', () => layoutCheck(cfg, plan), { hint: 'fix the salesforce block in foreman.config.json' });
 
   if (plan.scratch) {
-    add('salesforce org build', 'sf-orgs', () => warn('scratch mode: build orgs are made per story and are not checked here'), { hint: 'nothing to do: each story checks the scratch org it makes' });
+    add('salesforce org build', 'sf-orgs', () => scratchBuildCheck(b, plan, env, home, list), DEV_HUB);
   }
   const rolesOf = (org) => {
     if (org.production) return org.alias === plan.devHub ? 'production, scratch dev hub' : 'production';
@@ -831,7 +867,7 @@ export function doctorChecks(config, ctx) {
   }
   const scratchOrgs = () => (typeof ctx.root === 'string' ? readScratchOrgs(stateDir(ctx.root, cfg, env)) : []);
   const hub = (ids) => activeScratchQuery(iso, layout(b).build.devHub, ids);
-  add('salesforce sf isolation', 'sf-orgs', () => isolationCheck(b, { ...ctx, env }, home, list, query, scratchOrgs(), hub), { hint: "keep only the sandboxes in salesforce.orgs in Foreman's sf home" });
+  add('salesforce sf isolation', 'sf-orgs', () => isolationCheck(b, { ...ctx, env }, home, list, query, scratchOrgs(), hub), STRAY);
   add('salesforce plugin', 'sf-tools', () => pluginCheck(sh));
 
   for (const org of plan.build) {

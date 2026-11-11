@@ -32,6 +32,50 @@ describe('runShip', () => {
     expect(ctx.halts).toEqual([]);
   });
 
+  describe('a failure reason that is not text', () => {
+    it('is reduced to its reason field, and stored as a string', async () => {
+      const ctx = fakeCtx();
+      const { code, result } = await runShip({ steps: [step('watch', { ok: false, code: 5, stage: 'watch', reason: { reason: 'inner' } })], ctx });
+      expect(code).toBe(5);
+      expect(result.reason).toBe('inner');
+      expect(typeof ctx.halts[0].reason).toBe('string');
+    });
+
+    it('says the release failed at the stage when there is no reason in it', async () => {
+      const ctx = fakeCtx();
+      const { result } = await runShip({ steps: [step('watch', { ok: false, code: 5, stage: 'watch', reason: { x: 1 } })], ctx });
+      expect(result.reason).toBe('The release failed at watch.');
+    });
+
+    it('says the release failed at the step when the stage is missing too', async () => {
+      const ctx = fakeCtx();
+      const { result } = await runShip({ steps: [step('watch', { ok: false, code: 5, reason: 42 })], ctx });
+      expect(result.reason).toBe('The release failed at watch.');
+    });
+
+    it('still says "<step> failed." when there is no reason at all', async () => {
+      const ctx = fakeCtx();
+      const { result } = await runShip({ steps: [step('watch', { ok: false, code: 5 })], ctx });
+      expect(result.reason).toBe('watch failed.');
+    });
+  });
+
+  describe('a step label that is a function of ctx', () => {
+    it('is reported with its answer', async () => {
+      const ctx = fakeCtx();
+      await runShip({ steps: [step('a', { ok: true }, { label: (c) => `doing ${c.story}` })], ctx });
+      expect(ctx.reports).toContain('doing S-1');
+    });
+
+    it('reports the step name when it throws or answers nothing', async () => {
+      for (const label of [() => { throw new Error('no'); }, () => '', () => 7]) {
+        const ctx = fakeCtx();
+        await runShip({ steps: [step('a', { ok: true }, { label })], ctx });
+        expect(ctx.reports).toContain('a');
+      }
+    });
+  });
+
   it('tells every step which step of the release tests the merged code (testsMergedCode)', async () => {
     const ctx = fakeCtx();
     const a = step('a');
@@ -135,16 +179,17 @@ describe('runShip', () => {
   });
 
   it('step facts never replace the runner\'s own ctx keys', async () => {
-    const ctx = fakeCtx();
+    const ctx = fakeCtx({ rolledBackAt: '2026-11-10T18:00:00Z' });
     const sh = ctx.sh;
-    const bad = step('bad', { ok: true, sh: null, config: null, story: 'X', branch: 'main', locks: null, report: null, halt: null, sleep: null, now: null, pr: 'u' });
+    const bad = step('bad', { ok: true, sh: null, config: null, story: 'X', branch: 'main', locks: null, report: null, halt: null, sleep: null, now: null, rolledBackAt: 'x', pr: 'u' });
     const after = step('after');
     const { code, result } = await runShip({ steps: [bad, after], ctx });
     expect(code).toBe(0);
-    expect(after.ran[0].ctx).toMatchObject({ sh, story: 'S-1', branch: 'story/s-1', pr: 'u' });
+    expect(after.ran[0].ctx).toMatchObject({ sh, story: 'S-1', branch: 'story/s-1', rolledBackAt: '2026-11-10T18:00:00Z', pr: 'u' });
     expect(after.ran[0].ctx.config).toBeTruthy();
     expect(result).toMatchObject({ story: 'S-1', pr: 'u' });
     expect(result).not.toHaveProperty('branch');
+    expect(result).not.toHaveProperty('rolledBackAt');
   });
 
   it('a point-of-no-return step that fails itself does not halt', async () => {
@@ -233,10 +278,10 @@ describe('runShip', () => {
   describe('rolling back', () => {
     // A rollback step that records each call, and the HALTs written before it ran.
     const CMD = 'vercel rollback --yes';
-    const rollbackStep = (result = { ok: true, command: CMD }) => step('rollback', (ctx) => {
+    const rollbackStep = (result = { ok: true, command: CMD }, extra = {}) => step('rollback', (ctx) => {
       ctx.haltsWhenRolledBack = ctx.halts.map((h) => ({ ...h }));
       return typeof result === 'function' ? result(ctx) : result;
-    }, { label: 'rolling production back', commandFor: () => CMD });
+    }, { label: 'rolling production back', commandFor: () => CMD, ...extra });
     const merge = () => step('merge', { ok: true, sha: 's' }, { pointOfNoReturn: true });
     const deploy = (result = { ok: true }) => step('deploy-github', result, { deploys: true, halts: true });
     const watch = () => step('watch', { ok: false, code: 5, stage: 'watch', reason: 'errors went up after the deploy.' }, { halts: true });
@@ -291,6 +336,51 @@ describe('runShip', () => {
       expect(result.rolledBack).toBe(false);
       expect(result.reason).toMatch(/^Rollback failed .*production may be broken\. errors went up/);
       expect(ctx.halts.at(-1)).toEqual(result);
+    });
+
+    it('puts the rollback\'s manual steps in the HALT reason, before the failing step\'s reason', async () => {
+      const ctx = fakeCtx();
+      const onFailure = rollbackStep({ ok: true, command: CMD, manualSteps: ['a', 'b'] }, { whereFor: () => 'qa (acme-qa)' });
+      const { result } = await runShip({ steps: [merge(), deploy(), watch()], ctx, onFailure });
+      expect(result.reason).toBe(`qa (acme-qa) was rolled back with \`${CMD}\`. By hand: a; b. errors went up after the deploy.`);
+      expect(ctx.halts.at(-1)).toEqual(result);
+
+      const prod = fakeCtx();
+      const { result: p } = await runShip({ steps: [merge(), deploy(), watch()], ctx: prod, onFailure: rollbackStep({ ok: true, command: CMD, manualSteps: ['a'] }) });
+      expect(p.reason).toBe(`Production was rolled back with \`${CMD}\`. By hand: a. errors went up after the deploy.`);
+    });
+
+    it('ignores manualSteps that are not a non-empty list of strings, or that come with a failed rollback', async () => {
+      for (const manualSteps of [[], 'a', [1, 2], null, undefined]) {
+        const { result } = await runShip({ steps: [merge(), deploy(), watch()], ctx: fakeCtx(), onFailure: rollbackStep({ ok: true, command: CMD, manualSteps }) });
+        expect(result.reason).toBe(`Production was rolled back with \`${CMD}\`. errors went up after the deploy.`);
+      }
+      const { result } = await runShip({ steps: [merge(), deploy(), watch()], ctx: fakeCtx(), onFailure: rollbackStep({ ok: false, command: CMD, exitCode: 2, why: 'exited 2', manualSteps: ['a'] }) });
+      expect(result.reason).not.toContain('By hand');
+    });
+
+    it('names the place the rollback gives (whereFor) instead of production', async () => {
+      const ctx = fakeCtx();
+      const onFailure = rollbackStep({ ok: true, command: CMD }, { whereFor: () => 'qa (acme-qa)' });
+      const { result } = await runShip({ steps: [merge(), deploy(), watch()], ctx, onFailure });
+      expect(result.reason).toBe(`qa (acme-qa) was rolled back with \`${CMD}\`. errors went up after the deploy.`);
+    });
+
+    it('names that place when the rollback fails too, and never says production', async () => {
+      const ctx = fakeCtx();
+      const onFailure = rollbackStep({ ok: false, command: CMD, exitCode: 2, why: 'exited 2' }, { whereFor: () => 'qa (acme-qa)' });
+      const { result } = await runShip({ steps: [merge(), deploy(), watch()], ctx, onFailure });
+      expect(result.reason).toContain('qa (acme-qa) may be broken');
+      expect(result.reason).not.toMatch(/production/i);
+    });
+
+    it('says production when whereFor gives nothing usable or throws', async () => {
+      for (const whereFor of [() => '', () => null, () => 7, () => { throw new Error('no'); }]) {
+        const ctx = fakeCtx();
+        const onFailure = rollbackStep({ ok: true, command: CMD }, { whereFor });
+        const { result } = await runShip({ steps: [merge(), deploy(), watch()], ctx, onFailure });
+        expect(result.reason).toBe(`Production was rolled back with \`${CMD}\`. errors went up after the deploy.`);
+      }
     });
 
     it('is never called when the deploy itself fails: production still runs the previous version', async () => {

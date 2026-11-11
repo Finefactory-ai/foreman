@@ -36,7 +36,8 @@
 //                                Its prepare(n, path) returns a state or a promise of one
 //                                (lib/engine/slot-prepare.mjs). An optional sweep() tidies
 //                                what closed stories left and answers { warnings } or a
-//                                promise of it; the supervisor runs it every minute.
+//                                promise of it; the supervisor runs it every minute, and once
+//                                at a stop as sweep({ stopping: true, limitMs }).
 //     doctorChecks(config, ctx), optional; returns [{ name, step, run }] for `foreman doctor`.
 //                                `step` is the set-up step the check belongs to
 //                                (lib/setup/steps.mjs; 'project' when left out). A result
@@ -81,6 +82,20 @@
 //                                --mcp-config; a server of the same name that the project's
 //                                session.mcpServers names wins. A sessionNeeds of any other
 //                                shape stops the run.
+//     liveStage(config, ctx) -> { name, org } | null,
+//                                optional; the stage the release is live on (ctx holds the facts
+//                                its steps found so far). The core watch and rollback steps name
+//                                it in their stage words and reasons ("watching qa (acme-qa)
+//                                after the deploy"); "production" is used only when the pack
+//                                gives none (lib/adapters/ship/live-stage.mjs).
+//     rolledBackAt({ dir, story }) -> ISO time | null,
+//                                optional; when the story's last release was rolled back and no
+//                                release since replaced it, read from the state folder `dir`. It
+//                                is synchronous and never throws. The supervisor and `foreman
+//                                story next` use it so that a pull request merged before that
+//                                time does not count as shipped, and `foreman ship` uses it so
+//                                the release opens a new pull request instead of reusing one
+//                                merged before that time.
 //     traitsDir,                 optional; an absolute folder holding all.md (every role) and
 //                                <role>.md (one role). Their text goes before the project's own
 //                                traits (lib/engine/traits.mjs); a missing file is skipped.

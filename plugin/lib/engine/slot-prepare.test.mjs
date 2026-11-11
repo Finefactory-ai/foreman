@@ -7,7 +7,7 @@ import { git, makeRepos, sh } from '../../../test/state-repos.mjs';
 import { envAdapterContract } from '../adapters/env/contract.mjs';
 import { addItem, undoItem, updateItem } from './learning-store.mjs';
 import { envSweepDue, envVerdict, isPending, learnedSkills, learnedSkillsByRole, notStartedPatch, PENDING, pendingPrepares, prepareEnv, prepareSlot, runEnvSweep, sessionStartPatch, STATES, syncLearnedSkills } from './slot-prepare.mjs';
-import { readSlot, setSlot } from './state.mjs';
+import { readSlot, redact, setSlot } from './state.mjs';
 import { releaseHeld } from './scheduler.mjs';
 import { storiesInSlots } from '../../packs/salesforce/scratch-orgs.mjs';
 
@@ -657,6 +657,62 @@ describe('runEnvSweep', () => {
   it('skips warnings that are not text, and an adapter with no sweep', async () => {
     expect(await runEnvSweep({ sweep: async () => ({ warnings: [5, null, 'ok'] }) })).toEqual({ warnings: ['ok'] });
     expect(await runEnvSweep({})).toEqual({ warnings: [] });
+  });
+
+  describe('at a stop', () => {
+    it('calls sweep with no arguments without a stop argument, and with { stopping, limitMs } with one', async () => {
+      const sweep = vi.fn(async () => ({ warnings: [] }));
+      await runEnvSweep({ sweep });
+      expect(sweep).toHaveBeenCalledWith();
+      sweep.mockClear();
+      await runEnvSweep({ sweep }, { limitMs: 5000 });
+      expect(sweep).toHaveBeenCalledWith({ stopping: true, limitMs: 5000 });
+      expect(sweep).toHaveBeenCalledTimes(1);
+    });
+    it('keeps a warning of 450 characters whole, cuts one of 900 to 600, and redacts both', async () => {
+      const mid = `${'m'.repeat(430)} api_key=zzz999`;
+      const adapter = { sweep: async () => ({ warnings: [mid, 'x'.repeat(900)] }) };
+      const { warnings } = await runEnvSweep(adapter, { limitMs: 5000 });
+      expect(redact(mid).length).toBeGreaterThan(400);
+      expect(warnings[0]).toBe(redact(mid));
+      expect(warnings[0]).not.toContain('zzz999');
+      expect(warnings[1]).toHaveLength(600);
+      expect((await runEnvSweep(adapter)).warnings[1]).toHaveLength(200);
+      expect((await runEnvSweep(adapter)).warnings[0]).toBe(redact(mid).slice(0, 200));
+    });
+    it('gives one warning, and no rejection, when the sweep never settles', async () => {
+      const sweep = vi.fn(() => new Promise(() => {}));
+      const r = await runEnvSweep({ sweep }, { limitMs: 20, backstopMs: 10 });
+      expect(r.warnings).toHaveLength(1);
+      expect(r.warnings[0]).toMatch(/did not finish within/);
+    });
+    it('does not wait for the backstop once the sweep has answered', async () => {
+      vi.useFakeTimers();
+      try {
+        const r = await runEnvSweep({ sweep: async () => ({ warnings: ['one'] }) }, { limitMs: 60_000 });
+        expect(r).toEqual({ warnings: ['one'] });
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+    it('turns a throw, a rejection or a non-object answer into one warning, never a rejection', async () => {
+      const answers = [
+        () => {
+          throw new Error('boom');
+        },
+        () => Promise.reject(new Error('later boom')),
+        () => 'done',
+        () => null,
+        async () => ['z'.repeat(900)],
+      ];
+      for (const sweep of answers) {
+        const r = await runEnvSweep({ sweep }, { limitMs: 5000 });
+        expect(r.warnings, String(sweep)).toHaveLength(1);
+        expect(r.warnings[0].length).toBeLessThanOrEqual(600);
+      }
+      expect((await runEnvSweep({ sweep: () => { throw new Error('boom'); } }, { limitMs: 5000 })).warnings[0]).toContain('boom');
+    });
   });
 });
 

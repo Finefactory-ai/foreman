@@ -126,6 +126,15 @@
 // a server session.mcpServers does not; else ok, saying what sessions leave out unless
 // session.userSettings is true.
 //
+// 'foreman command' (Claude Code step, with or without a config) runs the user's interactive shell
+// (ctx.env.SHELL, `-ic 'type foreman'`, FOREMAN_RUN=1 set as in a story session) and warns when
+// `foreman` there is a shell alias or function, or a file other than this plugin's bin/foreman:
+// Claude Code's Bash tool sources the user's shell set-up, so such a `foreman` beats the plugin's
+// in story sessions (foreman-command.mjs). The fix says to wrap it in `if [[ -z "$FOREMAN_RUN" ]];
+// then ... fi`. It also warns, naming the shell, when the shell cannot be run or its answer says
+// nothing; it is ok when the shell has no foreman, or no SHELL is set (nothing is run). A warn
+// only, and it never prints an alias or function body.
+//
 // With a config, 'agent models' (Claude Code step) looks at the newest run record that ended in
 // the last 7 days and has its agents (run-record.mjs; ctx.now stands in for the clock). Its
 // modelMismatches name each agent that ran on another model family than its role is set to: a
@@ -145,7 +154,8 @@ import { envAdaptersFor } from './env-adapter.mjs';
 import { PACKS, packFor } from '../../packs/index.mjs';
 import * as emailResend from '../adapters/notify/email-resend.mjs';
 import { parsePluginList } from './plugin-list.mjs';
-import { copyWarning, installedCopies, ownCopy, sessionPlugin } from './plugin-copy.mjs';
+import { copyWarning, installedCopies, ownCopy, samePlace, sessionPlugin } from './plugin-copy.mjs';
+import { FIX_HINT, overrideText, readType } from './foreman-command.mjs';
 import { withFix } from '../setup/fix.mjs';
 import { stepForKey } from '../setup/keys.mjs';
 import { stateDir } from './paths.mjs';
@@ -597,6 +607,21 @@ export function buildChecks(config, ctx) {
     }
     if (log.status !== 0 || !Number.isFinite(committed) || committed <= 0) return warn('could not read this source\'s last commit time', hint('check that git works in the Foreman source'));
     return committed * 1000 > installedAt ? warn('installed plugin copy is older than this source; bump the version or reinstall', hint('bump the version or reinstall the plugin')) : ok();
+  });
+
+  add('foreman command', 'claude-code', () => {
+    const shell = ctx.env?.SHELL;
+    if (!shell) return ok('SHELL is not set; no shell set-up to check');
+    const r = ctx.sh(shell, ['-ic', 'type foreman'], { env: { ...ctx.env, FOREMAN_RUN: '1' }, timeout: 10_000 });
+    const t = readType(r ?? {}, { env: ctx.env });
+    const expected = path.join(ctx.sourceRoot, 'bin', 'foreman');
+    const overridden = (found) => warn(overrideText({ found, expected }), hint(FIX_HINT));
+    if (t.kind === 'alias') return overridden('a shell alias');
+    if (t.kind === 'function') return overridden('a shell function');
+    if (t.kind === 'file') return samePlace(t.path, expected, { fs: ctx.fs, home: ctx.home }) ? ok() : overridden(t.path);
+    if (t.kind === 'missing') return ok('your shell has no foreman of its own; story sessions use the plugin\'s');
+    if (t.kind === 'failed') return warn(`could not run your shell ${shell} to check \`foreman\` (${t.reason})`, hint(`check that \`${shell} -ic 'type foreman'\` runs`));
+    return warn(`could not tell what \`foreman\` is in your shell ${shell}`, hint(`run \`${shell} -ic 'type foreman'\` and check its output`));
   });
 
   if (!config) return checks.map(withFix);

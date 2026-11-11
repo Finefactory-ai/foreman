@@ -2975,6 +2975,46 @@ describe('help text', () => {
     expect(options(harness({ it: bare, help })).map((s) => s.h)).toEqual([null, null, null]);
   });
 
+  it('the answer form\'s save button says Save answer for any item with options, and Mark done only for a task without', () => {
+    const cardSrc = SCRIPT.match(/function decisionCard\(it\) \{[\s\S]*?\n {2}\}\n/)[0];
+    const helpSrc = SCRIPT.match(/function helpFor\(help, kind, key, own\) \{[\s\S]*?\n {2}\}\n/)[0];
+    const harness = new Function('input', `
+      const help = input.help, drafts = {}, changing = new Set(input.changing || []), busy = new Set();
+      const canAct = () => true, when = () => '';
+      const seen = [];
+      const el = (tag, cls, text) => ({ dataset: {}, setAttribute() {}, addEventListener() {}, append() {}, textContent: text });
+      const withHelp = (control, h, key) => { seen.push({ key, h, text: control.textContent }); return control; };
+      ${helpSrc}
+      ${cardSrc}
+      decisionCard(input.it);
+      return seen;
+    `);
+    const help = { decision: {}, form: { 'save-answer': { hint: 'Saves.', more: 'Saves.' }, 'mark-done': { hint: 'Done.', more: 'Done.' } } };
+    const saveOf = (it, changing) => harness({ it, help, changing }).find((s) => s.key === 'dec:' + it.id + ':save');
+    const task = { id: 't-1', kind: 'task', title: 'Fix the shop key', story: 'ACME-1', body: 'The key failed.', options: ['Retry the story', 'Close the task'], hints: ['Runs it again.', 'Closes it.'] };
+
+    const open = saveOf(task);
+    expect(open.text).toBe('Save answer');
+    expect(open.h).toEqual(help.form['save-answer']);
+
+    const answered = { ...task, answer: { option: 'Retry the story', note: 'go' } };
+    const reopened = saveOf(answered, ['t-1']);
+    expect(reopened.text).toBe('Save answer');
+    expect(reopened.h).toEqual(help.form['save-answer']);
+
+    const withOptions = saveOf({ id: 'd-1', kind: 'decision', title: 'Shop name', options: ['Keep', 'Rename'] });
+    expect(withOptions.text).toBe('Save answer');
+    expect(withOptions.h).toEqual(help.form['save-answer']);
+
+    const free = saveOf({ id: 'd-2', kind: 'decision', title: 'Shop motto' });
+    expect(free.text).toBe('Save answer');
+    expect(free.h).toEqual(help.form['save-answer']);
+
+    const old = saveOf({ id: 't-2', kind: 'task', title: 'Old task', options: [] });
+    expect(old.text).toBe('Mark done');
+    expect(old.h).toEqual(help.form['mark-done']);
+  });
+
   it('ties the hint and the tooltip to the control by safe ids', () => {
     expect(helpParts(null, 'help-x', '')).toBeNull();
     const h = { hint: 'a.', more: 'b' };

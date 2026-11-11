@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { confirmedResult } from './parks.mjs';
-import { ACTIONS, actionsFor, afterFixCheck, afterOutcome, apiHeldText, BACKOFF_MS, backoffMs, backoffShown, canPick, canResume, ENV_BACKOFF_STEPS, envWhy, failCauseOf, hung, LET_GO_PATCH, looseClaims, looseClaimText, lastProgressText, MAX_SIGNIN_RESUMES, newestStep, outcome, OWNER_CLAIM_POLL_SECONDS, ownerClaimFate, ownerClaimText, pendingCommands, releaseAfterWait, releaseHeld, resumeCheck, resumeHeld, settledOwnerClaims, signinRun, slotIdsFor, slotStoryId, spentResult, STANDBY, whenNothingLeft } from './scheduler.mjs';
+import { ACTIONS, actionsFor, afterFixCheck, afterOutcome, apiHeldText, BACKOFF_MS, backoffMs, backoffShown, canPick, canResume, dropSteps, ENV_BACKOFF_STEPS, envWhy, failCauseOf, hung, LET_GO_PATCH, looseClaims, looseClaimText, lastProgressText, MAX_SIGNIN_RESUMES, newestStep, outcome, OWNER_CLAIM_POLL_SECONDS, ownerClaimFate, ownerClaimText, pendingCommands, releaseAfterWait, releaseHeld, resumeCheck, resumeHeld, settledOwnerClaims, signinRun, slotIdsFor, slotStoryId, spentResult, STANDBY, whenNothingLeft, workStop, workStopText } from './scheduler.mjs';
 import { readSlot, setSlot } from './state.mjs';
 import { storiesInSlots } from '../../packs/salesforce/scratch-orgs.mjs';
 
@@ -953,6 +953,15 @@ describe('releaseHeld', () => {
     expect(releaseHeld([{ slot: 'w1', st: { state: 'held', heldStory: null, since: 'x' } }, { slot: 'w2', st: { state: 'held', since: 'y' } }])).toEqual([]);
   });
 
+  it('carries what the story looked like when the slot was held, as work.was', () => {
+    const heldWas = { status: 'blocked', blockedBy: 'Deploy failed' };
+    const st = { ...held('ACME-1', '2026-10-30T10:00:00.000Z', true), heldWas };
+    expect(releaseHeld([{ slot: 'w1', st }])[0].work).toEqual({ slot: 'w1', id: 'ACME-1', mode: 'after-halt', was: heldWas });
+    const api = { ...held('ACME-2', '2026-10-30T10:00:00.000Z'), heldFor: 'api', heldWas };
+    expect(resumeHeld([{ slot: 'w2', st: api }])[0].work).toEqual({ slot: 'w2', id: 'ACME-2', mode: '', was: heldWas });
+    expect(releaseAfterWait([{ slot: 'w2', st: api }], { now: 10 })[0].work).toEqual({ slot: 'w2', id: 'ACME-2', mode: '', was: heldWas, resume: true });
+  });
+
   describe('applied to a slot file', () => {
     let dir;
     beforeEach(() => {
@@ -976,6 +985,122 @@ describe('releaseHeld', () => {
     expect(fixed).toContain('setSlot(DIR, r.slot, r.patch, now());');
     expect(fixed).toContain('work.push(r.work);');
     expect(fixed).not.toContain('heldStory: null');
+  });
+
+  it('is gated: queued work passes queuedStop before takeOver, and a held slot records heldWas', () => {
+    const src = fs.readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const start = src.slice(src.indexOf('function startWork('), src.indexOf('const sweepClaims'));
+    expect(start).toContain('queuedStop(w)');
+    expect(start.indexOf('queuedStop(w)')).toBeLessThan(start.indexOf('takeOver('));
+    const reconcile = src.slice(src.indexOf('function reconcileStart('), src.indexOf('function startWork('));
+    expect(reconcile).toContain('finish: true');
+    const end = src.slice(src.indexOf('function endSession('), src.indexOf('const afterOwnerStop'));
+    expect(end).toContain('heldWas: heldSnapshot(id)');
+  });
+});
+
+describe('workStop', () => {
+  const ID = '[A-Z]+-\\d+';
+  const st = (id, status, blockedBy = '') => ({ id, status, blockedBy });
+  const list = [
+    st('ACME-1', 'todo'),
+    st('ACME-2', 'in-progress'),
+    st('ACME-3', 'blocked', 'Deploy failed.'),
+    st('ACME-4', 'done'),
+    st('ACME-5', 'retired'),
+    st('ACME-6', 'ready-to-promote'),
+    st('ACME-7', 'blocked', 'ACME-4 must land first'),
+    st('ACME-8', 'blocked', 'ACME-1 must land first'),
+  ];
+  const stop = (w, over = {}) => workStop({ slot: 'w1', mode: '', ...w }, { stories: list, idPattern: ID, ...over });
+
+  it('stops work for a story skipped this run', () => {
+    expect(stop({ id: 'ACME-1' }, { skipped: ['ACME-1'] })).toEqual({ why: 'skipped' });
+    expect(stop({ id: 'ACME-4', resume: true }, { skipped: ['ACME-4'] })).toEqual({ why: 'skipped' });
+  });
+  it('lets finish-release work and summary work through, even when skipped', () => {
+    expect(stop({ id: 'ACME-1', finish: true }, { skipped: ['ACME-1'] })).toBeNull();
+    expect(stop({ id: 'ACME-1', mode: 'group-summary' }, { skipped: ['ACME-1'] })).toBeNull();
+    expect(stop({ id: 'ACME-4', mode: 'phase-summary' })).toBeNull();
+  });
+  it('stops work for a done, retired or ready-to-promote story, but leaves a resume to closeInstead', () => {
+    expect(stop({ id: 'ACME-4' })).toEqual({ why: 'settled', status: 'done' });
+    expect(stop({ id: 'ACME-5' })).toEqual({ why: 'settled', status: 'retired' });
+    expect(stop({ id: 'ACME-6' })).toEqual({ why: 'settled', status: 'ready-to-promote' });
+    expect(stop({ id: 'ACME-4', resume: true })).toBeNull();
+  });
+  it('stops work for a story blocked in words, in any gated mode', () => {
+    expect(stop({ id: 'ACME-3' })).toEqual({ why: 'blocked' });
+    expect(stop({ id: 'ACME-3', mode: 'fresh' })).toEqual({ why: 'blocked' });
+  });
+  it('lets a halted story resume when nothing changed since it was held', () => {
+    expect(stop({ id: 'ACME-3', mode: 'after-halt', was: { status: 'blocked', blockedBy: 'Deploy failed.' } })).toBeNull();
+  });
+  it('stops a halted story the owner changed since it was held', () => {
+    expect(stop({ id: 'ACME-3', mode: 'after-halt', was: { status: 'blocked', blockedBy: 'Something else' } })).toEqual({ why: 'blocked' });
+    expect(stop({ id: 'ACME-3', mode: 'after-halt', was: { status: 'in-progress', blockedBy: '' } })).toEqual({ why: 'blocked' });
+  });
+  it('lets an after-halt story with no record resume as before', () => {
+    expect(stop({ id: 'ACME-3', mode: 'after-halt' })).toBeNull();
+  });
+  it('lets a story blocked only on done stories through, and stops one blocked on an open story', () => {
+    expect(stop({ id: 'ACME-7' })).toBeNull();
+    expect(stop({ id: 'ACME-8' })).toEqual({ why: 'blocked' });
+  });
+  it('lets todo and in-progress stories through', () => {
+    expect(stop({ id: 'ACME-1' })).toBeNull();
+    expect(stop({ id: 'ACME-2' })).toBeNull();
+  });
+  it('lets a story the source does not list through', () => {
+    expect(stop({ id: 'ACME-99' })).toBeNull();
+  });
+  it('checks only the skip when the source cannot be read', () => {
+    expect(stop({ id: 'ACME-4' }, { stories: null })).toBeNull();
+    expect(stop({ id: 'ACME-4' }, { stories: null, skipped: ['ACME-4'] })).toEqual({ why: 'skipped' });
+  });
+  it('treats a blocked story as blocked when there is no id pattern', () => {
+    expect(stop({ id: 'ACME-7' }, { idPattern: undefined })).toEqual({ why: 'blocked' });
+  });
+});
+
+describe('workStopText', () => {
+  it('words the three reasons', () => {
+    expect(workStopText({ id: 'ACME-1', slot: 'w1', stop: { why: 'skipped' } })).toBe('ACME-1 not resumed: you skipped it for this run; slot w1 is free.');
+    expect(workStopText({ id: 'ACME-2', slot: 'w2', stop: { why: 'settled', status: 'done' } })).toBe('ACME-2 not resumed: its story is done; slot w2 is free.');
+    expect(workStopText({ id: 'ACME-3', slot: 'w3', stop: { why: 'blocked' } })).toBe('ACME-3 not resumed: its story is blocked; slot w3 is free.');
+  });
+});
+
+describe('dropSteps', () => {
+  const NONE = { free: false, letGo: false, tidy: false, say: false };
+
+  it('touches nothing and says nothing when the story already runs elsewhere', () => {
+    for (const pinned of [false, true]) {
+      for (const elsewhere of [false, true]) expect(dropSteps({ running: true, pinned, elsewhere })).toEqual(NONE);
+    }
+  });
+  it('frees the slot, lets the story go and says so for a pinned story nothing else holds', () => {
+    expect(dropSteps({ running: false, pinned: true, elsewhere: false })).toEqual({ free: true, letGo: true, tidy: true, say: true });
+  });
+  it('clears the pin only, when the story is also in hand elsewhere', () => {
+    expect(dropSteps({ running: false, pinned: true, elsewhere: true })).toEqual({ free: true, letGo: false, tidy: false, say: false });
+  });
+  it('lets go and says so for an unpinned story nothing else holds', () => {
+    expect(dropSteps({ running: false, pinned: false, elsewhere: false })).toEqual({ free: false, letGo: true, tidy: false, say: true });
+  });
+  it('drops a duplicate of a story in hand elsewhere quietly', () => {
+    expect(dropSteps({ running: false, pinned: false, elsewhere: true })).toEqual(NONE);
+  });
+  it('is the unpinned, nowhere-else result with no argument', () => {
+    expect(dropSteps()).toEqual(dropSteps({ running: false, pinned: false, elsewhere: false }));
+  });
+  it('is what the supervisor drops stopped work with: running is read from sessions and slots, and the claim goes after the decision', () => {
+    const src = fs.readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const drop = src.slice(src.indexOf('function dropWork('), src.indexOf('function startWork('));
+    expect(drop).toContain('inHandSessions()');
+    expect(drop).toContain('.story?.id === w.id');
+    expect(drop).toContain('dropSteps({ running, pinned, elsewhere })');
+    expect(drop.indexOf('releaseClaim(')).toBeGreaterThan(drop.indexOf('dropSteps('));
   });
 });
 

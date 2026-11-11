@@ -9,7 +9,7 @@ vi.mock('node:fs', async (load) => {
 });
 
 import { pendingNotes } from '../engine/story-notes-queue.mjs';
-import { add, answer, applied, EXPLAIN_LABELS, EXPLAIN_PARTS, explainLine, explainProblems, list, pending } from './decisions.mjs';
+import { add, answer, applied, CLOSE_TASK, EXPLAIN_LABELS, EXPLAIN_PARTS, explainLine, explainProblems, list, pending, RETRY_STORY, TASK_HINTS, TASK_OPTIONS } from './decisions.mjs';
 
 let dir;
 beforeEach(() => {
@@ -117,10 +117,46 @@ describe('decisions', () => {
     expect(pending(dir)[0].answer).toBeNull();
   });
 
-  it('a task takes a free note', () => {
+  it('a task always offers Retry the story and Close the task, each with a hint', () => {
+    expect(TASK_OPTIONS).toEqual(['Retry the story', 'Close the task']);
+    expect(RETRY_STORY).toBe('Retry the story');
+    expect(CLOSE_TASK).toBe('Close the task');
+    for (const h of TASK_HINTS) expect(h.length).toBeLessThanOrEqual(100);
     const id = add(dir, { story: 'S-2', kind: 'task', title: 'Add the key' }, t(1));
-    answer(dir, id, { option: 'Added it to the env file' }, t(2));
-    expect(pending(dir)[0].answer).toEqual({ option: null, note: 'Added it to the env file', at: t(2).toISOString() });
+    const item = JSON.parse(readFileSync(join(dir, 'decisions', `${id}.json`), 'utf8'));
+    expect(item).toMatchObject({ options: TASK_OPTIONS, hints: TASK_HINTS });
+  });
+
+  it('refuses a task given options or hints, and writes nothing', () => {
+    const task = { story: 'S-2', kind: 'task', title: 'Add the key' };
+    expect(() => add(dir, { ...task, options: ['x'] }, t(1))).toThrow(/always offers/);
+    expect(() => add(dir, { ...task, hints: ['h'] }, t(1))).toThrow(/always offers/);
+    expect(() => add(dir, { ...task, options: TASK_OPTIONS, hints: TASK_HINTS }, t(1))).toThrow(/always offers/);
+    expect(existsSync(join(dir, 'decisions')) ? readdirSync(join(dir, 'decisions')) : []).toEqual([]);
+  });
+
+  it('a task takes an explanation without hints, and a recommendation of one of its options', () => {
+    const task = { story: 'S-2', kind: 'task', title: 'Add the key', explain: { purpose: 'Keeps the keys apart.', happened: 'A key is missing.', recommendation: 'Add it.' } };
+    expect(add(dir, task, t(1))).toMatch(/^d-/);
+    const id = add(dir, { ...task, recommend: CLOSE_TASK }, t(2));
+    expect(JSON.parse(readFileSync(join(dir, 'decisions', `${id}.json`), 'utf8')).recommend).toBe(CLOSE_TASK);
+    expect(() => add(dir, { ...task, recommend: 'Maybe' }, t(3))).toThrow(/not one of the options/);
+  });
+
+  it('a task takes Close the task with a note, and refuses words alone', () => {
+    const id = add(dir, { story: 'S-2', kind: 'task', title: 'Add the key' }, t(1));
+    expect(() => answer(dir, id, { option: 'Added it to the env file' }, t(2))).toThrow(/not one of the options/);
+    expect(pending(dir)[0].answer).toBeNull();
+    answer(dir, id, { option: 'Close the task', note: 'Added it to the env file' }, t(2));
+    expect(pending(dir)[0].answer).toEqual({ option: 'Close the task', note: 'Added it to the env file', at: t(2).toISOString() });
+  });
+
+  it('an old task with no options still takes words', () => {
+    const id = 'd-20261015090000-abcd';
+    mkdirSync(join(dir, 'decisions'));
+    const old = { id, story: 'S-2', kind: 'task', title: 'Add the key', options: [], urgent: false, body: '', createdAt: t(0).toISOString(), answer: null, appliedAt: null };
+    writeFileSync(join(dir, 'decisions', `${id}.json`), JSON.stringify(old, null, 2));
+    expect(answer(dir, id, { option: 'Added it' }, t(2))).toEqual({ option: null, note: 'Added it' });
   });
 
   it('checks what it is given', () => {

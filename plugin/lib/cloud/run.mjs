@@ -14,13 +14,18 @@
 //      pull, and go to 5. Any other ending ends the run: a stop request, the FOREMAN_MAX
 //      stories, or a failure (its exit code).
 //
+// The run's events go to stdout while it runs, one line each (event-echo.mjs), so `docker logs`
+// shows story starts and ends, halts and slots that go down. Events from before the run are not
+// repeated. The echo masks the values of the run's keys, the project's too, as well as token
+// patterns.
+//
 // Signals: the first SIGTERM asks the run to finish the stories in progress (a STOP naming the
 // cloud runner as who asked, console/stopper.mjs), the second, or SIGINT or SIGHUP, is passed to
 // the supervisor, which stops now. While idle, any of them ends the run at once. A fresh start
 // clears an old STOP, as `foreman run` does.
 //
-// deps: { sh, fs, proc, startSupervisor, startDashboard, wait(ms, { signal }), now }; `wait`
-// ends early when its signal aborts.
+// deps: { sh, fs, proc, startSupervisor, startDashboard, wait(ms, { signal }), now, echoMs }; `wait`
+// ends early when its signal aborts. `echoMs` is how often the events are followed.
 
 import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
@@ -30,7 +35,9 @@ import { readState } from '../engine/state.mjs';
 import { NOTHING_LEFT } from '../engine/scheduler.mjs';
 import { projectChecks, runChecks, runnerChecks, workDir } from './doctor.mjs';
 import { setUpGit } from './git-setup.mjs';
-import { placeKeys } from './env-file.mjs';
+import { followEvents, secretValues } from './event-echo.mjs';
+import { keyNames, placeKeys } from './env-file.mjs';
+import { redact as redactValues, SECRET_NAMES } from '../secrets/redact.mjs';
 import { writeStopFile } from '../console/control.mjs';
 import { stopperOf } from '../console/stopper.mjs';
 
@@ -48,7 +55,7 @@ function update(sh, repo, branch) {
   return ff.status === 0 ? null : `cannot fast-forward ${branch} to origin/${branch}: ${why(ff)}`;
 }
 
-export async function cloudRun({ env, stdout, stderr, sh, fs, proc, startSupervisor, startDashboard, wait, now = () => new Date() }) {
+export async function cloudRun({ env, stdout, stderr, sh, fs, proc, startSupervisor, startDashboard, wait, now = () => new Date(), echoMs = 2000 }) {
   const ctx = { env, sh, fs };
   if (await runChecks(runnerChecks(), ctx, stdout)) {
     stderr.write('Not starting: fix the checks above.\n');
@@ -110,6 +117,11 @@ export async function cloudRun({ env, stdout, stderr, sh, fs, proc, startSupervi
 
   mkdirSync(state, { recursive: true });
   rmSync(join(state, 'STOP'), { force: true });
+  // The mask reads runEnv, not keys.env: placeKeys takes the project's keys out of keys.env.
+  const mask = (t) => redactValues(t, { names: [], values: secretValues(runEnv, [...SECRET_NAMES, 'GITHUB_TOKEN', ...keyNames(config)]) });
+  const echo = followEvents({ file: join(state, 'events.jsonl'), write: (s) => stdout.write(s), fs, mask });
+  const echoTimer = setInterval(() => echo.poll(), echoMs);
+  echoTimer.unref?.();
 
   // Signals: see the header. `relay` is what the supervisor's launcher listens to.
   const relay = new EventEmitter();
@@ -139,6 +151,7 @@ export async function cloudRun({ env, stdout, stderr, sh, fs, proc, startSupervi
       for (const w of keys.warnings) stderr.write(`warning: ${w}\n`);
       phase = 'running';
       const code = await startSupervisor({ root: repo, env: keys.env, args, stderr, proc: relay });
+      echo.poll();
       if (code !== 0 || stopping || once) return code;
       const reason = readState(state).loop?.reason;
       if (reason !== NOTHING_LEFT) return 0;
@@ -164,6 +177,8 @@ export async function cloudRun({ env, stdout, stderr, sh, fs, proc, startSupervi
       else stderr.write('warning: foreman.config.json no longer loads; carrying on with the config as it was\n');
     }
   } finally {
+    clearInterval(echoTimer);
+    echo.close();
     for (const s of SIGNALS) proc.off(s, onSignal);
   }
 }

@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import pr, { prTarget } from './pr.mjs';
+import merge from './merge.mjs';
+import { runShip } from '../../engine/ship.mjs';
 import { fakeCtx } from '../../../../test/ship-fakes.mjs';
 
 const open = JSON.stringify({ number: 12, url: 'https://gh/pull/12', state: 'OPEN' });
@@ -19,7 +21,107 @@ describe('pr step', () => {
   it('asks GitHub whether the pull request is a draft', async () => {
     const ctx = fakeCtx({ branch: 'story/s-1', rules: [['gh pr view story/s-1', open], ['gh pr view 12 --json mergeable', 'MERGEABLE']] });
     await pr.run(ctx);
-    expect(ctx.sh.calls).toContain('gh pr view story/s-1 --json number,url,state,isDraft');
+    expect(ctx.sh.calls).toContain('gh pr view story/s-1 --json number,url,state,isDraft,mergedAt');
+  });
+
+  describe('a story rolled back after its pull request merged', () => {
+    const ROLLED_BACK_AT = '2026-11-10T18:00:00Z';
+    const oldMerged = { number: 28, url: 'https://gh/pull/28', state: 'MERGED', mergedAt: '2026-11-10T09:00:00Z' };
+    const fresh = { number: 41, url: 'https://gh/pull/41', state: 'OPEN' };
+    // `gh pr view story/s-1` answers `before` until `gh pr create` has run, then `after`.
+    const ctxFor = ({ before = oldMerged, after = fresh, create = 0, ...rest } = {}) => {
+      let created = false;
+      return fakeCtx({
+        branch: 'story/s-1',
+        rules: [
+          ['gh pr create', () => { created = true; return create; }],
+          ['gh pr view story/s-1', () => JSON.stringify(created ? after : before)],
+          ['gh pr view 41 --json mergeable', 'MERGEABLE'],
+        ],
+        ...rest,
+      });
+    };
+
+    it('a story rolled back after its pull request merged gets a new pull request', async () => {
+      const raised = [];
+      const ctx = ctxFor({ rolledBackAt: ROLLED_BACK_AT });
+      const r = await pr.run(ctx, { raiseStoryEvent: (...a) => (raised.push(a), { ok: true }) });
+      expect(r).toEqual({ ok: true, pr: 'https://gh/pull/41', prNumber: 41 });
+      expect(ctx.sh.calls).toContain('gh pr create --base main --head story/s-1 --fill');
+      expect(ctx.events).toHaveLength(1);
+      expect(ctx.events[0]).toMatchObject({ kind: 'info' });
+      expect(ctx.events[0].text).toContain('#28');
+      expect(raised[0][3]).toContain('https://gh/pull/41');
+    });
+
+    it('opens the new pull request into ship.pr.into when it is set', async () => {
+      const ctx = ctxFor({ rolledBackAt: ROLLED_BACK_AT });
+      ctx.config = { ...ctx.config, ship: { ...ctx.config.ship, pr: { into: 'qa' } } };
+      expect((await pr.run(ctx)).ok).toBe(true);
+      expect(ctx.sh.calls).toContain('gh pr create --base qa --head story/s-1 --fill');
+    });
+
+    it.each([[undefined], [null]])('without a rollback record (%s) the old merged pull request still fails as MERGED', async (rolledBackAt) => {
+      const ctx = ctxFor({ rolledBackAt });
+      const r = await pr.run(ctx);
+      expect(r).toMatchObject({ ok: false, code: 1, stage: 'pr', reason: 'Pull request #28 is MERGED.' });
+      expect(ctx.sh.calls.some((c) => c.startsWith('gh pr create'))).toBe(false);
+    });
+
+    it('a pull request merged after the rollback is the rebuild already shipped: still MERGED, nothing opened', async () => {
+      const ctx = ctxFor({ rolledBackAt: ROLLED_BACK_AT, before: { ...oldMerged, mergedAt: '2026-11-11T09:00:00Z' } });
+      const r = await pr.run(ctx);
+      expect(r).toMatchObject({ ok: false, code: 1, stage: 'pr', reason: 'Pull request #28 is MERGED.' });
+      expect(ctx.sh.calls.some((c) => c.startsWith('gh pr create'))).toBe(false);
+    });
+
+    it.each([['missing', undefined], ['unreadable', 'not a time']])('a merge time that is %s counts as before the rollback', async (_name, mergedAt) => {
+      const ctx = ctxFor({ rolledBackAt: ROLLED_BACK_AT, before: { ...oldMerged, mergedAt } });
+      expect(await pr.run(ctx)).toEqual({ ok: true, pr: 'https://gh/pull/41', prNumber: 41 });
+      expect(ctx.sh.calls).toContain('gh pr create --base main --head story/s-1 --fill');
+    });
+
+    it('a closed pull request still fails as CLOSED and nothing is opened', async () => {
+      const ctx = ctxFor({ rolledBackAt: ROLLED_BACK_AT, before: { number: 28, url: 'u', state: 'CLOSED' } });
+      expect(await pr.run(ctx)).toMatchObject({ ok: false, code: 1, stage: 'pr', reason: 'Pull request #28 is CLOSED.' });
+      expect(ctx.sh.calls.some((c) => c.startsWith('gh pr create'))).toBe(false);
+    });
+
+    it('stops when the new pull request cannot be opened', async () => {
+      const ctx = ctxFor({ rolledBackAt: ROLLED_BACK_AT, create: 1 });
+      expect(await pr.run(ctx)).toMatchObject({ ok: false, code: 1, stage: 'pr', reason: 'Could not open the pull request.' });
+    });
+
+    it('stops when, after the create, the old pull request is still the one found', async () => {
+      const ctx = ctxFor({ rolledBackAt: ROLLED_BACK_AT, after: oldMerged });
+      expect(await pr.run(ctx)).toMatchObject({ ok: false, code: 1, stage: 'pr', reason: 'Opened the pull request but cannot find it.' });
+      expect(ctx.sh.calls.some((c) => c.includes('--json mergeable'))).toBe(false);
+    });
+
+    it('still opens the new pull request when its event throws', async () => {
+      const ctx = ctxFor({ rolledBackAt: ROLLED_BACK_AT, event: () => { throw new Error('feed is gone'); } });
+      expect((await pr.run(ctx, { raiseStoryEvent: () => ({ ok: true }) })).ok).toBe(true);
+    });
+
+    it('is retried and shipped: the new pull request is the one that merges', async () => {
+      let merged = false;
+      let created = false;
+      const ctx = fakeCtx({
+        rolledBackAt: ROLLED_BACK_AT,
+        rules: [
+          ['gh pr create', () => { created = true; return 0; }],
+          ['gh pr view story/s-1', () => JSON.stringify(created ? fresh : oldMerged)],
+          ['gh pr view 41 --json mergeable', 'MERGEABLE'],
+          ['gh pr merge 41 --merge', () => { merged = true; return 0; }],
+          ['gh pr view 41 --json state', () => (merged ? 'MERGED' : 'OPEN')],
+        ],
+      });
+      const { code, result } = await runShip({ steps: [pr, merge], ctx });
+      expect(code).toBe(0);
+      expect(result).toMatchObject({ stage: 'shipped', prNumber: 41 });
+      expect(ctx.sh.calls).toContain('gh pr merge 41 --merge');
+      expect(ctx.sh.calls.some((c) => c.startsWith('gh pr merge 28'))).toBe(false);
+    });
   });
 
   describe('a reused draft pull request (left by a failed run)', () => {

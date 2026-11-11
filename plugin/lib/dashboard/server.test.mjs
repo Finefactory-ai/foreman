@@ -719,15 +719,18 @@ describe('/api/waiting', () => {
       expect(saved(id).answer).toMatchObject({ option: 'Undo' });
     });
 
-    it('a task with no options needs an answer in words', async () => {
+    it('a task offers Retry the story and Close the task', async () => {
       const base = await serve();
       const id = add(state, { story: 'ABC-1', kind: 'task', title: 'Add the key' });
-      expect((await waiting(base)).find((i) => i.id === id).actions).toEqual([{ id: 'answer', label: 'Send answer' }]);
-      const bad = await post(`${base}/api/waiting/${id}`, { action: 'answer' });
-      expect(bad.status).toBe(400);
+      expect((await waiting(base)).find((i) => i.id === id).actions).toEqual([
+        { id: 'option-0', label: 'Retry the story', hint: 'Puts the story back in line with your note, so it is built again.', recommended: false },
+        { id: 'option-1', label: 'Close the task', hint: 'Marks this task done and leaves the story as it is, even when it is blocked.', recommended: false },
+      ]);
+      const bad = await post(`${base}/api/waiting/${id}`, { action: 'answer', note: 'done it' });
+      expect(bad.status).not.toBe(200);
       expect(saved(id).answer).toBeNull();
-      expect((await post(`${base}/api/waiting/${id}`, { action: 'answer', note: 'done it' })).status).toBe(200);
-      expect(saved(id).answer).toMatchObject({ option: null, note: 'done it' });
+      expect((await post(`${base}/api/waiting/${id}`, { action: 'option-1', note: 'handled' })).status).toBe(200);
+      expect(saved(id).answer).toMatchObject({ option: 'Close the task', note: 'handled' });
     });
   });
 

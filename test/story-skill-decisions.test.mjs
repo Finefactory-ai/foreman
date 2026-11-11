@@ -7,7 +7,7 @@ import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { explainProblems } from '../plugin/lib/console/decisions.mjs';
-import { applyAnswers } from '../plugin/lib/engine/answers.mjs';
+import { applyAnswers, RELEASE_RETRY_NOTE } from '../plugin/lib/engine/answers.mjs';
 import { allText, skillFile } from './story-skill.mjs';
 
 // SKILL.md holds the main path; each rare path is a file next to it.
@@ -180,6 +180,63 @@ describe('story skill: the architect\'s own question', () => {
     const todo = calls.find((a) => a[0] === 'story' && a[1] === 'todo');
     expect(todo).toBeTruthy();
     expect(todo[todo.indexOf('--note') + 1]).toBe(filled);
+  });
+
+  // The paragraph and bullets for an answered item whose kind is task, up to the supervisor's paragraph.
+  const TASK_START = 'An answered item whose `kind` is `task`';
+  const taskRule = () => {
+    const answers = answersFile();
+    const start = answers.indexOf(TASK_START);
+    expect(start).toBeGreaterThan(-1);
+    return collapse(answers.slice(start, answers.indexOf('The supervisor also applies')));
+  };
+
+  it('applies an owner task by Retry the story or Close the task', () => {
+    const answers = answersFile();
+    expect(answers).toContain('Retry the story');
+    expect(answers).toContain('Close the task');
+    const rule = taskRule();
+    expect(rule).toContain('whatever its `story`');
+    const close = rule.slice(rule.indexOf('**"Close the task"**'));
+    expect(close).toContain('change nothing on the story');
+    expect(close).toContain('even when it is blocked');
+    expect(close).toContain('`foreman decide applied <item id>`');
+    expect(close).not.toContain('foreman story todo');
+    expect(close).toContain('answered only in words');
+    expect(answers.indexOf(TASK_START)).toBeGreaterThan(answers.indexOf('Decide for <ID>: <question>'));
+    expect(answers.indexOf(TASK_START)).toBeLessThan(answers.indexOf('The supervisor also applies'));
+  });
+
+  it('the task Retry note reads the same whoever applies it', async () => {
+    const rule = taskRule();
+    const template = /--note '([^']*)'/.exec(rule.slice(rule.indexOf('**"Retry the story"**')))[1];
+    const filled = template
+      .replace('<the title of the item>', 'ACME-1: which store?')
+      .replace('< the note from the answer, when given>', ' use it');
+    const calls = [];
+    const foreman = async (args) => { calls.push(args); return { status: 0, stdout: '' }; };
+    const item = {
+      id: 'd-1', kind: 'task', story: 'ACME-1', title: 'ACME-1: which store?', options: ['Retry the story', 'Close the task'],
+      answer: { option: 'Retry the story', note: 'use it' },
+    };
+    await applyAnswers([item], { foreman, gh: async () => ({ status: 0, stdout: '' }), git: async () => ({ status: 0, stdout: '' }), canRequeue: () => true });
+    const todo = calls.find((a) => a[0] === 'story' && a[1] === 'todo');
+    expect(todo).toBeTruthy();
+    expect(todo[todo.indexOf('--note') + 1]).toBe(filled);
+  });
+
+  it('says the supervisor counts a task only when answered Retry the story, and clears a closed one', () => {
+    const answers = collapse(answersFile());
+    const para = answers.slice(answers.indexOf('The supervisor also applies'));
+    expect(para).toContain('tasks count only when answered "Retry the story"');
+    expect(para).toContain('marks a closed task applied whatever its story');
+  });
+
+  it('tells the blocked step to give a task no --option', () => {
+    const blocked = collapse(skillFile('blocked.md'));
+    expect(blocked).toContain('Give a task no `--option`');
+    expect(blocked).toContain('every task offers "Retry the story" and "Close the task"');
+    expect(blocked).not.toContain('free-text task');
   });
 
   it('tells a session to leave out the body\'s last full stop when a note is given', () => {
@@ -576,5 +633,14 @@ describe('story skill: the commit reuses the tester\'s run of the same tree', ()
     for (const file of ['fix-round.md', 'failed.md', 'ship-ci.md', 'ship-conflict.md', 'ship-deletes.md', 'ship-stopped.md', 'modes.md']) {
       expect(skillFile(file)).not.toContain('--reuse');
     }
+  });
+});
+
+describe('story skill: the release decision', () => {
+  it('applies "<ID> could not be released" with the note the supervisor writes', () => {
+    const answers = answersFile();
+    expect(answers).toContain('could not be released');
+    expect(answers).toContain('"Retry the release"');
+    expect(answers).toContain(RELEASE_RETRY_NOTE);
   });
 });

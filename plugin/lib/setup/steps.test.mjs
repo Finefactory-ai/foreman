@@ -146,11 +146,21 @@ describe('the set-up steps', () => {
   it('gives the org sign-in guide ids, unique and in order, and the key and connect actions', () => {
     const step = stepById('sf-orgs');
     const guideIds = step.guide.map((g) => g.id);
-    expect(guideIds).toEqual(['certificate', 'app', 'oauth', 'policies', 'consumer-key', 'connect', 'source-tracking', 'sf-home']);
+    expect(guideIds).toEqual(['certificate', 'app', 'oauth', 'policies', 'consumer-key', 'connect', 'dev-hub', 'source-tracking', 'sf-home']);
     expect(new Set(guideIds).size).toBe(guideIds.length);
     expect(step.actions).toEqual([{ id: 'check', label: 'Test it' }, { id: 'sf-key', label: 'Make the key' }, { id: 'sf-connect', label: 'Connect an org' }]);
     expect(step.inputs).toEqual([]);
     expect(step.checks).toEqual(['salesforce sf isolation']);
+  });
+
+  it('tells how to sign the scratch Dev Hub in', () => {
+    const entry = stepById('sf-orgs').guide.find((g) => g.id === 'dev-hub');
+    for (const s of ['Scratch mode', 'sf org login web --alias <dev hub alias>', 'https://login.salesforce.com', 'FOREMAN_SF_HOME', 'SF_USE_GENERIC_UNIX_KEYCHAIN=true', 'sf org logout --target-org <dev hub alias> --no-prompt', 'JWT']) {
+      expect(entry.text, s).toContain(s);
+    }
+    expect(entry.text).not.toContain('sf org login jwt --alias');
+    expect(entry.check).toBeUndefined();
+    expect(entry.click).toBeUndefined();
   });
 
   it("walks through the External Client App with a click path for each Setup step", () => {

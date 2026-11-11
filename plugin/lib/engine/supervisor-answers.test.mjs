@@ -1,7 +1,8 @@
 // `foreman run 1` end to end, when the only story failed review and the owner answered
 // "Retry with a note to the architect": the supervisor applies the answer itself, before it
 // decides there is nothing to build, and starts the story. The same for a story blocked on an
-// owner task answered in words, unless the owner has claimed that story. A fake `claude` (and
+// owner task answered "Retry the story", unless the owner has claimed that story. A task answered
+// "Close the task" only marks the task applied and leaves its story as it is. A fake `claude` (and
 // `gh`) on the PATH stand in for the session and GitHub.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -91,21 +92,21 @@ describe('the supervisor applies an answered retry when nothing else runs', () =
 
 describe('the supervisor applies an answered owner task about a story blocked in words', () => {
   const TITLE = 'ACME-1: which store?';
-  // ACME-1 blocked on an owner question in words, and the owner's task answered in words.
-  const setUp = () => {
+  // ACME-1 blocked on an owner question in words, and the owner's task answered with the option.
+  const setUp = (option, note) => {
     writeFileSync(join(clone, 'stories', 'ACME-1.md'), OWNER_BLOCKED);
     git(clone, 'commit', '-qam', 'Block ACME-1 on the owner');
     git(clone, 'push', '-q', 'origin', 'main');
     const state = join(clone, '.foreman');
-    const id = decisions.add(state, { story: 'ACME-1', kind: 'task', title: TITLE, options: [] });
-    decisions.answer(state, id, { option: null, note: '(A) the database' });
+    const id = decisions.add(state, { story: 'ACME-1', kind: 'task', title: TITLE });
+    decisions.answer(state, id, { option, note });
     return { state, id };
   };
   const callsOf = () => readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
   const eventsOf = (state) => (existsSync(join(state, 'events.jsonl')) ? readFileSync(join(state, 'events.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l).text) : []);
 
   it('puts a story blocked on an owner task back with the answer and starts it', () => {
-    const { state, id } = setUp();
+    const { state, id } = setUp('Retry the story', '(A) the database');
 
     const r = runForeman(['run', '--foreground', '1'], { cwd: clone, env: runEnv(), encoding: 'utf8', timeout: 55_000 });
     expect(r.stdout).not.toContain('Nothing left to build');
@@ -116,13 +117,26 @@ describe('the supervisor applies an answered owner task about a story blocked in
     expect(calls[0][calls[0].indexOf('-p') + 1]).toBe('/foreman:story ACME-1');
 
     const overlay = JSON.parse(readFileSync(join(state, 'stories', 'ACME-1.json'), 'utf8'));
-    expect(JSON.stringify(overlay.notes)).toContain(JSON.stringify(`Note for the architect: the owner answered "${TITLE}": (A) the database`).slice(1, -1));
+    expect(JSON.stringify(overlay.notes)).toContain(JSON.stringify(`Note for the architect: the owner answered "${TITLE}" with "Retry the story". (A) the database`).slice(1, -1));
     expect(decisions.list(state).find((d) => d.id === id).appliedAt).toBeTruthy();
     expect(eventsOf(state)).toContain(`Applied your answer to "${TITLE}": ACME-1 is back to todo with your answer.`);
   }, 60_000);
 
+  it('leaves a blocked story alone when its task is answered Close the task, and marks the task applied', () => {
+    const { state, id } = setUp('Close the task', 'handled');
+
+    const r = runForeman(['run', '--foreground', '1'], { cwd: clone, env: runEnv(), encoding: 'utf8', timeout: 55_000 });
+    expect(r.status).toBe(0);
+    expect(callsOf()).toEqual([]);
+    expect(decisions.list(state).find((d) => d.id === id).appliedAt).toBeTruthy();
+    expect(readFileSync(join(clone, 'stories', 'ACME-1.md'), 'utf8')).toContain('status: blocked');
+    const overlay = join(state, 'stories', 'ACME-1.json');
+    expect(existsSync(overlay) ? JSON.parse(readFileSync(overlay, 'utf8')).status ?? 'blocked' : 'blocked').toBe('blocked');
+    expect(eventsOf(state)).toContain(`Applied your answer to "${TITLE}": the task is closed and ACME-1 is left as it is.`);
+  }, 60_000);
+
   it('leaves a story the owner has claimed alone', () => {
-    const { state, id } = setUp();
+    const { state, id } = setUp('Retry the story', '(A) the database');
     locks.ownerClaim(state, 'ACME-1');
 
     const r = runForeman(['run', '--foreground', '1'], { cwd: clone, env: runEnv(), encoding: 'utf8', timeout: 55_000 });

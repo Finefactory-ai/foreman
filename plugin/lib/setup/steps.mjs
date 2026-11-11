@@ -74,7 +74,10 @@ export const DOCS_URL = 'https://finefactory.ai/apps/foreman/docs/';
 
 const CHECK = Object.freeze({ id: 'check', label: 'Test it' });
 const CALLBACK = 'http://localhost:8765/callback';
-const SF_LOGIN = 'HOME="${FOREMAN_SF_HOME:-$HOME/.config/foreman/sf-home}" SF_USE_GENERIC_UNIX_KEYCHAIN=true sf org login jwt --alias <alias> --username <user> --jwt-key-file <key file> --client-id <consumer key> --instance-url https://test.salesforce.com';
+const SF_HOME_ENV = 'HOME="${FOREMAN_SF_HOME:-$HOME/.config/foreman/sf-home}" SF_USE_GENERIC_UNIX_KEYCHAIN=true';
+const SF_LOGIN = `${SF_HOME_ENV} sf org login jwt --alias <alias> --username <user> --jwt-key-file <key file> --client-id <consumer key> --instance-url https://test.salesforce.com`;
+const SF_DEV_HUB_LOGIN = `${SF_HOME_ENV} sf org login web --alias <dev hub alias> --instance-url https://login.salesforce.com`;
+const SF_DEV_HUB_LOGOUT = `${SF_HOME_ENV} sf org logout --target-org <dev hub alias> --no-prompt`;
 
 const isText = (v) => typeof v === 'string' && v.length > 0;
 const code = (list) => list.map((s) => `\`${s}\``);
@@ -144,7 +147,7 @@ export const STEPS = Object.freeze([
     why: 'Foreman runs its agents in Claude Code, through the foreman plugin.',
     hint: 'install Claude Code and the foreman plugin',
     applies: always,
-    checks: ['claude on PATH', 'plugin installed and enabled', 'plugin fresh', 'workflows'],
+    checks: ['claude on PATH', 'plugin installed and enabled', 'plugin fresh', 'foreman command', 'workflows'],
     inputs: [],
     actions: [CHECK],
     guide: [
@@ -379,6 +382,7 @@ export const STEPS = Object.freeze([
         click: ['External Client App Manager', 'Foreman', 'Settings', 'OAuth Settings', 'Consumer Key and Secret'],
       },
       { id: 'connect', text: `Connect each org in salesforce.orgs with Connect an org: its alias from the config, the username, the consumer key and the login URL (https://test.salesforce.com for a sandbox). Or sign it in to Foreman's own sf home yourself: \`${SF_LOGIN}\`` },
+      { id: 'dev-hub', text: `Scratch mode only (salesforce.build.scratch): sign the Dev Hub in with the Salesforce CLI's own app, not with Connect an org or \`sf org login jwt\`. sf cannot make a scratch org through a Dev Hub signed in by JWT. Run \`${SF_DEV_HUB_LOGIN}\` and sign in in the browser it opens. If the Dev Hub is signed in by JWT already, sign it out first with \`${SF_DEV_HUB_LOGOUT}\`.` },
       {
         id: 'source-tracking',
         text: 'Once, in the production org, which you open yourself (Foreman never connects to it): turn on source tracking for Developer and Developer Pro sandboxes, then refresh each build sandbox. Or turn it on in one sandbox alone, with no refresh, in that sandbox\'s Sandbox Settings.',

@@ -167,8 +167,10 @@
 // ties), else null. The first state that fits wins: halted (a halt item, or the loop halted);
 // paused (for Jira with the HH:MM from the reason, from the Command centre, or for its own reason);
 // stuck (the loop running and a run:stuck item: "Running, but stuck: <its why>.", state running,
-// never the Building line); standby (the loop waiting for something to build: "Standby: nothing to
-// build. <why>. Picks up new stories automatically.", the why being how many stories wait on the
+// never the Building line); standby (the loop waiting for something to build: when a failed story's decision ("<ID> could
+// not pass review" or "<ID> could not be released") blocks other stories, "Standby: nothing to
+// build. <ids> failed and holds up N stories. Picks up new stories automatically."; else
+// "Standby: nothing to build. <why>. Picks up new stories automatically.", the why being how many stories wait on the
 // owner's tasks or on the owner, else how many things need the owner, else how many tasks open up
 // as stories ship, else "Nothing waits on you"; but while any now item is a follow-up proposal, of
 // the bundle 'follow-ups', "Standby: N follow-up proposals wait on you.", then, from the other
@@ -200,7 +202,7 @@
 // the run will not pick again by itself.
 
 import { isAbsolute, relative } from 'node:path';
-import { kindOf, learnedNote, slotHolds } from '../engine/answers.mjs';
+import { failedStoryOf, kindOf, learnedNote, slotHolds } from '../engine/answers.mjs';
 import { EXPLAIN_PARTS } from './decisions.mjs';
 import { dependentsOf, freedBy, waitersOf } from '../engine/pick.mjs';
 import { configProblemWhy } from '../engine/config-health.mjs';
@@ -746,6 +748,14 @@ export function headline({ items = [], loop = null, slots = [], stranded = [], c
   const who = blocking.every((i) => i.kind === 'owner-task') ? 'your tasks' : 'you';
 
   if (loop?.state === 'standby') {
+    // A failed story (a decision "<ID> could not pass review" or "... be released" whose story is
+    // open) that holds up other stories is named first: nothing else on standby says why the run idles.
+    const failed = now.filter((i) => i.kind === 'decision' && failedStoryOf(i.title) && Array.isArray(i.blocks) && i.blocks.includes(failedStoryOf(i.title)));
+    const failedIds = [...new Set(failed.map((i) => failedStoryOf(i.title)))];
+    const held = new Set(failed.flatMap((i) => i.blocks).filter((id) => !failedIds.includes(id)));
+    if (held.size > 0) {
+      return { state: 'standby', text: `Standby: nothing to build. ${names(failedIds)} failed and ${failedIds.length === 1 ? 'holds' : 'hold'} up ${plural(held.size, 'story', 'stories')}. Picks up new stories automatically.${left}`, best };
+    }
     // Follow-up proposals waiting on the owner are named first; the rest is said from the other
     // items alone, since a proposal's story may be missing from the list (Jira drops done issues)
     // and would then count as a story waiting.

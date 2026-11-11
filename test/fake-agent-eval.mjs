@@ -4,10 +4,20 @@
 //   ACME_SPEC                       the builder's example spec for Acme_Order_Helper, two cases
 //   specWith(n, api)                a spec of n cases, case-1 to case-<n>, one routing check each
 //   specText(spec)                  the spec as git show prints it
-//   orgDisplay(over)                `sf org display` for acme-qa, with the session token in it
+//   ACME_SESSION                    acme-qa's session ID, shaped like Salesforce's: <org id>!<secret>
+//   sessionOf(orgId)                the session ID of that org, in the same shape
+//   orgDisplay(over)                `sf org display` for acme-qa, with the session token in it; the
+//                                   token follows over.id when that is given
+//   orgList(entries)                `sf org list`'s answer: acme-dev1, acme-qa and acme-uat by default
 //   planners(ids)                   the GenAiPlannerDefinition query's answer
-//   evalRules({ spec, planner })    fakeSh rules for git show of every tests/<Api>-eval.json,
-//                                   the org display and the planner query
+//   evalRules({ spec, display, list, planner })
+//                                   fakeSh rules for git show of every tests/<Api>-eval.json,
+//                                   the org list, the org display and the planner query
+//   fakeRealSf(dir)                 writes <dir>/real-bin/sf, an executable that is not a Foreman
+//                                   wrapper, and returns the folder, for a PATH where
+//                                   findRealSf can find an sf. fakeSh never runs it.
+//   tempPath(root, ...dirs)         a PATH made only of folders inside root, a folder the test made
+//                                   under the temp folder; any other folder throws
 //   fakeFetch({ userinfo, nameduser, evals })
 //                                   a fetch that records { url, method, headers, body, redirect }
 //                                   for each call. Each answer is a Response, a JSON value (200), or a
@@ -16,9 +26,13 @@
 //   failing(body, { <case>: [check ids] })
 //                                   the same with those checks failing
 
-import { ACME_QA_ID, sfOk } from './fake-sf.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { ACME_DEV1_ID, ACME_QA_ID, ACME_UAT_ID, sfOk } from './fake-sf.mjs';
 
-export const ACME_SESSION = 'ACME-SESSION-SECRET';
+export const sessionOf = (orgId) => `${orgId.slice(0, 15)}!ACME.SESSION.SECRET`;
+export const ACME_SESSION = sessionOf(ACME_QA_ID);
 export const ACME_JWT = 'aaa.bbb.ccc';
 export const ACME_USER_ID = '005000000000001AAA';
 export const ACME_PLANNER_ID = '16j000000000002AAA';
@@ -59,7 +73,36 @@ export const specWith = (n, api = 'Acme_Order_Helper') => ({
 export const specText = (spec) => `${JSON.stringify(spec, null, 2)}\n`;
 
 export const orgDisplay = (over = {}) =>
-  sfOk({ id: ACME_QA_ID, alias: 'acme-qa', username: 'admin@acme-qa.acme.example', instanceUrl: ACME_INSTANCE, accessToken: ACME_SESSION, connectedStatus: 'Connected', ...over });
+  sfOk({ id: ACME_QA_ID, alias: 'acme-qa', username: 'admin@acme-qa.acme.example', instanceUrl: ACME_INSTANCE, accessToken: over.id === undefined ? ACME_SESSION : sessionOf(over.id), connectedStatus: 'Connected', ...over });
+
+const acmeEntry = (alias, orgId) => ({ alias, orgId, username: `admin@${alias}.acme.example` });
+
+export const orgList = (entries = [acmeEntry('acme-dev1', ACME_DEV1_ID), acmeEntry('acme-qa', ACME_QA_ID), acmeEntry('acme-uat', ACME_UAT_ID)]) =>
+  sfOk({ nonScratchOrgs: [], sandboxes: entries });
+
+export function fakeRealSf(dir) {
+  const bin = path.join(dir, 'real-bin');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, 'sf'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  fs.chmodSync(path.join(bin, 'sf'), 0o755);
+  return bin;
+}
+
+// A PATH made only of folders inside root, a folder the test made under the temp folder. Any
+// other folder throws: a relative one, /usr/bin, node's own folder, a sibling of root. So a
+// test's PATH can never find a program installed on the machine, above all the Salesforce CLI.
+export function tempPath(root, ...dirs) {
+  const tmp = fs.realpathSync(os.tmpdir());
+  const real = fs.realpathSync(root);
+  if (!real.startsWith(tmp + path.sep)) throw new Error(`tempPath: ${root} is not inside the temp folder`);
+  if (dirs.length === 0) throw new Error('tempPath: no folders');
+  const base = path.resolve(root);
+  for (const d of dirs) {
+    const rel = path.isAbsolute(d) ? path.relative(base, path.resolve(d)) : null;
+    if (rel === null || rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) throw new Error(`tempPath: ${d} is not inside ${root}`);
+  }
+  return dirs.join(path.delimiter);
+}
 
 export const planners = (ids = [ACME_PLANNER_ID]) =>
   sfOk({ records: ids.map((Id) => ({ attributes: { type: 'GenAiPlannerDefinition' }, Id })), totalSize: ids.length, done: true });
@@ -71,13 +114,14 @@ const specFor = (spec, api) => {
   return s && typeof s === 'object' && !Array.isArray(s) ? { ...s, agent: api } : s;
 };
 
-export function evalRules({ spec = ACME_SPEC, display = orgDisplay(), planner = planners() } = {}) {
+export function evalRules({ spec = ACME_SPEC, display = orgDisplay(), list = orgList(), planner = planners() } = {}) {
   return [
     [/^git show [^ ]+:tests\/[A-Za-z0-9_]+-eval\.json$/, (line) => {
       const api = /tests\/([A-Za-z0-9_]+)-eval\.json$/.exec(line)[1];
       const s = specFor(spec, api);
       return s === null ? { status: 128, stdout: '', stderr: `fatal: path 'tests/${api}-eval.json' does not exist` } : typeof s === 'string' ? s : specText(s);
     }],
+    [/^sf org list /, list],
     [/^sf org display /, display],
     [/^sf data query --query SELECT Id FROM GenAiPlannerDefinition /, planner],
   ];

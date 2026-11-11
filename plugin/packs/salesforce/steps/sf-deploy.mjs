@@ -1,9 +1,9 @@
 // Ship step `sf-deploy-<stage>`: deploys the story's delta to one stage's org, after the merge.
 // sfDeploy(stageName) gives the step for that stage, the same module on every call; sfDeploy(
 // stageName, { later: true }) gives a later stage's (any stage after the first), which is
-// marked noRollback and needs git too, so a failure from it on never rolls back: it halts. A
-// stage that shares the build org gets a real deploy too. It halts on failure and marks the
-// release as deployed.
+// marked noRollback, so a failure from it on never rolls back: it halts. Every stage needs sf and
+// git. A stage that shares the build org gets a real deploy too. It halts on failure and marks
+// the release as deployed.
 //
 //   0. a later stage with a branch of its own first gets the story branch merged into that
 //      branch (stage-merge.mjs). A merge that fails is code 5, and nothing is deployed. The
@@ -19,7 +19,12 @@
 //      than 15 minutes before startedAt. Otherwise `sf project deploy start --manifest <delta>
 //      [--post-destructive-changes <file>] --test-level <testLevel.deploy> --target-org <org>
 //      --async`, through the isolated sf home, and the record is written before the job is
-//      first read. It never passes --ignore-*, `quick` or NoTestRun.
+//      first read. It never passes --ignore-*, `quick` or NoTestRun. sf finds its source in the
+//      folder it runs in, so the start runs in a temporary git worktree of the stage's commit
+//      (the merge into its own branch, else ctx.sha), never in the project's checkout, which is
+//      on whatever the merge step left. The worktree is removed right after the start, on every
+//      path, and git's record of it is pruned when the remove fails. A commit that is not a full sha, or a checkout that fails, is code 5 with nothing
+//      started. sf's "No source-backed components" answer names the commit and the folder.
 //   3. the job is read every 10 seconds, for up to 30 minutes (deploy-result.mjs). A job that
 //      ends clears the record. One still running at the deadline keeps it, which a re-run of
 //      the same release would resume; but the pull request is merged by then and nothing
@@ -41,17 +46,21 @@
 // which is what `foreman sf rollback` reverts. The branch is worked out here, as sf-org-guard
 // does, rather than imported from the pr step.
 
+import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import { stateDir } from '../../../lib/engine/paths.mjs';
 import { BLOCK_DEFAULTS, TEST_LEVELS, layout } from '../config.mjs';
 import { FINAL, JOB_ID, summary, waitForJob } from '../deploy-result.mjs';
 import { clearDeployJob, readDeployJob, writeDeployJob } from '../deploy-jobs.mjs';
 import { markReached, readDeployed, recordFirstDeploy, writeDeployed } from '../releases.mjs';
 import { mergeIntoStage } from '../stage-merge.mjs';
+import { removeTempTree } from '../temp-tree.mjs';
 import { describe, isInherited, problemsOf, readBaseline } from '../baseline.mjs';
 import { manifestTypes } from '../env/sandbox-pool.mjs';
 import { isolatedSh, sfHome } from '../isolation.mjs';
 import { runSf } from '../sf.mjs';
+import { redact } from '../../../lib/secrets/redact.mjs';
 import { problems } from './sf-validate.mjs';
 
 const START_TIMEOUT_MS = 600_000;
@@ -82,6 +91,10 @@ function whyNotGenuine(result, record) {
   return null;
 }
 
+const SHA = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+const NO_SOURCE = /No source-backed components/i;
+const firstLine = (text) => String(text ?? '').split('\n').map((l) => l.trim()).find(Boolean) ?? 'git gave no reason';
+
 const pick = (v, list, fallback) => (list.includes(v) ? v : fallback);
 
 function make(stageName, later) {
@@ -92,7 +105,7 @@ function make(stageName, later) {
   return {
     name,
     label,
-    needs: later ? ['sf', 'git'] : ['sf'],
+    needs: ['sf', 'git'],
     halts: true,
     deploys: true,
     ...(later ? { noRollback: true } : {}),
@@ -132,14 +145,36 @@ function make(stageName, later) {
       const iso = isolatedSh(ctx.sh, env, sfHome(env, os.homedir()), os.homedir());
       const where = `${stage.org} (${stageName})`;
 
-      // Starts the deploy and records its job; gives the job ID, or the failure.
+      // Starts the deploy and records its job; gives the job ID, or the failure. sf reads the
+      // source from the folder it runs in, so it runs in a temporary checkout of the stage's
+      // commit, never the project's own checkout (which is on whatever the merge step left). The
+      // checkout is needed only for the start, and is removed on every path.
       const startDeploy = () => {
-        const args = ['project', 'deploy', 'start', '--manifest', delta.manifest, ...(deletes.length ? ['--post-destructive-changes', delta.postDestructive] : []), '--test-level', level, '--target-org', stage.org, '--async'];
-        const start = runSf(iso, args, { timeoutMs: START_TIMEOUT_MS });
-        const id = start.ok && typeof start.result?.id === 'string' && JOB_ID.test(start.result.id) ? start.result.id : null;
-        if (!id) return { failure: fail(5, `The deploy to ${where} never started: ${start.ok ? 'sf gave no deploy job ID' : start.error.message}`) };
-        writeDeployJob(state, { story: ctx.story, stage: stageName, org: stage.org, orgId: stage.orgId, jobId: id, to: delta.to, startedAt: ctx.now().toISOString() });
-        return { id };
+        if (typeof commit !== 'string' || !SHA.test(commit)) {
+          return { failure: fail(5, `The deploy to ${where} never started: the ${stageName} commit is not known, so there is nothing to check out and deploy.`) };
+        }
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'foreman-sf-deploy-'));
+        const tree = path.join(tmp, 'tree');
+        const git = (args, cwd = ctx.root) => ctx.sh('git', args, { cwd }) ?? {};
+        try {
+          const added = git(['worktree', 'add', '--detach', tree, commit]);
+          if (added.status !== 0) {
+            return { failure: fail(5, `The deploy to ${where} never started: could not check out ${commit} (the ${stageName} commit) to deploy from: ${redact(firstLine(added.stderr || added.stdout), { env })}`) };
+          }
+          const args = ['project', 'deploy', 'start', '--manifest', delta.manifest, ...(deletes.length ? ['--post-destructive-changes', delta.postDestructive] : []), '--test-level', level, '--target-org', stage.org, '--async'];
+          const start = runSf(iso, args, { cwd: tree, timeoutMs: START_TIMEOUT_MS });
+          const id = start.ok && typeof start.result?.id === 'string' && JOB_ID.test(start.result.id) ? start.result.id : null;
+          if (!id) {
+            const reason = !start.ok && NO_SOURCE.test(start.error.message)
+              ? `The deploy to ${where} never started: ${start.error.message} (sf looked in ${tree}, a checkout of ${commit}, the ${stageName} commit)`
+              : `The deploy to ${where} never started: ${start.ok ? 'sf gave no deploy job ID' : start.error.message}`;
+            return { failure: fail(5, reason) };
+          }
+          writeDeployJob(state, { story: ctx.story, stage: stageName, org: stage.org, orgId: stage.orgId, jobId: id, to: delta.to, startedAt: ctx.now().toISOString() });
+          return { id };
+        } finally {
+          removeTempTree(git, tree, tmp);
+        }
       };
 
       const record = readDeployJob(state, ctx.story, stageName);

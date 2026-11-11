@@ -1,5 +1,6 @@
 // The jobs the supervisor starts in the background and never waits on: the release watch, the slot environment's sweep
-// and the learning tick.
+// and the learning tick. sweepAtStop is the exception: stop() awaits it, once, so the scratch
+// orgs of closed stories are deleted before the run ends (60 s at most; it never throws).
 //
 // Learning: after each run record, with `learning.auto` on, it starts `foreman learning tick` in
 // the background (detached), which may write a learned trait and tell the owner with an FYI. The
@@ -41,6 +42,9 @@ export const PARK_CHECK_MS = 5 * 60_000;
 // (slot-prepare.mjs runEnvSweep). It runs every minute, while paused or halted too, and is
 // never counted as busy: it touches only stories that are in no slot.
 export const ENV_SWEEP_MS = 60_000;
+// The one sweep at a stop, which deletes the environments of closed stories (the supervisor's
+// stop() awaits it): the most time its calls may take, before runEnvSweep's own backstop.
+export const STOP_SWEEP_MS = 60_000;
 
 // The supervisor passes `settings()` (the config in effect, replaced when the settings change); the objects
 // returned here are the ones its tick reads.
@@ -74,6 +78,18 @@ export function backgroundJobs({ root: ROOT, dir: DIR, bin: FOREMAN_BIN, node: N
       .finally(() => {
         envSweep.running = false;
       });
+  }
+
+  // The sweep at a stop, awaited by the supervisor's stop(): the environments of stories that
+  // closed are deleted, for up to STOP_SWEEP_MS. Never throws; its warnings are events.
+  async function sweepAtStop() {
+    if (DRY || typeof envAdapter?.sweep !== 'function') return;
+    try {
+      const { warnings } = await runEnvSweep(envAdapter, { limitMs: STOP_SWEEP_MS });
+      for (const w of warnings) event(`Slot environment: ${w}`, 'warn');
+    } catch {
+      // a failed sweep never holds the stop
+    }
   }
 
   let learningNode = NODE.node(); // the Node the last learning tick ran on
@@ -126,5 +142,5 @@ export function backgroundJobs({ root: ROOT, dir: DIR, bin: FOREMAN_BIN, node: N
     auto: () => settings().learning?.auto,
     event,
   });
-  return { parkWatch, startParkWatch, envSweep, startEnvSweep, learning };
+  return { parkWatch, startParkWatch, envSweep, startEnvSweep, sweepAtStop, learning };
 }

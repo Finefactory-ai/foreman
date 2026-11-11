@@ -7,7 +7,7 @@
 # it restarts only after a failure, so `foreman stop` and `docker compose stop` stay stopped.
 services:
   foreman:
-    image: ghcr.io/finefactory-ai/foreman-runner:0.11.0
+    image: ghcr.io/finefactory-ai/foreman-runner:0.12.0
     build:
       context: ..
       dockerfile: runner/Dockerfile

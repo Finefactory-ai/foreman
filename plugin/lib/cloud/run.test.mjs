@@ -231,6 +231,98 @@ describe('foreman cloud run', () => {
     });
   });
 
+  describe('the events echo', () => {
+    const AT = '2026-10-18T10:00:00.000Z';
+    const events = () => path.join(stateDir(), 'events.jsonl');
+    const write = (...list) => {
+      fs.mkdirSync(stateDir(), { recursive: true });
+      fs.appendFileSync(events(), list.map(([text, kind, slot = null]) => JSON.stringify({ at: AT, text, kind, slot }) + '\n').join(''));
+    };
+
+    it('writes the events of the run to stdout, one line each: story starts and ends, halts, slots down', async () => {
+      const w = world({
+        supervisor: [{
+          code: 0,
+          reason: 'Stopped on request.',
+          during: async () => write(['Slot w1: ACME-1', 'story', 'w1'], ['ACME-1 shipped', 'ok', 'w1'], ['Slot w2 is down: Its environment would not start: limit reached', 'warn', 'w2'], ['Factory halted: CI is red', 'warn']),
+        }],
+      });
+      const { out } = await run(w);
+      expect(out).toContain(`${AT} story w1 Slot w1: ACME-1\n`);
+      expect(out).toContain(`${AT} ok w1 ACME-1 shipped\n`);
+      expect(out).toContain(`${AT} warn w2 Slot w2 is down: Its environment would not start: limit reached\n`);
+      expect(out).toContain(`${AT} warn - Factory halted: CI is red\n`);
+    });
+
+    it('does not repeat the events an earlier run left', async () => {
+      write(['Slot w1: OLD-1', 'story', 'w1']);
+      const w = world({ supervisor: [{ code: 0, reason: 'Stopped on request.', during: async () => write(['Slot w1: ACME-1', 'story', 'w1']) }] });
+      const { out } = await run(w);
+      expect(out).not.toContain('OLD-1');
+      expect(out).toContain('Slot w1: ACME-1');
+    });
+
+    it('masks a key in an event', async () => {
+      const w = world({ supervisor: [{ code: 0, reason: 'Stopped on request.', during: async () => write(['push failed with GH_TOKEN=ghp_x', 'warn']) }] });
+      const { out } = await run(w);
+      expect(out).toContain('push failed with GH_TOKEN=•••');
+      expect(out).not.toContain('ghp_x\n');
+      expect(out.match(/push failed.*/)[0]).not.toContain('ghp_x');
+    });
+
+    it('masks the bare value of a project key in an event, though the supervisor never gets the key', async () => {
+      const config = { ...CONFIG, cloud: { ...CONFIG.cloud, envVars: ['RESEND_API_KEY', 'ACME_REGION'] } };
+      const w = world({
+        config,
+        supervisor: [{
+          code: 0,
+          reason: 'Stopped on request.',
+          during: async () => write(['Slot w2 is down: sign-in https://auth.acme.example/cb?refresh=AcmeRefreshValue123 refused', 'warn', 'w2'], ['eu region is slow', 'info']),
+        }],
+      });
+      const { out } = await run(w, { ...ENV(), RESEND_API_KEY: 'AcmeRefreshValue123', ACME_REGION: 'eu' });
+      expect(out).not.toContain('AcmeRefreshValue123');
+      expect(out).toContain('refresh=••• refused');
+      expect(out).toContain(`${AT} info - eu region is slow`);
+      expect(w.seen.supervisors[0].env.RESEND_API_KEY).toBeUndefined();
+    });
+
+    it('goes on across the idle loop: the second run is echoed after "Nothing left to build"', async () => {
+      const w = world({
+        supervisor: [
+          { code: 0, reason: NOTHING_LEFT, during: async () => write(['first run event', 'info']) },
+          { code: 0, reason: 'Stopped on request.', during: async () => write(['second run event', 'info']) },
+        ],
+      });
+      const { out } = await run(w);
+      const first = out.indexOf('first run event');
+      const idle = out.indexOf('Nothing left to build');
+      const second = out.indexOf('second run event');
+      expect(first).toBeGreaterThan(-1);
+      expect(idle).toBeGreaterThan(first);
+      expect(second).toBeGreaterThan(idle);
+    });
+
+    it('follows the log on a timer while the supervisor runs, and stops when the run ends', async () => {
+      let during;
+      const w = world({ supervisor: [{ code: 0, reason: 'Stopped on request.', during: async () => { await during(); } }] });
+      const lines = [];
+      during = async () => {
+        write(['mid-run event', 'info']);
+        for (let i = 0; i < 200 && !lines.some((l) => l.includes('mid-run event')); i++) await new Promise((r) => setTimeout(r, 10));
+      };
+      let out = '';
+      const code = await cloudRun({ env: ENV(), stdout: { write: (s) => { out += s; lines.push(s); } }, stderr: { write: () => {} }, echoMs: 5, ...w.deps });
+      expect(code).toBe(0);
+      expect(lines.some((l) => l.includes('mid-run event'))).toBe(true);
+      const count = lines.length;
+      write(['after the run', 'info']);
+      await new Promise((r) => setTimeout(r, 40));
+      expect(lines).toHaveLength(count);
+      expect(out).not.toContain('after the run');
+    });
+  });
+
   describe('signals', () => {
     it('the first SIGTERM asks the run to finish the stories in progress; a second stops it now', async () => {
       const w = world({

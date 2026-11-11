@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { deployedFile, markReached, readDeployed, readRelease, recordAgent, recordFirstDeploy, recordRollback, releaseFile, writeDeployed } from './releases.mjs';
+import { deployedFile, markReached, readDeployed, readRelease, recordAgent, recordFirstDeploy, recordRollback, releaseFile, rolledBackAt, writeDeployed } from './releases.mjs';
 import { ACME_QA_ID } from '../../../test/fake-sf.mjs';
 
 let dir;
@@ -103,6 +103,44 @@ describe('the agents a release published', () => {
     expect(recordAgent(dir, 'S-1', AGENT).agents).toEqual([AGENT]);
     fs.writeFileSync(releaseFile(dir, 'S-1'), JSON.stringify({ story: 'S-1', to: 'bbb', reached: ['qa'], first: null, rolledBack: null, agents: 'broken' }));
     expect(recordAgent(dir, 'S-1', AGENT).agents).toEqual([AGENT]);
+  });
+});
+
+describe('rolledBackAt', () => {
+  const AT = '2026-10-24T11:00:00.000Z';
+
+  it('is null with no file, a broken file, or rolledBack null', () => {
+    expect(rolledBackAt(dir, 'S-1')).toBeNull();
+    fs.mkdirSync(path.dirname(releaseFile(dir, 'S-1')), { recursive: true });
+    fs.writeFileSync(releaseFile(dir, 'S-1'), '{ not json');
+    expect(rolledBackAt(dir, 'S-1')).toBeNull();
+    markReached(dir, 'S-2', 'qa', 'bbb');
+    expect(rolledBackAt(dir, 'S-2')).toBeNull();
+  });
+
+  it('is null for a rolledBack that is not an object with a text `at`', () => {
+    fs.mkdirSync(path.dirname(releaseFile(dir, 'S-1')), { recursive: true });
+    for (const rolledBack of ['yes', ['x'], {}, { at: 5 }, { at: '' }]) {
+      fs.writeFileSync(releaseFile(dir, 'S-1'), JSON.stringify({ story: 'S-1', to: 'a', reached: [], first: null, rolledBack }));
+      expect(rolledBackAt(dir, 'S-1')).toBeNull();
+    }
+  });
+
+  it('gives `at` after recordRollback', () => {
+    markReached(dir, 'S-1', 'qa', 'bbb');
+    recordFirstDeploy(dir, 'S-1', FIRST);
+    recordRollback(dir, 'S-1', { revert: 'r1', jobId: null, at: AT });
+    expect(rolledBackAt(dir, 'S-1')).toBe(AT);
+  });
+
+  it('is null again after a new first deploy, and after a new `to`', () => {
+    markReached(dir, 'S-1', 'qa', 'bbb');
+    recordRollback(dir, 'S-1', { revert: 'r1', jobId: null, at: AT });
+    recordFirstDeploy(dir, 'S-1', FIRST);
+    expect(rolledBackAt(dir, 'S-1')).toBeNull();
+    recordRollback(dir, 'S-1', { revert: 'r1', jobId: null, at: AT });
+    markReached(dir, 'S-1', 'qa', 'ccc');
+    expect(rolledBackAt(dir, 'S-1')).toBeNull();
   });
 });
 

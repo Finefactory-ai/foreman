@@ -7,9 +7,10 @@
 //   3. --story asks for that story next, as `foreman next` does
 //   4. when nothing can happen (idleReason), it stops here, so an idle job costs seconds. An
 //      answered owner decision the supervisor applies itself (lib/engine/answers.mjs) counts
-//      as something to do, so a retried story is put back and built; so does an answered task
-//      or question about a story blocked for a reason in words (answers.mjs requeueKind and
-//      waitsForAnswer), which the supervisor puts back to todo. Answers are read through
+//      as something to do, so a retried story is put back and built; so does a task
+//      answered "Retry the story", or a question about a story blocked for a reason in words
+//      (answers.mjs requeueKind and waitsForAnswer), which the supervisor puts back to todo; and
+//      so does a task answered "Close the task", which a run marks applied. Answers are read through
 //      the project's console (openConsole), as the supervisor reads them; with `artifacts` that
 //      is the page's local copy, <stateDir>/sync/decisions, and sync/ stays on each machine,
 //      off the state branch (state-store/branch.mjs GITIGNORE). A pause Foreman made itself
@@ -95,9 +96,13 @@ export async function idleReason({ root, dir, config, env = process.env, now = (
     const pending = await openConsole({ config, ctx: { stateDir: dir, now } }).decisions.pending();
     if (pending.some(supervisorApplies)) return null;
     if (!source) return null;
-    // An answered task or question about a story the supervisor would put back in line. No
-    // claim is held here: inProgress() returned above.
-    if (pending.some((i) => requeueKind(i) && waitsForAnswer(list.find((s) => s.id === i.story), { idPattern: source.idPattern }))) return null;
+    // An answered task or question about a story the supervisor would put back in line, or a task
+    // answered "Close the task", which the supervisor marks applied whatever its story waits on, so
+    // a run clears it. No claim is held here: inProgress() returned above.
+    if (pending.some((i) => {
+      const kind = requeueKind(i);
+      return kind === 'closeTask' || (kind && waitsForAnswer(list.find((s) => s.id === i.story), { idPattern: source.idPattern }));
+    })) return null;
     return nextStory(list, { idPattern: source.idPattern }) ? null : 'nothing can be built (every story is done, blocked or waiting on another)';
   } catch {
     return null;

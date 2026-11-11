@@ -26,7 +26,7 @@ if (process.argv[2] === 'auth') {
 }
 const id = process.env.FOREMAN_STORY;
 const at = process.argv.indexOf('--plugin-dir');
-appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({ pluginDir: at === -1 ? null : process.argv[at + 1] }) + '\\n');
+appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({ pluginDir: at === -1 ? null : process.argv[at + 1], pluginRoot: process.env.FOREMAN_PLUGIN_ROOT ?? null }) + '\\n');
 console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'fake', model: 'claude-opus-5-5', plugins: [{ name: 'foreman', path: process.env.FAKE_PLUGIN_PATH, source: 'foreman@foreman', version: '0.0.1' }] }));
 const wait = () => {
   if (!existsSync(process.env.FAKE_PROCEED)) return setTimeout(wait, 50);
@@ -146,7 +146,7 @@ describe('the plugin folder a story session loads', () => {
       await new Promise((r) => setTimeout(r, 3 * TEST_TICK_MS));
     });
     expect(code).toBe(0);
-    expect(sessions()).toEqual([{ pluginDir: resolve(PLUGIN_DIR) }]);
+    expect(sessions()).toEqual([{ pluginDir: resolve(PLUGIN_DIR), pluginRoot: resolve(PLUGIN_DIR) }]);
     const start = warns('story sessions load this one with --plugin-dir');
     expect(start).toHaveLength(1);
     expect(start[0].slot).toBeNull();
@@ -164,7 +164,7 @@ describe('the plugin folder a story session loads', () => {
     // The check of the init runs on a tick; give it a few before the session ends.
     const code = await runToIdle(PLUGIN_DIR, () => new Promise((r) => setTimeout(r, 3 * TEST_TICK_MS)));
     expect(code).toBe(0);
-    expect(sessions()).toEqual([{ pluginDir: null }]);
+    expect(sessions()).toEqual([{ pluginDir: null, pluginRoot: resolve(PLUGIN_DIR) }]);
     expect(events().filter((e) => e.text.includes('--plugin-dir') || e.text.includes('its session loaded'))).toEqual([]);
   }, 90_000);
 });

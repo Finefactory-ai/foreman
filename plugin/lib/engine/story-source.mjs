@@ -23,8 +23,16 @@
 // openStorySource({ ..., cacheOnly: true }) does the same for one source: the dashboard's task
 // details read the cache-only brief(), the brief file's path when there is one, and never wait
 // on Jira or sf. The markdown source ignores it.
+//
+// storyTarget(config) is { remote, branch }: where pull requests merge when that is not the base
+// branch (`ship.pr.into`, e.g. qa), or null when it is the base branch. The markdown source gets
+// it as ctx.shippedOn: the story's shipped record lands on that branch, not on the base branch,
+// so the source also reads the records on <remote>/<branch> to know what has shipped.
+// fetchStoryTarget({ root, config, sh }) brings that branch up to date and returns a warning
+// sentence when it cannot, else null. The Jira and Salesforce sources ignore shippedOn.
 
 import { resolve } from 'node:path';
+import { BRANCH } from '../config/validate.mjs';
 import { create as jira } from '../adapters/stories/jira.mjs';
 import { create as markdown } from '../adapters/stories/markdown.mjs';
 import { create as salesforce } from '../adapters/stories/salesforce.mjs';
@@ -45,13 +53,37 @@ export function preferCachedStories({ onQueued } = {}) {
   cached = { cacheOnly: true, onQueued };
 }
 
+// The branch pull requests merge into, when it is not the base branch. The rule is prTarget's
+// (adapters/ship/pr.mjs: ship.pr.into, else baseBranch), repeated here because pr.mjs pulls in
+// story-events and importing it could make a cycle. A name git could read as an option or a
+// path, or a remote with a slash, gives null.
+export function storyTarget(config) {
+  const base = config?.baseBranch ?? 'main';
+  const into = config?.ship?.pr?.into ?? base;
+  const remote = config?.remote ?? 'origin';
+  if (typeof into !== 'string' || typeof remote !== 'string') return null;
+  if (into === base || !BRANCH.test(into) || !BRANCH.test(remote) || remote.includes('/')) return null;
+  return { remote, branch: into };
+}
+
+// Fetches that branch into its remote-tracking ref (the refspec merge.mjs uses), so the records
+// other runs shipped there can be read. Returns a warning sentence on failure, else null.
+export function fetchStoryTarget({ root, config, sh }) {
+  const target = storyTarget(config);
+  if (!target) return null;
+  const { remote, branch } = target;
+  const done = sh('git', ['fetch', '--quiet', remote, `+refs/heads/${branch}:refs/remotes/${remote}/${branch}`], { cwd: root });
+  if (done.status === 0) return null;
+  return `Could not fetch ${branch} from ${remote}, so stories another run shipped there may look unbuilt until it is fetched.`;
+}
+
 export function openStorySource({ root, config, now, env = process.env, cacheOnly = false }) {
   const { adapter, ...options } = config?.stories ?? {};
   const make = Object.hasOwn(REGISTRY, adapter) ? REGISTRY[adapter] : null;
   if (!make) throw new Error(`unknown story source: ${adapter}`);
   const envFile = config?.envFile ? resolve(root, config.envFile) : undefined;
   const foremanEnvFile = resolve(root, foremanEnvName(config));
-  return make(options, { root, now, env, envFile, foremanEnvFile, stateDir: stateDir(root, config, env), features: config?.features ?? {}, salesforceOrgs: config?.salesforce?.orgs, ...(cached ?? {}), ...(cacheOnly ? { cacheOnly: true } : {}) });
+  return make(options, { root, now, env, envFile, foremanEnvFile, stateDir: stateDir(root, config, env), features: config?.features ?? {}, salesforceOrgs: config?.salesforce?.orgs, shippedOn: storyTarget(config) ?? undefined, ...(cached ?? {}), ...(cacheOnly ? { cacheOnly: true } : {}) });
 }
 
 // The same, reading the project's foreman.config.json with this machine's local settings on

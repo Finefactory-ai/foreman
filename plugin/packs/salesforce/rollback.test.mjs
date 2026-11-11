@@ -15,6 +15,9 @@ const JOB = '0Af000000000005AAA';
 const FIRST_JOB = '0Af000000000001AAA';
 const CLASSES = 'force-app/main/default/classes';
 const FLOWS = 'force-app/main/default/flows';
+const BUNDLES = 'force-app/main/default/aiAuthoringBundles';
+const AGENT_FILE = `${BUNDLES}/Acme_Order_Helper/Acme_Order_Helper.agent`;
+const agentText = (cls) => `system:\n    instructions: "Help Acme customers with orders"\n\ntopic orders:\n    actions:\n        look_up:\n            target: "apex://${cls}"\n            description: "Looks up an Acme order"\n`;
 
 const LAYOUT_A = { orgs: { 'acme-dev1': { orgId: ACME_DEV1_ID } }, build: 'acme-dev1', stages: [{ name: 'dev', org: 'acme-dev1' }] };
 const LAYOUT_B = {
@@ -54,7 +57,8 @@ const xml = (types) =>
   ].join('\n');
 
 // `sf sgd source delta`, faked over real git: the diff from --from to --to in the call's cwd,
-// with classes/*.cls as ApexClass and flows/*.flow-meta.xml as Flow.
+// with classes/*.cls as ApexClass, flows/*.flow-meta.xml as Flow and every file under
+// aiAuthoringBundles/<Name>/ as the one AiAuthoringBundle <Name>.
 function fakeSgd(args, opts) {
   const at = (flag) => args[args.indexOf(flag) + 1];
   const diff = git(opts.cwd, 'diff', '--name-status', '--no-renames', at('--from'), at('--to'));
@@ -64,10 +68,11 @@ function fakeSgd(args, opts) {
     const [status, file] = line.split('\t');
     const apex = /\/classes\/([^/]+)\.cls$/.exec(file);
     const flow = /\/flows\/([^/]+)\.flow-meta\.xml$/.exec(file);
-    const hit = apex ? ['ApexClass', apex[1]] : flow ? ['Flow', flow[1]] : null;
+    const bundle = /\/aiAuthoringBundles\/([^/]+)\//.exec(file);
+    const hit = apex ? ['ApexClass', apex[1]] : flow ? ['Flow', flow[1]] : bundle ? ['AiAuthoringBundle', bundle[1]] : null;
     if (!hit) continue;
     const into = status === 'D' ? destructive : pkg;
-    into[hit[0]] = [...(into[hit[0]] ?? []), hit[1]].sort();
+    into[hit[0]] = [...new Set([...(into[hit[0]] ?? []), hit[1]])].sort();
   }
   const out = at('--output-dir');
   fs.mkdirSync(path.join(out, 'package'), { recursive: true });
@@ -93,12 +98,19 @@ function write(rel, text) {
 // qa holds AcmeService and AcmeOld. The story changes AcmeService, deletes AcmeOld, adds
 // AcmeNew and AcmeFlow, and is merged into qa with --no-ff (or squashed into one commit whose
 // only parent is the base), then pushed.
-function fixture({ story = 'metadata', squash = false } = {}) {
+// The 'agent' story adds the authoring bundle Acme_Order_Helper, whose .agent targets the class
+// AcmeOrderAction, with that class and its test. With agentOnBase the bundle is already on qa and
+// the story only changes it.
+function fixture({ story = 'metadata', squash = false, agentOnBase = false } = {}) {
   git(base, 'init', '-q', '--bare', '-b', 'qa', origin);
   git(base, 'init', '-q', '-b', 'qa', repo);
   write(`${CLASSES}/AcmeService.cls`, 'public class AcmeService {\n    public Integer total() { return 1; }\n}\n');
   write(`${CLASSES}/AcmeOld.cls`, 'public class AcmeOld {\n    // the old way of doing things at Acme\n}\n');
   write('README.md', 'Acme\n');
+  if (agentOnBase) {
+    write(AGENT_FILE, agentText('AcmeOldAction'));
+    write(`${BUNDLES}/Acme_Order_Helper/Acme_Order_Helper.bundle-meta.xml`, '<?xml version="1.0" encoding="UTF-8"?>\n<AiAuthoringBundle xmlns="http://soap.sforce.com/2006/04/metadata"><bundleType>AGENT</bundleType></AiAuthoringBundle>\n');
+  }
   git(repo, 'add', '-A');
   git(repo, 'commit', '-q', '-m', 'Acme base');
   git(repo, 'remote', 'add', 'origin', origin);
@@ -109,6 +121,11 @@ function fixture({ story = 'metadata', squash = false } = {}) {
     fs.rmSync(path.join(repo, CLASSES, 'AcmeOld.cls'));
     write(`${CLASSES}/AcmeNew.cls`, 'public class AcmeNew {\n    public String hello() { return \'Acme\'; }\n}\n');
     write(`${FLOWS}/AcmeFlow.flow-meta.xml`, '<?xml version="1.0" encoding="UTF-8"?>\n<Flow xmlns="http://soap.sforce.com/2006/04/metadata"><label>Acme Flow</label></Flow>\n');
+  } else if (story === 'agent') {
+    write(AGENT_FILE, agentText('AcmeOrderAction'));
+    write(`${BUNDLES}/Acme_Order_Helper/Acme_Order_Helper.bundle-meta.xml`, '<?xml version="1.0" encoding="UTF-8"?>\n<AiAuthoringBundle xmlns="http://soap.sforce.com/2006/04/metadata"><bundleType>AGENT</bundleType></AiAuthoringBundle>\n');
+    write(`${CLASSES}/AcmeOrderAction.cls`, 'public class AcmeOrderAction {\n    // looks up an Acme order\n}\n');
+    write(`${CLASSES}/AcmeOrderActionTest.cls`, '@IsTest\nprivate class AcmeOrderActionTest {\n    // tests the Acme order action\n}\n');
   } else {
     write('README.md', 'Acme, now with notes\n');
   }
@@ -143,7 +160,7 @@ const report = (status) => sfOk({ id: JOB, status, numberComponentsDeployed: 3, 
 
 // The sh rollBack gets: every call recorded in order; git runs for real, sgd is fakeSgd, and the
 // rest of sf answers from the rules.
-function shFor({ identity = orgRecord(ACME_QA_ID), deploy = report('Succeeded'), push = null, agents = [] } = {}) {
+function shFor({ identity = orgRecord(ACME_QA_ID), deploy = report('Succeeded'), push = null, remove = null, show = null, lsTree = null, restore = null, diff = null, agents = [] } = {}) {
   const fake = fakeSh([
     ...agents,
     [/^sf plugins --core/, PINNED],
@@ -158,6 +175,11 @@ function shFor({ identity = orgRecord(ACME_QA_ID), deploy = report('Succeeded'),
     sh.opts.push(opts);
     if (cmd === 'git') {
       if (push !== null && args[0] === 'push') return push;
+      if (show !== null && args[0] === 'show') return show;
+      if (diff !== null && args[0] === 'diff') return diff;
+      if (lsTree !== null && args[0] === 'ls-tree') return lsTree;
+      if (restore !== null && args[0] === 'restore') return restore;
+      if (remove !== null && args[0] === 'worktree' && args[1] === 'remove') return remove;
       const r = runGit(opts.cwd ?? repo, args);
       return { status: r.status ?? 1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
     }
@@ -231,6 +253,31 @@ const deployLine = (sh) => sh.calls.find((l) => l.startsWith('sf project deploy 
 const pushes = (sh) => sh.calls.filter((l) => l.startsWith('git push'));
 
 describe('foreman sf rollback on the fixture history', () => {
+  it('a remove that fails is followed by a prune from the project root, and leaves no stale worktree record', async () => {
+    fixture();
+    seed();
+    const { r, sh } = await run({ sh: shFor({ remove: { status: 128, stdout: '', stderr: 'fatal: simulated' } }) });
+    expect(r.ok).toBe(true);
+    expect(git(origin, 'rev-parse', 'qa^1')).toBe(merge);
+    const removeAt = sh.calls.findIndex((l) => l.startsWith('git worktree remove'));
+    expect(removeAt).toBeGreaterThan(-1);
+    expect(sh.calls[removeAt + 1]).toBe('git worktree prune');
+    expect(sh.opts[removeAt + 1].cwd).toBe(repo);
+    expect(git(repo, 'worktree', 'list').split('\n')).toHaveLength(1);
+    expect(git(repo, 'worktree', 'list', '--porcelain')).not.toContain('prunable');
+    const m = /--manifest (\S+)\/delta\/package\/package\.xml/.exec(deployLine(sh));
+    expect(path.basename(m[1])).toMatch(/^foreman-sf-rollback-/);
+    expect(fs.existsSync(m[1])).toBe(false);
+  });
+
+  it('a remove that succeeds runs no prune', async () => {
+    fixture();
+    seed();
+    const { r, sh } = await run();
+    expect(r.ok).toBe(true);
+    expect(sh.calls.filter((l) => l.startsWith('git worktree prune'))).toEqual([]);
+  });
+
   it('reverts the merge, deploys the reverse delta to stage 1 with a test level, and pushes the revert', async () => {
     fixture();
     seed();
@@ -425,7 +472,7 @@ describe('foreman sf rollback on the fixture history', () => {
     const published = (over = {}) => recordAgent(state, 'S-1', { stage: 'qa', org: 'acme-qa', apiName: AGENT, previous: 1, version: 2, at: '2026-10-24T10:00:00.000Z', ...over });
     const agentLines = (sh) => sh.calls.filter((l) => l.startsWith('sf agent '));
 
-    it('reactivates the previous version after the deploy and before the push', async () => {
+    it('reactivates the previous version before the deploy and before the push', async () => {
       fixture();
       seed();
       published();
@@ -433,7 +480,9 @@ describe('foreman sf rollback on the fixture history', () => {
       expect(r).toMatchObject({ ok: true, agents: [{ apiName: AGENT, version: 1 }] });
       expect(agentLines(sh)).toEqual([ACTIVATE]);
       const at = sh.calls.indexOf(ACTIVATE);
-      expect(at).toBeGreaterThan(sh.calls.findLastIndex((l) => l.startsWith('sf project deploy report')));
+      expect(at).toBeGreaterThan(sh.calls.findIndex((l) => l.includes('FROM Organization --target-org acme-qa')));
+      expect(at).toBeGreaterThan(sh.calls.findIndex((l) => l.startsWith('sf sgd source delta')));
+      expect(at).toBeLessThan(sh.calls.findIndex((l) => l.startsWith('sf project deploy start')));
       expect(at).toBeLessThan(sh.calls.findIndex((l) => l.startsWith('git push')));
       expect(sh.opts[at].env.HOME).toBe(sfHome);
       expect(readRelease(state, 'S-1').rolledBack).toMatchObject({ revert: r.revert });
@@ -469,23 +518,130 @@ describe('foreman sf rollback on the fixture history', () => {
       expect(sh.calls.indexOf(ACTIVATE)).toBeLessThan(sh.calls.findIndex((l) => l.startsWith('git push')));
     });
 
-    it('pushes nothing and records no rollback when the agent cannot be restored, and says what to run by hand', async () => {
+    it('deploys and pushes nothing, and records no rollback, when the agent cannot be put back, and says what to run by hand', async () => {
       fixture();
       seed();
       published();
       const { r, sh } = await run({ sh: shFor({ agents: agentRoutes({ activate: sfError('ActivateError', 'Acme activation broke') }) }) });
       expect(r.ok).toBe(false);
-      expect(r.reason).toMatch(/^acme-qa \(qa\) was rolled back except agent Acme_Order_Helper: /);
+      expect(r.reason).toMatch(/^could not put back agent Acme_Order_Helper in acme-qa \(qa\): /);
       expect(r.reason).toContain('Acme activation broke');
-      expect(r.reason).toContain('the revert was not pushed');
+      expect(r.reason).toContain('nothing was deployed and the revert was not pushed');
       expect(r.reason).toContain(`sf agent activate --api-name ${AGENT} --version 1 --target-org acme-qa`);
-      expect(r.reason).toMatch(/then git push origin [0-9a-f]{40}:qa$/);
+      expect(r.reason).toMatch(/then run foreman sf rollback S-1 again$/);
       expect(r.reason).not.toContain('Did you mean');
+      expect(deployLine(sh)).toBeUndefined();
       expect(pushes(sh)).toEqual([]);
       expect(originQa()).toBe(merge);
       expect(readRelease(state, 'S-1').rolledBack).toBeNull();
-      const revert = /([0-9a-f]{40}):qa$/.exec(r.reason)[1];
-      expect(readDeployed(state, 'qa')).toMatchObject({ jobId: JOB, commit: revert });
+      expect(readDeployed(state, 'qa')).toBeNull();
+    });
+
+    it('says the agents already put back when the deploy then fails, and pushes nothing', async () => {
+      fixture();
+      seed();
+      published();
+      const failed = sfOk({ id: JOB, status: 'Failed', details: { componentFailures: { componentType: 'ApexClass', fullName: 'AcmeOld', problem: 'Acme broke' } } });
+      const { r, sh } = await run({ sh: shFor({ deploy: failed, agents: agentRoutes() }) });
+      expect(r.ok).toBe(false);
+      expect(r.reason).toContain('1 problem(s): ApexClass AcmeOld');
+      expect(r.reason).toMatch(new RegExp(`the revert was not pushed; agent\\(s\\) ${AGENT} were already put back, and running foreman sf rollback S-1 again leaves them as they are\\.$`));
+      expect(agentLines(sh)).toEqual([ACTIVATE]);
+      expect(pushes(sh)).toEqual([]);
+      expect(readRelease(state, 'S-1').rolledBack).toBeNull();
+    });
+
+    it('says the agents already put back when the deploy never starts', async () => {
+      fixture();
+      seed();
+      published();
+      const { r } = await run({ sh: shFor({ agents: [[/^sf project deploy start /, sfError('DeployError', 'Acme cannot start')], ...agentRoutes()] }) });
+      expect(r.ok).toBe(false);
+      expect(r.reason).toMatch(/^The rollback deploy to acme-qa \(qa\) never started: .*; the revert was not pushed; agent\(s\) Acme_Order_Helper were already put back, and running foreman sf rollback S-1 again leaves them as they are\.$/);
+    });
+
+    it('stops before any deploy, agent call or push when the agent bundle cannot be read', async () => {
+      fixture({ story: 'agent' });
+      seed();
+      published({ previous: null, version: 1 });
+      const { r, sh } = await run({ sh: shFor({ agents: agentRoutes({ versions: [[1, 'Active']] }), show: { status: 128, stdout: '', stderr: 'fatal: Acme cannot read that' } }) });
+      expect(r.ok).toBe(false);
+      expect(r.reason).toMatch(new RegExp(`^could not read agent ${AGENT}'s bundle at ${merge.slice(0, 7)}: fatal: Acme cannot read that; nothing was deployed and the revert was not pushed$`));
+      expect(deployLine(sh)).toBeUndefined();
+      expect(agentLines(sh)).toEqual([]);
+      expect(pushes(sh)).toEqual([]);
+      expect(originQa()).toBe(merge);
+      expect(readDeployed(state, 'qa')).toBeNull();
+    });
+
+    it('stops before any deploy, agent call or push when the merge cannot be listed', async () => {
+      fixture({ story: 'agent' });
+      seed();
+      published({ previous: null, version: 1 });
+      const { r, sh } = await run({ sh: shFor({ agents: agentRoutes({ versions: [[1, 'Active']] }), lsTree: { status: 128, stdout: '', stderr: 'fatal: Acme cannot list that' } }) });
+      expect(r.ok).toBe(false);
+      expect(r.reason).toMatch(new RegExp(`^could not read agent ${AGENT}'s bundle at ${merge.slice(0, 7)}: fatal: Acme cannot list that; nothing was deployed and the revert was not pushed$`));
+      expect(deployLine(sh)).toBeUndefined();
+      expect(agentLines(sh)).toEqual([]);
+      expect(pushes(sh)).toEqual([]);
+      expect(originQa()).toBe(merge);
+      expect(readDeployed(state, 'qa')).toBeNull();
+      expect(sh.calls.filter((l) => l.startsWith('git show'))).toEqual([]);
+    });
+
+    it('rolls back a story that created an agent: deactivates it before the deploy, keeps its bundle and the classes it uses out of the deletes, pushes the revert and lists the Setup steps', async () => {
+      fixture({ story: 'agent' });
+      seed();
+      published({ previous: null, version: 1 });
+      const { r, sh } = await run({ sh: shFor({ agents: agentRoutes({ versions: [[1, 'Active']] }) }) });
+      expect(r.ok).toBe(true);
+      const deploy = sh.calls.findIndex((l) => l.startsWith('sf project deploy start'));
+      expect(sh.calls.indexOf(DEACTIVATE)).toBeGreaterThan(-1);
+      expect(sh.calls.indexOf(DEACTIVATE)).toBeLessThan(deploy);
+      expect(sh.deployed.post).toEqual({ ApexClass: ['AcmeOrderActionTest'] });
+      expect(r.deletes).toEqual([{ type: 'ApexClass', member: 'AcmeOrderActionTest' }]);
+      expect(r.held).toEqual([{ type: 'AiAuthoringBundle', member: AGENT, agent: AGENT }, { type: 'ApexClass', member: 'AcmeOrderAction', agent: AGENT }]);
+      expect(r.manualSteps).toEqual([
+        `Delete agent ${AGENT} in acme-qa by hand in Setup > Agentforce Agents: the rollback deactivated it, but Salesforce cannot delete a published agent from the command line`,
+        `Then delete AiAuthoringBundle ${AGENT} in acme-qa by hand, if deleting the agent left it`,
+        `Then delete ApexClass AcmeOrderAction in acme-qa by hand; agent ${AGENT} used it, so the rollback kept it`,
+      ]);
+      expect(r.agents).toEqual([{ apiName: AGENT, version: null }]);
+      expect(pushes(sh)).toHaveLength(1);
+      expect(git(origin, 'rev-parse', 'qa^1')).toBe(merge);
+      expect(readRelease(state, 'S-1').rolledBack).toMatchObject({ revert: r.revert });
+      expect(readDeployed(state, 'qa')).toMatchObject({ commit: r.revert });
+      expect(sh.calls.filter((l) => l.includes('delete'))).toEqual([]);
+      // The merge's .agent file is read once, in the temporary tree.
+      const shows = sh.calls.filter((l) => l.startsWith('git show') || l.startsWith('git ls-tree'));
+      expect(shows).toEqual([`git ls-tree -r --name-only ${merge}`, `git show ${merge}:${AGENT_FILE}`]);
+      for (const l of shows) expect(path.basename(sh.opts[sh.calls.indexOf(l)].cwd)).toBe('tree');
+    });
+
+    it('rolls back a story that changed an existing agent: reactivates the old version before the deploy and keeps the class its .agent uses', async () => {
+      fixture({ story: 'agent', agentOnBase: true });
+      seed();
+      published({ previous: 1, version: 2 });
+      const { r, sh } = await run({ sh: shFor({ agents: agentRoutes() }) });
+      expect(r.ok).toBe(true);
+      expect(sh.calls.indexOf(ACTIVATE)).toBeGreaterThan(-1);
+      expect(sh.calls.indexOf(ACTIVATE)).toBeLessThan(sh.calls.findIndex((l) => l.startsWith('sf project deploy start')));
+      expect(sh.deployed.package).toEqual({ AiAuthoringBundle: [AGENT] });
+      expect(sh.deployed.post).toEqual({ ApexClass: ['AcmeOrderActionTest'] });
+      expect(r.held).toEqual([{ type: 'ApexClass', member: 'AcmeOrderAction', agent: AGENT }]);
+      expect(r.manualSteps).toEqual([`Delete ApexClass AcmeOrderAction in acme-qa by hand once no version of agent ${AGENT} uses it; version 2 (the story's, now inactive) still does`]);
+      expect(pushes(sh)).toHaveLength(1);
+    });
+
+    it('reads the held classes from the merge only for the agents recorded on stage 1', async () => {
+      fixture({ story: 'agent' });
+      seed();
+      published({ previous: null, version: 1, stage: 'uat', org: 'acme-uat' });
+      const { r, sh } = await run({ sh: shFor({ agents: agentRoutes() }) });
+      expect(r.ok).toBe(true);
+      expect(sh.calls.filter((l) => l.startsWith('git ls-tree') || l.startsWith('git show'))).toEqual([]);
+      expect(r.held).toEqual([]);
+      expect(sh.deployed.post).toEqual({ ApexClass: ['AcmeOrderAction', 'AcmeOrderActionTest'], AiAuthoringBundle: [AGENT] });
     });
   });
 
@@ -501,6 +657,219 @@ describe('foreman sf rollback on the fixture history', () => {
         expect(originQa()).toBe(merge);
       });
     }
+  });
+});
+
+// The story branch is cut from main, where the story file lives, and qa is behind main: the merge
+// into qa brings stories/S-1.md and the story's shipped record with it. main is the base branch.
+const STORY_TEXT = '---\nid: S-1\nstatus: todo\n---\n\n# S-1\n';
+const STORIES = 'stories';
+const SERVICE = `${CLASSES}/AcmeService.cls`;
+// With deleted, main also had stories/S-0.md, which the 'S-1 is a story' commit deletes, so the merge
+// into qa deletes it and its revert would add it back.
+function storyFixture({ squash = false, deleted = false } = {}) {
+  git(base, 'init', '-q', '--bare', '-b', 'main', origin);
+  git(base, 'init', '-q', '-b', 'main', repo);
+  write(SERVICE, 'public class AcmeService {\n    public Integer total() { return 1; }\n}\n');
+  write('README.md', 'Acme\n');
+  if (deleted) write(`${STORIES}/S-0.md`, '---\nid: S-0\nstatus: done\n---\n\n# S-0\n');
+  git(repo, 'add', '-A');
+  git(repo, 'commit', '-q', '-m', 'Acme base');
+  git(repo, 'remote', 'add', 'origin', origin);
+  git(repo, 'push', '-q', 'origin', 'main');
+  git(repo, 'branch', 'qa');
+  git(repo, 'push', '-q', 'origin', 'qa');
+  write(`${STORIES}/S-1.md`, STORY_TEXT);
+  if (deleted) fs.rmSync(path.join(repo, STORIES, 'S-0.md'));
+  git(repo, 'add', '-A');
+  git(repo, 'commit', '-q', '-m', 'S-1 is a story');
+  git(repo, 'push', '-q', 'origin', 'main');
+  git(repo, 'checkout', '-q', '-b', 'story/s-1');
+  write(`${CLASSES}/AcmeNew.cls`, 'public class AcmeNew {\n    public String hello() { return \'Acme\'; }\n}\n');
+  write(`${STORIES}/.shipped/S-1.json`, '{"id":"S-1","status":"done"}\n');
+  git(repo, 'add', '-A');
+  git(repo, 'commit', '-q', '-m', 'S-1: the story');
+  git(repo, 'checkout', '-q', 'qa');
+  if (squash) {
+    git(repo, 'merge', '-q', '--squash', 'story/s-1');
+    git(repo, 'commit', '-q', '-m', 'S-1: the story, squashed');
+  } else {
+    git(repo, 'merge', '-q', '--no-ff', '-m', 'Merge S-1', 'story/s-1');
+  }
+  git(repo, 'push', '-q', 'origin', 'qa');
+  merge = git(repo, 'rev-parse', 'HEAD');
+}
+
+const onQa = (file) => runGit(origin, ['cat-file', '-e', `qa:${file}`]).status === 0;
+const gitCalls = (sh, prefix) => sh.calls.filter((l) => l.startsWith(prefix));
+
+// After the rollback: S-1's story file is set to blocked on main, the next story is cut from main,
+// and its merge into qa (as the origin has it) must be clean.
+function mergeNextStory() {
+  git(repo, 'checkout', '-q', 'main');
+  write(`${STORIES}/S-1.md`, STORY_TEXT.replace('status: todo', 'status: blocked'));
+  git(repo, 'add', '-A');
+  git(repo, 'commit', '-q', '-m', 'S-1 is blocked');
+  git(repo, 'push', '-q', 'origin', 'main');
+  git(repo, 'checkout', '-q', '-b', 'story/s-2');
+  write(`${CLASSES}/AcmeSecond.cls`, 'public class AcmeSecond {\n    // the second Acme story\n}\n');
+  git(repo, 'add', '-A');
+  git(repo, 'commit', '-q', '-m', 'S-2: the next story');
+  git(repo, 'checkout', '-q', 'qa');
+  git(repo, 'reset', '-q', '--hard', 'origin/qa');
+  const merged = runGit(repo, ['merge', '--no-ff', '-m', 'Merge S-2', 'story/s-2']);
+  expect(merged.stderr + merged.stdout).not.toContain('CONFLICT');
+  expect(merged.status).toBe(0);
+  expect(git(repo, 'show', `qa:${STORIES}/S-1.md`)).toContain('status: blocked');
+}
+
+describe('foreman sf rollback and the story files on the stage branch', () => {
+  for (const [name, squash] of [
+    ["keeps the story file on qa after the rollback of a merge commit, so a later status change on main does not conflict with the next story's merge", false],
+    ["leaves the story file reverted on qa after a squash rollback, and the next story's merge into qa is still clean", true],
+  ]) {
+    it(name, async () => {
+      storyFixture({ squash });
+      seed(squash ? { method: 'squash' } : {});
+      const { r, sh } = await run();
+      expect(r.ok).toBe(true);
+      expect(r.revert).toBe(originQa());
+      // A squash commit has no ancestry with main, so its story file stays reverted: kept, it would
+      // be an add/add conflict with main's next change however it was rolled back.
+      if (squash) expect(onQa(`${STORIES}/S-1.md`)).toBe(false);
+      else expect(git(origin, 'show', `qa:${STORIES}/S-1.md`)).toBe(STORY_TEXT.trim());
+      if (squash) expect(gitCalls(sh, 'git restore')).toEqual([]);
+      // FM-436: the story's shipped record stays reverted, so list() no longer reads it as shipped on qa.
+      expect(onQa(`${STORIES}/.shipped/S-1.json`)).toBe(false);
+      expect(onQa(`${CLASSES}/AcmeNew.cls`)).toBe(false);
+      expect(git(origin, 'rev-parse', 'qa^1')).toBe(merge);
+      if (squash) expect(sh.calls.some((l) => l.startsWith('git revert') && l.includes(' -m '))).toBe(false);
+      expect(sh.deployed.post).toEqual({ ApexClass: ['AcmeNew'] });
+      expect(readRelease(state, 'S-1').rolledBack.revert).toBe(originQa());
+      expect(readDeployed(state, 'qa').commit).toBe(originQa());
+      expect(await healthOf()).toMatchObject({ ok: true });
+      mergeNextStory();
+    });
+  }
+
+  it('keeps a story file the merge deleted deleted on qa after the rollback, because main no longer has it', async () => {
+    storyFixture({ deleted: true });
+    seed();
+    const { r, sh } = await run();
+    expect(r.ok).toBe(true);
+    expect(r.revert).toBe(originQa());
+    // The revert would add S-0.md back; main lacks it, so it stays deleted. Dropping `|| !before.has(p)` fails here.
+    expect(onQa(`${STORIES}/S-0.md`)).toBe(false);
+    expect(git(origin, 'show', `qa:${STORIES}/S-1.md`)).toBe(STORY_TEXT.trim());
+    expect(onQa(`${STORIES}/.shipped/S-1.json`)).toBe(false);
+    expect(onQa(`${CLASSES}/AcmeNew.cls`)).toBe(false);
+    const restores = gitCalls(sh, 'git restore');
+    expect(restores).toHaveLength(1);
+    expect(restores[0]).toContain(`:(literal)${STORIES}/S-0.md`);
+    expect(restores[0]).toContain(`:(literal)${STORIES}/S-1.md`);
+    expect(restores[0]).not.toContain('.shipped');
+    expect(git(origin, 'rev-parse', 'qa^1')).toBe(merge);
+    expect(readRelease(state, 'S-1').rolledBack.revert).toBe(originQa());
+    expect(await healthOf()).toMatchObject({ ok: true });
+    mergeNextStory();
+  });
+
+  it('stops before any deploy or push when the story files cannot be listed', async () => {
+    storyFixture();
+    seed();
+    const before = originQa();
+    const { r, sh } = await run({ sh: shFor({ lsTree: { status: 128, stdout: '', stderr: 'fatal: Acme cannot list that' } }) });
+    expect(r).toEqual({ ok: false, reason: 'could not keep the story files on qa: fatal: Acme cannot list that; nothing was deployed and the revert was not pushed' });
+    expect(deployLine(sh)).toBeUndefined();
+    expect(pushes(sh)).toEqual([]);
+    expect(gitCalls(sh, 'git restore')).toEqual([]);
+    expect(gitCalls(sh, 'git commit --amend')).toEqual([]);
+    expect(sh.calls.filter((l) => l.startsWith('sf agent '))).toEqual([]);
+    expect(originQa()).toBe(before);
+    expect(readDeployed(state, 'qa')).toBeNull();
+    expect(git(repo, 'worktree', 'list').split('\n')).toHaveLength(1);
+  });
+
+  it("stops before fetching main, deploying or pushing when the revert's story-file diff fails", async () => {
+    storyFixture();
+    seed();
+    const before = originQa();
+    const { r, sh } = await run({ sh: shFor({ diff: { status: 128, stdout: '', stderr: 'fatal: Acme cannot diff that' } }) });
+    expect(r).toEqual({ ok: false, reason: 'could not keep the story files on qa: fatal: Acme cannot diff that; nothing was deployed and the revert was not pushed' });
+    expect(gitCalls(sh, 'git fetch')).toHaveLength(1);
+    expect(gitCalls(sh, 'git ls-tree')).toEqual([]);
+    expect(gitCalls(sh, 'git restore')).toEqual([]);
+    expect(gitCalls(sh, 'git commit --amend')).toEqual([]);
+    expect(deployLine(sh)).toBeUndefined();
+    expect(pushes(sh)).toEqual([]);
+    expect(originQa()).toBe(before);
+    expect(readDeployed(state, 'qa')).toBeNull();
+    expect(git(repo, 'worktree', 'list').split('\n')).toHaveLength(1);
+  });
+
+  it('stops before any deploy or push when main cannot be fetched, with the worktree gone', async () => {
+    storyFixture();
+    git(origin, 'update-ref', '-d', 'refs/heads/main');
+    seed();
+    const before = originQa();
+    const { r, sh } = await run();
+    expect(r).toEqual({ ok: false, reason: 'could not fetch main from origin, so the story files on qa cannot be kept; nothing was deployed and the revert was not pushed' });
+    expect(deployLine(sh)).toBeUndefined();
+    expect(pushes(sh)).toEqual([]);
+    expect(sh.calls.filter((l) => l.startsWith('sf agent '))).toEqual([]);
+    expect(originQa()).toBe(before);
+    expect(git(repo, 'worktree', 'list').split('\n')).toHaveLength(1);
+  });
+
+  it('stops before any deploy or push when the story files cannot be put back', async () => {
+    storyFixture();
+    seed();
+    const before = originQa();
+    const { r, sh } = await run({ sh: shFor({ restore: { status: 1, stdout: '', stderr: 'fatal: simulated' } }) });
+    expect(r.ok).toBe(false);
+    expect(r.reason.startsWith('could not keep the story files on qa: fatal: simulated')).toBe(true);
+    expect(deployLine(sh)).toBeUndefined();
+    expect(pushes(sh)).toEqual([]);
+    expect(originQa()).toBe(before);
+    expect(git(repo, 'worktree', 'list').split('\n')).toHaveLength(1);
+  });
+
+  it('leaves the revert as it was when qa is the base branch', async () => {
+    storyFixture();
+    seed();
+    const { r, sh } = await run({ config: configFor(LAYOUT_B, { baseBranch: 'qa' }) });
+    expect(r.ok).toBe(true);
+    expect(onQa(`${STORIES}/S-1.md`)).toBe(false);
+    expect(gitCalls(sh, 'git restore')).toEqual([]);
+    expect(gitCalls(sh, 'git commit --amend')).toEqual([]);
+    expect(gitCalls(sh, 'git fetch')).toHaveLength(1);
+  });
+
+  it('leaves the revert as it was when the stories are not a markdown folder in the project', async () => {
+    for (const stories of [{ adapter: 'markdown', dir: '../elsewhere' }, { adapter: 'jira', project: 'ACME' }, { adapter: 'markdown', dir: '.' }]) {
+      fs.rmSync(base, { recursive: true, force: true });
+      fs.mkdirSync(base);
+      fs.mkdirSync(sfHome);
+      storyFixture();
+      seed();
+      const { r, sh } = await run({ config: configFor(LAYOUT_B, { stories }) });
+      expect(r.ok).toBe(true);
+      expect(gitCalls(sh, 'git restore')).toEqual([]);
+      expect(gitCalls(sh, 'git commit --amend')).toEqual([]);
+      expect(gitCalls(sh, 'git fetch')).toHaveLength(1);
+      expect(onQa(`${STORIES}/S-1.md`)).toBe(false);
+    }
+  });
+
+  it('makes no further git call when the revert changed no story file', async () => {
+    fixture();
+    seed();
+    const { r, sh } = await run();
+    expect(r.ok).toBe(true);
+    expect(gitCalls(sh, 'git fetch')).toHaveLength(1);
+    expect(sh.calls.some((l) => l.startsWith('git ls-tree -r --name-only -z refs/remotes'))).toBe(false);
+    expect(gitCalls(sh, 'git restore')).toEqual([]);
+    expect(gitCalls(sh, 'git commit --amend')).toEqual([]);
   });
 });
 

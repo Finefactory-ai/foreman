@@ -85,6 +85,12 @@
 // base environment, the slot environment nor a pack can change it; Foreman's own test config
 // and a project's test runner can read it. Without it the command is exactly as before, and a
 // FOREMAN_TEST_CORES in baseEnv passes through.
+//
+// pluginRoot is the plugin folder the session loads (the supervisor's own, resolved). As a
+// non-empty string it becomes FOREMAN_PLUGIN_ROOT among the FOREMAN_* keys, so no other
+// environment can change it; the `foreman` CLI compares its own folder with it at the start of a
+// session and warns when a shell alias or another copy runs instead (foreman-command.mjs).
+// Without it the command is exactly as before, and a FOREMAN_PLUGIN_ROOT in baseEnv passes through.
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync } from 'node:fs';
@@ -131,7 +137,7 @@ export function testCoreShare(cores, slots) {
   return Math.max(2, Math.floor(c / s));
 }
 
-export function command({ id, mode = '', config, slot, n, root, stateDir, supervisorPid, envAdapter, baseEnv = {}, packSession = null, fileKeys = {}, useSubscription = false, scope = null, testCores, pluginDir }) {
+export function command({ id, mode = '', config, slot, n, root, stateDir, supervisorPid, envAdapter, baseEnv = {}, packSession = null, fileKeys = {}, useSubscription = false, scope = null, testCores, pluginDir, pluginRoot }) {
   const artifacts = artifactsConsole(config);
   const env = {
     ...withSessionKeys(baseEnv, fileKeys),
@@ -144,6 +150,7 @@ export function command({ id, mode = '', config, slot, n, root, stateDir, superv
     FOREMAN_STORY: id,
     FOREMAN_SUPERVISOR_PID: String(supervisorPid),
     ...(positiveWhole(testCores) ? { FOREMAN_TEST_CORES: String(testCores) } : {}),
+    ...(typeof pluginRoot === 'string' && pluginRoot ? { FOREMAN_PLUGIN_ROOT: pluginRoot } : {}),
     CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '0',
   };
   if (useSubscription) delete env.ANTHROPIC_API_KEY;

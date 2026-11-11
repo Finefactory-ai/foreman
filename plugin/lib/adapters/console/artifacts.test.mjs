@@ -249,6 +249,12 @@ describe('the outbox', () => {
     await expect(con.decisions.applied('a" and drop')).rejects.toThrow(/no decision/i);
   });
 
+  it('refuses a task given options', async () => {
+    const con = make();
+    await expect(con.decisions.add({ story: 'P1-01', kind: 'task', title: 'Add the key', options: ['x'] })).rejects.toThrow(/always offers/);
+    expect(outbox()).toEqual([]);
+  });
+
   it('the next push carries them as numbered ArtifactData steps', async () => {
     const fake = fakeClaude();
     const con = make(fake);
@@ -262,7 +268,7 @@ describe('the outbox', () => {
     expect(prompt).toContain('"outbox"');
     // The item's data goes by file, in the page's shape.
     const file = prompt.match(/doc_id "d-[^"]+", file_path "([^"]+)"/)[1];
-    expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ kind: 'task', title: 'Add the key', story: 'P1-01', options: [], input: 'optional' });
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ kind: 'task', title: 'Add the key', story: 'P1-01', options: ['Retry the story', 'Close the task'], input: 'optional' });
     // Both confirmed: the outbox is empty.
     expect(outbox()).toEqual([]);
   });

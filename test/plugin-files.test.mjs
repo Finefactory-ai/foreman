@@ -108,8 +108,15 @@ describe('skills/story/*', () => {
     expect(step4).toContain('git status --porcelain');
     expect(step4).toContain('git commit --allow-empty');
     expect(step4).toContain('nothing to change for this story source');
+    expect(step4).toContain('shipped record');
     expect(step4).toContain('make one commit for the story');
     expect(step4.toLowerCase()).toContain('attribution');
+  });
+
+  it("keeps step 4's lines wrapped like their neighbours (at most 100 characters)", () => {
+    const step4 = text.slice(text.indexOf('## 4. Commit'), text.indexOf('## 5. Release'));
+    const lines = step4.split('\n');
+    expect(lines.filter((l) => l.length > 100)).toEqual([]);
   });
 
   it("starts the commit checks with --reuse and waits for them, never committing without the exact tree's passing result", () => {

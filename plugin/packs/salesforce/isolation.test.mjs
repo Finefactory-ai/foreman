@@ -15,6 +15,7 @@ import {
   homeVerdict,
   isolatedEnv,
   keyRoot,
+  listedEntry,
   setUp,
   sfHome,
   wrapperScript,
@@ -698,6 +699,22 @@ describe('aliasStray', () => {
     const list = { ok: false, result: null, error: { name: 'SfError', message: 'No authorization info for x@acme.example' } };
     const r = aliasStray({ home: HOME, block: block(), list, alias: 'acme-qa' });
     expect(r).toBe(`could not list the orgs in the isolated sf home ${HOME}: No authorization info for an org`);
+  });
+});
+
+describe('listedEntry', () => {
+  const listOf = (...entries) => ({ ok: true, result: { nonScratchOrgs: entries, sandboxes: entries, scratchOrgs: [], devHubs: [], other: [] }, error: null });
+
+  it('returns the entry listed under an alias, including one listed only in devHubs', () => {
+    expect(listedEntry(listOf(DEV1, QA), 'acme-qa')).toEqual(QA);
+    const hubs = { ok: true, result: { nonScratchOrgs: [], sandboxes: [], scratchOrgs: [], devHubs: [QA], other: [] }, error: null };
+    expect(listedEntry(hubs, 'acme-qa')).toEqual(QA);
+  });
+  it('is null for an alias not listed, a failed list, no list and groups that are not arrays', () => {
+    expect(listedEntry(listOf(DEV1), 'acme-qa')).toBeNull();
+    expect(listedEntry({ ok: false, result: null, error: { name: 'SfError', message: 'x' } }, 'acme-qa')).toBeNull();
+    expect(listedEntry(undefined, 'acme-qa')).toBeNull();
+    expect(listedEntry({ ok: true, result: { nonScratchOrgs: 'x', devHubs: 5 } }, 'acme-qa')).toBeNull();
   });
 });
 

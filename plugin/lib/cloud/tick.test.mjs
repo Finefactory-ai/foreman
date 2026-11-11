@@ -369,9 +369,9 @@ describe('idleReason', () => {
       const IN_WORDS = BLOCKED.replace('Factory could not pass review; nothing was built', 'Owner decision needed: which store?');
       const ON_STORY = BLOCKED.replace('Factory could not pass review; nothing was built', 'ACME-2 must land first');
       const DONE = BLOCKED.replace('status: blocked', 'status: done');
-      const ownerTask = () => {
-        const id = decisions.add(dir, { story: 'ACME-1', kind: 'task', title: 'ACME-1: which store?', options: [] }, NOW());
-        decisions.answer(dir, id, { option: null, note: '(A) the database' }, NOW());
+      const ownerTask = (option = 'Retry the story', note = '(A) the database') => {
+        const id = decisions.add(dir, { story: 'ACME-1', kind: 'task', title: 'ACME-1: which store?' }, NOW());
+        decisions.answer(dir, id, { option, note }, NOW());
       };
 
       it('is null when the story is blocked for a reason in words, so the supervisor puts it back', async () => {
@@ -386,6 +386,12 @@ describe('idleReason', () => {
           ownerTask();
           expect(await reason(), text).toMatch(/^nothing can be built/);
         }
+      });
+
+      it('is null for a closed task, whatever its story waits on, so the supervisor clears it', async () => {
+        project({ stories: { 'ACME-1': ON_STORY, 'ACME-2': STORY('ACME-2', 'blocked') } });
+        ownerTask('Close the task', 'handled');
+        expect(await reason()).toBeNull();
       });
     });
 

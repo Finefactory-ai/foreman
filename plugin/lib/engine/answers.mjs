@@ -4,6 +4,8 @@
 // never comes.
 //
 //   review      "<ID> could not pass review": Retry with a note to the architect | I'll take it | Drop
+//   release     "<ID> could not be released": Retry the release | I'll take it | Drop (the supervisor
+//               raises it when a story ends failed with nothing else open for it)
 //   depends     "Add depends_on: <ids> to <ID>?": Apply | Ignore
 //   waits       "<ID> now waits for <ids>": Undo | Keep (a dependency Foreman added itself,
 //               `foreman story depend`; Undo takes the ids off the story's depends_on again)
@@ -30,23 +32,28 @@
 //   close       "Close <ID>: nothing to build?": Close it as Done | Build it anyway (the story
 //               skill's blocked.md; the story done with the item's body as the evidence, or back
 //               to todo with a note for the architect)
-//   answer      any other task or decision about a story, by none of the titles above: a
-//               "Decide for <ID>: ..." question answered with one of its options, or a task
-//               answered in words (requeueKind). The story goes back to todo with the answer in
-//               a note for the architect, so the next pick takes it
+//   answer      any other decision about a story, by none of the titles above (a "Decide for
+//               <ID>: ..." question answered with one of its options), or a task answered "Retry
+//               the story" (requeueKind). The story goes back to todo with the answer in a note
+//               for the architect, so the next pick takes it
+//   closeTask   a task answered "Close the task", or an old task (asked before tasks had these
+//               two options) answered in words: it only marks the item applied, whatever state
+//               the story is in, on every tick
 //
 // The titles and the commands are the story skill's ("The owner's answers") and `foreman
 // learn`'s. Anything else is left for the sessions: unanswered items, the items requeueKind
 // gives null, and close and answer items whose story waitsForAnswer refuses (one blocked on
 // other stories, which the picker takes when they land, or one a claim, a session, queued work
 // or a slot's story, held story or parked story holds; the caller's canRequeue says which).
-// Review, trait, follow-up and deletes answers are applied only when nothing runs
-// (mayApplyAnswers). The EVERY_TICK kinds (STORYLESS, close and answer) are applied on every
+// Review, release, trait, follow-up and deletes answers are applied only when nothing runs
+// (mayApplyAnswers). The EVERY_TICK kinds (STORYLESS, close, answer and closeTask) are applied on every
 // tick, even while sessions run. Nothing is applied twice, because:
 //   - sessions cannot run `foreman learning keep|undo` (run-guard GUARDED.learning), and a
 //     learned answer passes the note's createdAt: the tick gives its note the time of the ledger
 //     line, so a note a session added (`foreman decide add`) is refused and stays pending;
 //   - rolledBack only marks the note applied;
+//   - closeTask only marks the item applied, so a session racing it marks the same item applied,
+//     which changes nothing;
 //   - a created Undo closes only stories still todo that no live claim holds, so it never closes
 //     a story a session builds, and the tick applies answers before it picks, so a story it
 //     closes is not picked on that tick; sessions cannot run `foreman learn undo` (run-guard
@@ -62,11 +69,16 @@
 // Pure apart from the runners passed in: foreman(args), gh(args) and git(args), each giving
 // { status, stdout }, at once or as a promise.
 
+import { CLOSE_TASK, RETRY_STORY } from '../console/decisions.mjs';
 import { waitsOnStories } from './pick.mjs';
 
 const RETRY = 'Retry with a note to the architect';
 const TAKE = "I'll take it";
 const DROP = 'Drop';
+const RETRY_RELEASE = 'Retry the release';
+export const RELEASE_RETRY_NOTE = 'The owner asked to retry the release: resume from the built branch and ship it again.';
+export const releaseTitle = (id) => `${id} could not be released`;
+const FAILED_STORY = /^(\S+) could not (?:pass review|be released)$/;
 const DEPENDS = /^Add depends_on: (.+) to (\S+)\?$/;
 const WAITS = /^(\S+) now waits for (.+)$/;
 const FOLLOW_UP = /^Follow up on \S+: \d+ minor finding\(s\)\?$/;
@@ -84,6 +96,7 @@ const BUILD_ANYWAY = 'Build it anyway';
 
 export const OPTIONS = {
   review: [RETRY, TAKE, DROP],
+  release: [RETRY_RELEASE, TAKE, DROP],
   depends: ['Apply', 'Ignore'],
   waits: ['Undo', 'Keep'],
   trait: ['Add as a trait', 'Ignore'],
@@ -99,6 +112,7 @@ export const OPTIONS = {
 export function kindOf(item) {
   const title = String(item.title ?? '');
   if (title === `${item.story} could not pass review`) return 'review';
+  if (title === releaseTitle(item.story)) return 'release';
   if (DEPENDS.test(title)) return 'depends';
   if (title.startsWith('Add a trait for ') && title.endsWith('?')) return 'trait';
   if (FOLLOW_UP.test(title)) return 'followUp';
@@ -108,6 +122,12 @@ export function kindOf(item) {
   if (ROLLED_BACK.test(title)) return 'rolledBack';
   if (CREATED.test(title)) return 'created';
   return null;
+}
+
+// The story id a failed-story title names ("<ID> could not pass review" or "<ID> could not be
+// released"), else null. The one place that reads these titles (the standby headline).
+export function failedStoryOf(title) {
+  return FAILED_STORY.exec(String(title ?? ''))?.[1] ?? null;
 }
 
 // What a learned or rolled-back note is about, by its title: { id: 'L-n', change, roles }, change
@@ -130,16 +150,19 @@ export function supervisorApplies(item) {
 
 // The kinds about one story, which the supervisor applies only to a story waitsForAnswer allows.
 export const STORY_KINDS = ['close', 'answer'];
-// The kinds the supervisor applies on every tick, even while sessions run.
-export const EVERY_TICK = [...STORYLESS, ...STORY_KINDS];
+// The kinds the supervisor applies on every tick, even while sessions run. closeTask changes no
+// story, so it is not a story kind: a claim or a session on the story does not matter to it.
+export const EVERY_TICK = [...STORYLESS, ...STORY_KINDS, 'closeTask'];
 
 const isText = (v) => typeof v === 'string' && v.trim() !== '';
 const oneLine = (v) => String(v ?? '').replace(/\s+/g, ' ').trim();
 
-// Which story answer the item is ('close' or 'answer'), or null: an answered, unapplied task or
-// decision about a story, by none of kindOf's titles. A "Close <ID>: nothing to build?" item
-// counts only with one of its two options; an item with options only with one of them; an item
-// without only with a note in words.
+// Which kind of story answer the item is ('close', 'answer' or 'closeTask'), or null: an answered,
+// unapplied task or decision about a story, by none of kindOf's titles. A "Close <ID>: nothing to
+// build?" item counts only with one of its two options; a task with options is 'answer' for
+// "Retry the story" and 'closeTask' for "Close the task", and null for anything else; a task
+// without options (an old one) is 'closeTask' with a note in words; a decision with options counts
+// only with one of them, and one without only with a note in words.
 export function requeueKind(item) {
   if (!item?.answer || item.appliedAt) return null;
   if (item.kind !== 'task' && item.kind !== 'decision') return null;
@@ -148,6 +171,11 @@ export function requeueKind(item) {
   const options = Array.isArray(item.options) ? item.options : [];
   if (item.title === `Close ${item.story}: nothing to build?`) {
     return (option === CLOSE_DONE || option === BUILD_ANYWAY) && options.includes(option) ? 'close' : null;
+  }
+  if (item.kind === 'task') {
+    if (!options.length) return isText(item.answer.note) ? 'closeTask' : null;
+    if (option === RETRY_STORY && options.includes(option)) return 'answer';
+    return option === CLOSE_TASK && options.includes(option) ? 'closeTask' : null;
   }
   if (options.length) return options.includes(option) ? 'answer' : null;
   return isText(item.answer.note) ? 'answer' : null;
@@ -217,14 +245,21 @@ function steps(item, kind, { foreman, gh, git, branchPrefix, remote, today }) {
       markApplied,
     ];
   }
-  if (kind === 'review' && option === TAKE) {
+  if (kind === 'release' && option === RETRY_RELEASE) {
+    const note = oneLine(item.answer.note);
+    return [
+      { what: `putting ${story} back to todo`, run: async () => ok(await foreman(['story', 'todo', story, '--note', note ? `${RELEASE_RETRY_NOTE} Note for the architect: ${note}` : RELEASE_RETRY_NOTE])) },
+      markApplied,
+    ];
+  }
+  if ((kind === 'review' || kind === 'release') && option === TAKE) {
     return [
       { what: `claiming ${story} for you`, run: async () => ok(await foreman(['lock', 'owner-claim', story])) },
       { what: `blocking ${story}`, run: async () => ok(await foreman(['story', 'block', story, '--reason', 'Taken by the owner'])) },
       markApplied,
     ];
   }
-  if (kind === 'review') {
+  if (kind === 'review' || kind === 'release') {
     const branch = `${branchPrefix}${story.toLowerCase()}`;
     let numbers = [];
     return [
@@ -303,7 +338,7 @@ function steps(item, kind, { foreman, gh, git, branchPrefix, remote, today }) {
     const text = `Note for the architect: the owner wants it built anyway.${note ? ` ${note}` : ''}`;
     return [{ what: `putting ${story} back to todo`, run: async () => ok(await foreman(['story', 'todo', story, '--note', text])) }, markApplied];
   }
-  if (kind === 'rolledBack') return [markApplied];
+  if (kind === 'rolledBack' || kind === 'closeTask') return [markApplied];
   // `foreman learn undo` marks the item applied itself.
   if (kind === 'created' && option === UNDO_CREATED) return [{ what: 'running foreman learn undo', run: async () => ok(await foreman(['learn', 'undo', id])) }];
   if (kind === 'created') return [markApplied];
@@ -401,7 +436,9 @@ export async function applyAnswers(items, { foreman, gh, git, branchPrefix, remo
         ? { ...base, ok: false, step: failed, text: `Could not apply your answer to "${item.title}": ${failed} failed.` }
         : kind === 'answer'
           ? { ...base, ok: true, text: `Applied your answer to "${item.title}": ${item.story} is back to todo with your answer.` }
-          : { ...base, ok: true, text: `Applied your answer to "${item.title}": ${item.answer.option}.` },
+          : kind === 'closeTask'
+            ? { ...base, ok: true, text: `Applied your answer to "${item.title}": the task is closed and ${item.story} is left as it is.` }
+            : { ...base, ok: true, text: `Applied your answer to "${item.title}": ${item.answer.option}.` },
     );
   }
   return results;

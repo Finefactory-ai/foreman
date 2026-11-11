@@ -10,10 +10,8 @@ commands below are what that run will check.
 
 ## The image
 
-Each release tag publishes `ghcr.io/finefactory-ai/foreman-runner:<version>`. While the
-Foreman repository is private, so is the image: sign in first with
-`docker login ghcr.io` (a GitHub token with `read:packages`). Or build it yourself from a
-Foreman checkout:
+Each release tag publishes `ghcr.io/finefactory-ai/foreman-runner:<version>`. The image is
+public, so pulling it needs no sign-in. Or build it yourself from a Foreman checkout:
 
 ```
 docker build -f runner/Dockerfile -t foreman-runner .
@@ -68,7 +66,7 @@ All settings come from the environment. Pass secrets as secrets, never in the im
 ```
 docker run -d --name foreman --restart on-failure --stop-timeout 900 \
   --env-file .env.runner -v foreman-work:/work -p 127.0.0.1:4317:4317 \
-  ghcr.io/finefactory-ai/foreman-runner:0.11.0
+  ghcr.io/finefactory-ai/foreman-runner:0.12.0
 ```
 
 At start it runs `foreman cloud doctor`, and stops with the reason if a check fails: the
@@ -86,6 +84,8 @@ cp .env.runner runner/foreman.env
 docker compose -f runner/compose.yaml up -d --build
 docker compose -f runner/compose.yaml logs -f
 ```
+
+The logs show the run's events as they happen (each story's start and end, halts, and a slot that goes down), with secrets masked.
 
 ## Stopping
 
@@ -139,7 +139,7 @@ this in the project's committed `.claude/settings.json`:
 - A project in another language needs its toolchain. Build on this image:
 
   ```dockerfile
-  FROM ghcr.io/finefactory-ai/foreman-runner:0.11.0
+  FROM ghcr.io/finefactory-ai/foreman-runner:0.12.0
   USER root
   RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv && rm -rf /var/lib/apt/lists/*
   USER foreman
@@ -160,5 +160,5 @@ fly secrets set GH_TOKEN=… CLAUDE_CODE_OAUTH_TOKEN=… FOREMAN_DASHBOARD_TOKEN
 fly deploy --local-only
 ```
 
-`--local-only` builds with your own Docker, which can pull the private image once you have
-signed in to ghcr.io. The dashboard is then at `https://my-foreman.fly.dev/?token=…`.
+`--local-only` builds with your own Docker; a plain `fly deploy` builds on Fly instead. The
+image is public, so either works without a sign-in. The dashboard is then at `https://my-foreman.fly.dev/?token=…`.

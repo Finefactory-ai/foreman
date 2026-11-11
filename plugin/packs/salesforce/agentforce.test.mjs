@@ -2,15 +2,16 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { AGENTFORCE_FILE, AGENT_API_NAME, agentBundles, agentforceCheck, evalDefinitions, plannerQuery, readAgentforceSwitch, restoreAgents, versionsQuery, writeAgentforceSwitch } from './agentforce.mjs';
+import { AGENTFORCE_FILE, AGENT_API_NAME, agentBundles, agentforceCheck, apexTargets, evalDefinitions, plannerQuery, readAgentforceSwitch, restoreAgents, versionsQuery, writeAgentforceSwitch } from './agentforce.mjs';
 import { isolatedSh } from './isolation.mjs';
 import { readRelease } from './releases.mjs';
 import { fakeCtx, fakeSh } from '../../../test/ship-fakes.mjs';
 import { ACME_QA_ID, sfError, sfOk } from '../../../test/fake-sf.mjs';
-import { evalRules, failing, fakeFetch } from '../../../test/fake-agent-eval.mjs';
+import { evalRules, failing, fakeFetch, fakeRealSf, tempPath } from '../../../test/fake-agent-eval.mjs';
 
 const API = 'Acme_Order_Helper';
 const OTHER = 'Acme_Case_Helper';
+const SHA = '0123456789abcdef0123456789abcdef01234567';
 const STAGE = { name: 'qa', org: 'acme-qa', orgId: ACME_QA_ID, branch: 'qa' };
 const LAYOUT = {
   productionBranch: 'main',
@@ -45,6 +46,7 @@ const publishLine = (api = API) => `sf agent publish authoring-bundle --api-name
 const activateLine = (api = API, n = 2) => `sf agent activate --api-name ${api} --version ${n} --target-org acme-qa --json`;
 const deactivateLine = (api = API) => `sf agent deactivate --api-name ${api} --target-org acme-qa --json`;
 // The eval suite's sf calls after the activates: one sign-in read, then each agent's planner.
+const listLine = 'sf org list --all --skip-connection-status --json';
 const displayLine = 'sf org display --target-org acme-qa --json';
 const plannerLine = (api = API, n = 2) => `sf data query --query SELECT Id FROM GenAiPlannerDefinition WHERE DeveloperName = '${api}_v${n}' --target-org acme-qa --json`;
 
@@ -71,7 +73,7 @@ afterEach(() => {
   }
 });
 
-const ENV = () => ({ FOREMAN_SF_HOME: sfHome, FOREMAN_STATE_DIR: state });
+const ENV = () => ({ FOREMAN_SF_HOME: sfHome, FOREMAN_STATE_DIR: state, PATH: tempPath(dir, fakeRealSf(dir)) });
 
 function pkg(types) {
   const file = path.join(dir, 'package.xml');
@@ -89,6 +91,7 @@ function setup({ types = { AiAuthoringBundle: [API], ApexClass: ['AcmeOrderStatu
   ctx.sh = raw;
   ctx.fetch = fakeFetch();
   ctx.sfDelta = { to: 'bbb', manifest: types ? pkg(types) : undefined };
+  ctx.sha = SHA;
   const sh = isolatedSh(raw, ENV(), sfHome, os.homedir());
   return { ctx, raw, run: () => agentforceCheck.run({ ctx, sh, stage: STAGE }) };
 }
@@ -149,13 +152,61 @@ describe('agentforceCheck', () => {
     const b = setup({ types: null });
     expect(await b.run()).toEqual({ ok: true });
     expect(sfLines(b.raw)).toEqual([]);
+    expect(a.raw.calls).toEqual([]);
+    expect(b.raw.calls).toEqual([]);
+  });
+
+  it('fails before any git or sf call when the stage commit is not a full sha', async () => {
+    for (const sha of [undefined, 'bbb']) {
+      const { ctx, raw, run } = setup({ rules: happyRules() });
+      ctx.sha = sha;
+      expect(await run()).toEqual({ ok: false, reason: 'could not check the agents in acme-qa (qa): the qa commit is not known, so there is nothing to check out' });
+      expect(raw.calls).toEqual([]);
+    }
+  });
+
+  it('reads the specs, checks the commit out, runs in the checkout, and removes it before the session', async () => {
+    const { raw, run } = setup({ rules: happyRules() });
+    expect((await run()).ok).toBe(true);
+    const at = (line) => raw.calls.findIndex((l) => l === line);
+    const add = raw.calls.findIndex((l) => l.startsWith('git worktree add '));
+    const tree = raw.calls[add].split(' ')[4];
+    expect(raw.calls[add]).toBe(`git worktree add --detach ${tree} ${SHA}`);
+    const remove = at(`git worktree remove --force ${tree}`);
+    const order = [at(`git show ${SHA}:tests/${API}-eval.json`), add, at(validateLine()), at(publishLine()), at(activateLine()), remove, at(displayLine)];
+    expect(order.every((n) => n >= 0)).toBe(true);
+    expect(order).toEqual([...order].sort((x, y) => x - y));
+    expect(raw.opts[at(validateLine())].cwd).toBe(tree);
+    expect(raw.opts[at(publishLine())].cwd).toBe(tree);
+    expect(raw.opts[add].cwd).toBe('/acme/repo');
+    expect(raw.opts[remove].cwd).toBe('/acme/repo');
+    expect(raw.calls.filter((l) => l.startsWith('git worktree '))).toHaveLength(2);
+    expect(fs.existsSync(path.dirname(tree))).toBe(false);
+  });
+
+  it('fails with no sf call when git cannot check the commit out', async () => {
+    const { raw, run } = setup({ rules: happyRules([[/^git worktree add /, { status: 128, stderr: 'fatal: invalid reference' }]]) });
+    const r = await run();
+    expect(r.ok).toBe(false);
+    expect(r).not.toHaveProperty('changedOrg');
+    expect(r.reason).toContain(`could not check out ${SHA} (the qa commit): fatal: invalid reference`);
+    expect(sfLines(raw)).toEqual([]);
+  });
+
+  it('removes the checkout when validate fails', async () => {
+    const { raw, run } = setup({ rules: happyRules([[/^sf agent validate /, sfError('ValidationError', 'Acme agent script has 2 errors')]]) });
+    expect((await run()).ok).toBe(false);
+    const validate = raw.calls.indexOf(validateLine());
+    const remove = raw.calls.findIndex((l) => l.startsWith('git worktree remove --force '));
+    expect(validate).toBeGreaterThan(-1);
+    expect(remove).toBeGreaterThan(validate);
   });
 
   it('validates, publishes without a retrieve, records the versions, activates and checks the new version', async () => {
     const { ctx, raw, run } = setup({ rules: happyRules() });
     const r = await run();
     expect(r).toEqual({ ok: true, changedOrg: true, agents: [{ apiName: API, previous: 1, version: 2 }] });
-    expect(sfLines(raw)).toEqual([validateLine(), queryLine(), publishLine(), queryLine(), activateLine(), queryLine(), displayLine, plannerLine()]);
+    expect(sfLines(raw)).toEqual([validateLine(), queryLine(), publishLine(), queryLine(), activateLine(), queryLine(), listLine, displayLine, plannerLine()]);
     expect(raw.limits[raw.calls.indexOf(publishLine())]).toBe(600000);
     for (let i = 0; i < raw.calls.length; i += 1) if (raw.calls[i].startsWith('sf ')) expect(raw.opts[i].env.HOME).toBe(sfHome);
     expect(readRelease(state, 'S-1').agents).toEqual([{ stage: 'qa', org: 'acme-qa', apiName: API, previous: 1, version: 2, at: ctx.now().toISOString() }]);
@@ -317,6 +368,7 @@ describe('agentforceCheck', () => {
       queryLine(API),
       activateLine(API, 2),
       queryLine(API),
+      listLine,
       displayLine,
       plannerLine(OTHER, 4),
       plannerLine(API, 2),
@@ -357,6 +409,21 @@ describe('the Agentforce switch', () => {
     const { raw, run } = setup({ types: { ApexClass: ['AcmeNew'] } });
     expect(await run()).toEqual({ ok: true });
     expect(raw.calls).toEqual([]);
+  });
+});
+
+describe('apexTargets', () => {
+  it('returns the sorted, unique class names of every apex:// target', () => {
+    const text = 'actions:\n  a:\n    target: "apex://AcmeZ"\n  b:\n    target: "apex://AcmeA"\n  c:\n    target: "apex://AcmeZ"\n';
+    expect(apexTargets(text)).toEqual(['AcmeA', 'AcmeZ']);
+  });
+
+  it('ignores flow:// and prompt:// targets', () => {
+    expect(apexTargets('target: "flow://Acme_Flow"\ntarget: "prompt://Acme_Prompt"\ntarget: "apex://AcmeOrder_1"\n')).toEqual(['AcmeOrder_1']);
+  });
+
+  it('returns [] for a non-string or for text with no targets', () => {
+    for (const v of [undefined, null, 7, {}, [], '', 'system:\n  instructions: "Acme"\n']) expect(apexTargets(v)).toEqual([]);
   });
 });
 

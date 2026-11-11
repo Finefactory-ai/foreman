@@ -100,6 +100,23 @@ describe('mergeIntoStage, with a fake shell', () => {
     expect(fs.existsSync(path.dirname(tree))).toBe(false);
   });
 
+  it('a remove that fails is followed by a prune from the project root, after the folder is gone', async () => {
+    const sh = fakeSh([PIN, ['git merge-base --is-ancestor', 1], ['git rev-parse HEAD', `${MERGED}\n`], ['git worktree remove', 128]]);
+    const r = await mergeIntoStage(ctxFor(sh), UAT);
+    expect(r).toEqual({ ok: true, sha: MERGED, merged: true });
+    const tree = treeOf(sh);
+    expect(sh.calls.at(-1)).toBe('git worktree prune');
+    expect(sh.calls.at(-2)).toBe(`git worktree remove --force ${tree}`);
+    expect(sh.opts.at(-1)).toEqual({ cwd: '/acme/repo' });
+    expect(fs.existsSync(path.dirname(tree))).toBe(false);
+  });
+
+  it('a remove that succeeds runs no prune', async () => {
+    const sh = fakeSh([PIN, ['git merge-base --is-ancestor', 1], ['git rev-parse HEAD', `${MERGED}\n`]]);
+    await mergeIntoStage(ctxFor(sh), UAT);
+    expect(sh.calls.some((c) => c.startsWith('git worktree prune'))).toBe(false);
+  });
+
   it('never merges the previous stage branch', async () => {
     const sh = fakeSh([PIN, ['git merge-base --is-ancestor', 1], ['git rev-parse HEAD', `${MERGED}\n`]]);
     await mergeIntoStage(ctxFor(sh), UAT);
@@ -337,6 +354,16 @@ describe('mergeIntoStage, with real git', () => {
     const again = await mergeIntoStage(ctx(), UAT);
     expect(again).toEqual({ ok: true, sha: r.sha, merged: false });
     expect(git(origin, 'rev-parse', 'uat')).toBe(r.sha);
+  });
+
+  it('a remove that fails leaves no stale worktree record: the prune clears it', async () => {
+    fixture();
+    const real = realSh(repo, GIT_ENV);
+    const sh = (cmd, args = [], opts = {}) => (cmd === 'git' && args[0] === 'worktree' && args[1] === 'remove' ? { status: 128, stdout: '', stderr: 'fatal: simulated' } : real(cmd, args, opts));
+    const r = await mergeIntoStage({ ...ctx(), sh }, UAT);
+    expect(r.ok).toBe(true);
+    expect(git(repo, 'worktree', 'list').split('\n')).toHaveLength(1);
+    expect(git(repo, 'worktree', 'list', '--porcelain')).not.toContain('prunable');
   });
 
   it('refuses an unreviewed commit pushed to the remote story branch, and leaves uat where it was', async () => {

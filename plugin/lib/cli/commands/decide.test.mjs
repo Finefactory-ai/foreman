@@ -123,9 +123,46 @@ describe('foreman decide', () => {
   it('a task, urgent, answered with free text', async () => {
     const a = await run(['decide', 'add', '--story', 'S-2', '--kind', 'task', '--urgent', '--title', 'S-2 stopped the release line', '--body', '{"stage":"deploy"}']);
     const id = a.out.trim();
-    expect((await run(['decide', 'answer', id, 'Rolled back by hand'])).code).toBe(0);
+    expect((await run(['decide', 'answer', id, 'Rolled back by hand'])).code).toBe(1);
+    expect(JSON.parse((await run(['decide', 'pending'])).out)[0].answer).toBeNull();
+    expect((await run(['decide', 'answer', id, 'Close the task', '--note', 'Rolled back by hand'])).code).toBe(0);
     const [item] = JSON.parse((await run(['decide', 'pending'])).out);
-    expect(item).toMatchObject({ kind: 'task', urgent: true, body: '{"stage":"deploy"}', answer: { option: null, note: 'Rolled back by hand' } });
+    expect(item).toMatchObject({ kind: 'task', urgent: true, body: 'The release failed at deploy.', answer: { option: 'Close the task', note: 'Rolled back by hand' } });
+  });
+
+  it('a task offers both options, and list prints each with its hint under it', async () => {
+    const a = await run(['decide', 'add', '--story', 'S-2', '--kind', 'task', '--title', 'Add the key']);
+    expect(a.code).toBe(0);
+    const lines = (await run(['decide', 'list'])).out.split('\n');
+    const retry = lines.indexOf('      - Retry the story');
+    const close = lines.indexOf('      - Close the task');
+    expect(retry).toBeGreaterThan(-1);
+    expect(close).toBe(retry + 2);
+    expect(lines[retry + 1]).toContain('Puts the story back in line with your note, so it is built again.');
+    expect(lines[close + 1]).toContain('Marks this task done and leaves the story as it is, even when it is blocked.');
+  });
+
+  it('a task added with an option exits 1', async () => {
+    const r = await run(['decide', 'add', '--story', 'S-2', '--kind', 'task', '--title', 'Add the key', '--option', 'x']);
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/always offers/);
+    expect((await run(['decide', 'list'])).out).toBe('Nothing has been asked of you.\n');
+  });
+
+  it('a body that is a ship JSON line is stored as its reason and pull request, with no brace', async () => {
+    const R = 'qa (acme-qa) was rolled back with `foreman sf rollback "$FOREMAN_STORY"`. ./watch.sh reported a problem after the deploy: 3 new errors';
+    const line = JSON.stringify({ ok: false, code: 5, sfDelta: { dir: '/tmp/acme-delta', from: 'a'.repeat(40), to: 'b'.repeat(40) }, stage: 'watch', reason: R, rolledBack: true, pr: 'https://github.com/acme/acme/pull/5' });
+    const a = await run(['decide', 'add', '--story', 'S-1', '--kind', 'task', '--urgent', '--title', 'S-1 stopped the release line', '--body', line]);
+    expect(a.code).toBe(0);
+    const [item] = JSON.parse((await run(['decide', 'pending'])).out);
+    expect(item.body).toBe(`${R}\n\nPull request: https://github.com/acme/acme/pull/5`);
+    expect(item.body).not.toContain('{');
+  });
+
+  it('a plain-text body is stored unchanged', async () => {
+    const a = await run(['decide', 'add', '--story', 'S-1', '--kind', 'task', '--title', 'S-1 stopped the release line', '--body', 'Rolled back {by hand}; see the PR.']);
+    expect(a.code).toBe(0);
+    expect(JSON.parse((await run(['decide', 'pending'])).out)[0].body).toBe('Rolled back {by hand}; see the PR.');
   });
 
   it('list shows each item in words', async () => {

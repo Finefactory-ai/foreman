@@ -1,7 +1,8 @@
 // Story source: one markdown file per story in a folder, with the story's facts in the
 // frontmatter (`id:`, `title:`, `status:` and so on). This is how the Obsidian vault works
 // today and how a plain repo can keep its stories in `stories/`. A file without an `id:` is
-// not a story and is ignored.
+// not a story and is ignored. A story with no `status:` line, or an empty one, is `todo`, as in
+// the other sources, so a new story is never dropped silently.
 //
 // Options (the `stories` block of foreman.config.json):
 //   dir              the folder, relative to the project or absolute (required)
@@ -42,6 +43,19 @@
 //
 // A story's `followUpOf` is its `follow_up_of:` frontmatter, which create() writes from the
 // origin: the story it follows up, or '' for none.
+//
+// Stage branches (state mode only): when pull requests merge into a branch other than the base
+// branch (ctx.shippedOn, { remote, branch }, from engine/story-source.mjs storyTarget), finalize
+// never edits a story file that is on the base branch, because the owner may edit it there and
+// the two branches would conflict. It writes the story's shipped record instead, in the story's
+// own commit: <dir>/.shipped/<id>.json, { id, status: 'done', completed, notes: [{ date, text }] },
+// newest note first. Only Foreman writes it, so it cannot conflict. list() reads the records in
+// <dir>/.shipped (those already promoted to the base branch) and the ones on
+// refs/remotes/<remote>/<branch> (read with git ls-tree and kept for SHIPPED_TTL_MS, because the
+// supervisor lists many times a tick). A record is merged truth like a done note: it beats a todo,
+// in-progress or blocked note or overlay, but not a retired note or a ready-to-promote park.
+// A note made by create() that still waits is written into the checkout as before, since it is
+// a new file. In file mode records are ignored.
 
 import { spawnSync } from 'node:child_process';
 import { existsSync, linkSync, mkdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -52,12 +66,24 @@ import { bulletOf, localDate, overlayStore, safeId as safe, writeAtomic } from '
 // The one place the default id pattern lives; the picking rules take the pattern from the source.
 export const DEFAULT_ID_PATTERN = '[A-Z]+-\\d+';
 export const DEFAULT_NEW_ID = 'F-{n}';
+// Where a story's shipped record lives under dir, and how long the remote branch's list of them is kept.
+export const SHIPPED_DIR = '.shipped';
+export const SHIPPED_TTL_MS = 30_000;
 
 const OPTION_KEYS = ['adapter', 'dir', 'dirEnv', 'dirEnvSuffix', 'idPattern', 'fields', 'ownerTask', 'resourcesByGroup', 'progressHeading', 'groupSummary', 'groupLabel', 'track', 'newId'];
 const TRACKS = ['file', 'state'];
 const FINAL = ['done', 'retired'];
 
 const DEFAULT_FIELDS = { group: 'group', groupName: 'group_name', order: 'order', dependsOn: 'depends_on', blockedBy: 'blocked_by' };
+
+// The names under SHIPPED_DIR on each remote branch read so far: `${dir}\0${ref}` -> { at, names }.
+// Module-level because the supervisor opens a fresh source on every call.
+const shippedCache = new Map();
+const gitEnv = () => {
+  const env = { ...process.env };
+  for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE']) delete env[key];
+  return env;
+};
 
 const isPlain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
@@ -193,13 +219,18 @@ function edited(text, sets, bullets, progressHeading) {
   return lines.join('\n');
 }
 
+// The absolute stories folder for these options (dirEnv's value when set, else dir); it checks nothing.
+export function storiesDirOf(options = {}, { root, env = process.env } = {}) {
+  const moved = options.dirEnv ? String(env[options.dirEnv] ?? '') : '';
+  return moved ? resolve(root, moved, options.dirEnvSuffix ?? '') : resolve(root, options.dir);
+}
+
 export function create(options, ctx = {}) {
   checkOptions(options);
   const root = ctx.root ?? process.cwd();
   const now = ctx.now ?? (() => new Date());
   const env = ctx.env ?? process.env;
-  const moved = options.dirEnv ? String(env[options.dirEnv] ?? '') : '';
-  const dir = moved ? resolve(root, moved, options.dirEnvSuffix ?? '') : resolve(root, options.dir);
+  const dir = storiesDirOf(options, { root, env });
   const idPattern = options.idPattern ?? DEFAULT_ID_PATTERN;
   const fields = { ...DEFAULT_FIELDS, ...(options.fields ?? {}) };
   const progressHeading = options.progressHeading ?? '## Progress notes';
@@ -208,6 +239,8 @@ export function create(options, ctx = {}) {
   const ownerTitle = new RegExp((options.ownerTask ?? { title: '\\(owner task\\)' }).title ?? '(?!)', 'i');
   const track = options.track ?? (isInside(root, dir) ? 'state' : 'file');
   const stateDir = ctx.stateDir;
+  // Stage branches: where pull requests merge when that is not the base branch. File mode ignores it.
+  const target = track === 'state' && ctx.shippedOn ? ctx.shippedOn : null;
   if (track === 'state' && !stateDir) throw new Error('stories tracked in state need a state folder (ctx.stateDir)');
   const keyed = { ...fields, status: 'status', title: 'title' };
 
@@ -249,7 +282,7 @@ export function create(options, ctx = {}) {
       id,
       title,
       ref: file,
-      status: fieldOf(fm, 'status'),
+      status: fieldOf(fm, 'status') || 'todo',
       group,
       groupName: fieldOf(fm, fields.groupName),
       order: Number(fieldOf(fm, fields.order)) || 0,
@@ -283,7 +316,49 @@ export function create(options, ctx = {}) {
     return ov ? { ...n, fm: frontmatterOf(edited(n.text, overlaySets(ov), [], progressHeading)) } : n;
   };
 
-  const list = () => notes().map((n) => toStory(effective(n)));
+  // The record file names on the remote branch (cached), read with git; empty when anything fails.
+  const remoteShipped = () => {
+    const ref = `refs/remotes/${target.remote}/${target.branch}`;
+    const key = `${realOr(dir)}\0${ref}`;
+    const at = now().getTime();
+    const had = shippedCache.get(key);
+    if (had && at - had.at < SHIPPED_TTL_MS) return had.names;
+    let names = [];
+    try {
+      const r = spawnSync('git', ['ls-tree', '-z', '--name-only', ref, '--', `${SHIPPED_DIR}/`], { cwd: dir, encoding: 'utf8', timeout: 10_000, env: gitEnv() });
+      if (r.status === 0) names = String(r.stdout).split('\0').filter(Boolean).map((p) => basename(p));
+    } catch {
+      names = [];
+    }
+    shippedCache.set(key, { at, names });
+    return names;
+  };
+
+  // The record file names promoted into dir; empty when the folder is missing or cannot be read, as the remote read is.
+  const localShipped = () => {
+    try {
+      return listNames(join(dir, SHIPPED_DIR));
+    } catch {
+      return [];
+    }
+  };
+
+  // The names of the shipped records: those in dir (promoted to the base branch) and, with a
+  // stage branch, those on its remote ref.
+  const shippedNames = () => {
+    if (track !== 'state') return new Set();
+    const names = localShipped().filter((name) => name.endsWith('.json'));
+    if (target) names.push(...remoteShipped());
+    return new Set(names.filter((name) => name.endsWith('.json')));
+  };
+
+  const list = () => {
+    const shipped = shippedNames();
+    return notes().map((n) => {
+      const s = toStory(effective(n));
+      return shipped.has(`${safe(s.id)}.json`) && !['done', 'retired', 'ready-to-promote'].includes(s.status) ? { ...s, status: 'done' } : s;
+    });
+  };
 
   const brief = (id) => {
     const note = find(id);
@@ -338,7 +413,8 @@ export function create(options, ctx = {}) {
   // State mode: mark the story done in the copy of its file in the checkout around cwd (the
   // story's worktree), with the overlay's notes, so the story's commit carries them. Returns
   // { path } of the edited file, { path: null } when there is nothing to edit, null for an
-  // unknown id.
+  // unknown id. With stage branches (target) a note already on the base branch is not edited:
+  // the story's shipped record is written instead and its path returned (see the header).
   function finalize(id, { note, cwd = process.cwd() } = {}) {
     const found = find(id);
     if (!found) return null;
@@ -347,19 +423,43 @@ export function create(options, ctx = {}) {
     if (track !== 'state' || !isInside(root, inRepo)) return { path: null };
     const top = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf8' });
     if (top.status !== 0) throw new Error(`finalize must run inside a git checkout (${cwd})`);
+    const checkout = String(top.stdout).trim();
+    const today = localDate(now());
+    if (target && !found.waiting) return { path: writeRecord(checkout, id, today, note) };
     const repoPath = found.waiting ? join(realOr(dir), basename(found.file)) : realOr(found.file);
-    const path = join(String(top.stdout).trim(), relative(realOr(root), repoPath));
+    const path = join(checkout, relative(realOr(root), repoPath));
     // A story made by create() is not on the base branch yet: its own commit adds the file.
     if (found.waiting && !existsSync(path)) writeAtomic(path, found.text);
     if (!existsSync(path)) throw new Error(`${path} is not in this checkout`);
-    const today = localDate(now());
     const earlier = (readOverlay(id)?.notes ?? []).map(bulletOf);
     const text = readFileSync(path, 'utf8');
     // Run again (a fix round after finalize), it adds no line the file already has.
     const have = new Set(text.split('\n'));
     const bullets = [...(note ? [bulletOf({ date: today, text: note })] : []), ...earlier].filter((b) => !have.has(b));
     writeFileSync(path, edited(text, setsOf('done', { completed: today }), bullets, progressHeading));
-    return { path };
+    return { path: target ? writeRecord(checkout, id, today, note) : path };
+  }
+
+  // The story's shipped record in the checkout: the note given, then the notes of the record
+  // already there (a fix round), then the overlay's, each date+text once, newest first.
+  function writeRecord(checkout, id, today, note) {
+    const path = join(checkout, relative(realOr(root), realOr(dir)), SHIPPED_DIR, `${safe(id)}.json`);
+    let before = [];
+    try {
+      const earlier = JSON.parse(readFileSync(path, 'utf8')).notes;
+      if (Array.isArray(earlier)) before = earlier;
+    } catch {
+      before = [];
+    }
+    const seen = new Set();
+    const notes = [...(note ? [{ date: today, text: note }] : []), ...before, ...(readOverlay(id)?.notes ?? [])].filter((n) => {
+      const key = `${n?.date}\0${n?.text}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    writeAtomic(path, `${JSON.stringify({ id, status: 'done', completed: today, notes }, null, 2)}\n`);
+    return path;
   }
 
   // Where the group's summary goes and whether it is due: every live story done, the file
