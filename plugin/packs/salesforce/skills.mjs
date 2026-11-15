@@ -6,11 +6,21 @@
 //   skills-lock.json            { version: 1, skills: { <name>: { source, sourceType, ref,
 //                               commit, skillPath, computedHash } } }, sorted, 2-space indented.
 //                               commit is Foreman's own field, the commit the tag pointed at;
-//                               the CLI does not write it.
+//                               the CLI does not write it. So is trackedHash, below.
 //
 // computedHash is the CLI's: SHA-256 over every regular file in the skill folder, sorted by
 // relative path with localeCompare, each as its '/' path then its bytes. Folders named .git or
 // node_modules, and anything that is neither a file nor a folder, are left out.
+//
+// Some skills ship a sample sfdx-project.json (an example project, in assets/ or beside the
+// skill). Gearset needs exactly one sfdx-project.json on each branch it reads, so after installing,
+// installSkills keeps every sample out of git: it makes sure the project's .gitignore holds
+// SAMPLE_IGNORE (a line that starts at .agents/skills/, so the project's own root sfdx-project.json
+// is never matched) and runs `git rm --cached` on any sample git already tracks. The files stay on
+// disk. A fresh clone or a slot worktree then has no sample, so a skill that held one also gets
+// trackedHash in its lock entry: the hash of the folder without its samples. skillUnchanged passes a
+// folder that matches computedHash (samples present, untouched) or trackedHash (samples absent),
+// and nothing else. A root that is not a git repo only gets the .gitignore line.
 //
 // Foreman owns skills-lock.json: installSkills replaces the skills it lists and removes the ones
 // a new tag drops, and refuses to overwrite a skill folder it did not install. When a skill
@@ -37,6 +47,10 @@ export const TAG = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 const OWNER_REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const SKIPPED = new Set(['.git', 'node_modules']);
 const LOCK_FILE = 'skills-lock.json';
+export const SAMPLE_PROJECT = 'sfdx-project.json';
+// The .gitignore line for the samples: it starts with .agents/skills/, so the root file is safe.
+export const SAMPLE_IGNORE = '.agents/skills/**/sfdx-project.json';
+const SAMPLE_COMMENT = '# Sample Salesforce projects inside the pinned skills: Gearset needs exactly one sfdx-project.json (foreman sf skills)';
 const LS_REMOTE_TIMEOUT_MS = 60_000;
 const CLONE_TIMEOUT_MS = 300_000;
 const MAX_NAMED = 5;
@@ -66,7 +80,12 @@ export function gitUrl(source) {
 
 export const sourceType = (source) => (typeof source === 'string' && OWNER_REPO.test(source) ? 'github' : 'git');
 
-export function hashSkillDir(dir, fs) {
+// True when the last '/'-separated part of `relPath` is sfdx-project.json.
+export const isSampleProject = (relPath) => typeof relPath === 'string' && relPath.split('/').at(-1) === SAMPLE_PROJECT;
+
+// The skills CLI's hash of a skill folder. With skip, a regular file whose relative path skip
+// accepts is left out; with none, this is the CLI's hash exactly.
+export function hashSkillDir(dir, fs, { skip } = {}) {
   const files = [];
   const walk = (abs, rel) => {
     for (const entry of fs.readdirSync(abs, { withFileTypes: true })) {
@@ -74,7 +93,7 @@ export function hashSkillDir(dir, fs) {
       if (entry.isDirectory()) {
         if (!SKIPPED.has(entry.name)) walk(path.join(abs, entry.name), relPath);
       } else if (entry.isFile()) {
-        files.push(relPath);
+        if (!(typeof skip === 'function' && skip(relPath))) files.push(relPath);
       }
     }
   };
@@ -86,6 +105,13 @@ export function hashSkillDir(dir, fs) {
     hash.update(fs.readFileSync(path.join(dir, ...relPath.split('/'))));
   }
   return hash.digest('hex');
+}
+
+// Whether the skill folder at `dir` is as installed: it hashes to the lock entry's computedHash
+// (samples present and untouched) or to its trackedHash (samples absent, as in a fresh clone).
+export function skillUnchanged(dir, entry, fs) {
+  const hash = hashSkillDir(dir, fs);
+  return hash === entry.computedHash || (typeof entry.trackedHash === 'string' && hash === entry.trackedHash);
 }
 
 const unquote = (s) => s.trim().replace(/^(['"])(.*)\1$/, '$2').trim();
@@ -153,6 +179,23 @@ function copyDir(fs, from, to) {
   }
 }
 
+// Whether the folder holds a sample sfdx-project.json, with the same walk as the hash.
+function hasSample(fs, dir) {
+  let found = false;
+  const walk = (abs, rel) => {
+    for (const entry of fs.readdirSync(abs, { withFileTypes: true })) {
+      const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        if (!SKIPPED.has(entry.name)) walk(path.join(abs, entry.name), relPath);
+      } else if (entry.isFile() && isSampleProject(relPath)) {
+        found = true;
+      }
+    }
+  };
+  walk(dir, '');
+  return found;
+}
+
 // The skill folders at skills/<name>/ that hold a SKILL.md, sorted.
 function skillsIn(fs, repo) {
   let entries;
@@ -199,6 +242,7 @@ function writeSkills({ root, source, tag, commit, fs, repo, names, managed }) {
       commit,
       skillPath: `skills/${name}/SKILL.md`,
       computedHash: hashSkillDir(real, fs),
+      ...(hasSample(fs, real) ? { trackedHash: hashSkillDir(real, fs, { skip: isSampleProject }) } : {}),
     };
   }
   fs.writeFileSync(path.join(root, LOCK_FILE), `${JSON.stringify(lock, null, 2)}\n`);
@@ -211,6 +255,37 @@ function writeSkills({ root, source, tag, commit, fs, repo, names, managed }) {
 export function movedFromLock(lock, { source, tag, commit }) {
   if (!isObject(lock) || !isObject(lock.skills)) return undefined;
   return Object.values(lock.skills).find((entry) => isObject(entry) && entry.source === source && entry.ref === tag && typeof entry.commit === 'string' && COMMIT.test(entry.commit) && entry.commit !== commit)?.commit;
+}
+
+// After the skills are written: keeps their sample sfdx-project.json files out of git. Makes sure
+// .gitignore has SAMPLE_IGNORE, then, in a git repo, stops git tracking any sample it tracks (the
+// files stay on disk). { ok: true, untracked, ignoreAdded } or { ok: false, reason }. Skills that
+// hold no sample are left alone: no write and no git call.
+function keepSamplesOutOfGit({ root, sh, fs, names }) {
+  if (!names.some((name) => hasSample(fs, path.join(root, '.agents', 'skills', name)))) return { ok: true, untracked: [], ignoreAdded: false };
+  const file = path.join(root, '.gitignore');
+  let text = '';
+  try {
+    text = String(fs.readFileSync(file, 'utf8'));
+  } catch (err) {
+    if (err?.code !== 'ENOENT') throw err;
+  }
+  let ignoreAdded = false;
+  if (!text.split('\n').some((line) => line.trimEnd() === SAMPLE_IGNORE)) {
+    fs.writeFileSync(file, `${text}${text === '' || text.endsWith('\n') ? '' : '\n'}${SAMPLE_COMMENT}\n${SAMPLE_IGNORE}\n`);
+    ignoreAdded = true;
+  }
+
+  const inside = sh('git', ['-C', root, 'rev-parse', '--is-inside-work-tree'], {}) ?? {};
+  if (inside.status !== 0 || String(inside.stdout ?? '').trim() !== 'true') return { ok: true, untracked: [], ignoreAdded };
+  const listed = sh('git', ['-C', root, 'ls-files', '-z', '--', '.agents/skills'], {}) ?? {};
+  if (listed.status !== 0) return { ok: false, reason: 'installed the skills, but could not list what git tracks under .agents/skills' };
+  const tracked = String(listed.stdout ?? '').split('\0').filter(isSampleProject);
+  if (tracked.length) {
+    const removed = sh('git', ['--literal-pathspecs', '-C', root, 'rm', '--cached', '--quiet', '--', ...tracked], {}) ?? {};
+    if (removed.status !== 0) return { ok: false, reason: `installed the skills, but could not stop git tracking ${named(tracked)}; run \`git rm --cached\` on them` };
+  }
+  return { ok: true, untracked: tracked, ignoreAdded };
 }
 
 function install({ root, source, tag, sh, fs, tmpDir }) {
@@ -256,14 +331,26 @@ function install({ root, source, tag, sh, fs, tmpDir }) {
     if (conflicts.length) return { ok: false, reason: `${named(conflicts)} are not from ${source}; move them or remove them` };
 
     const removed = writeSkills({ root, source, tag, commit, fs, repo, names, managed });
-    return { ok: true, commit, installed: names, removed, ...(movedFrom ? { movedFrom } : {}) };
+    const kept = keepSamplesOutOfGit({ root, sh, fs, names });
+    if (!kept.ok) return kept;
+    return {
+      ok: true,
+      commit,
+      installed: names,
+      removed,
+      ...(movedFrom ? { movedFrom } : {}),
+      ...(kept.untracked.length ? { untracked: kept.untracked } : {}),
+      ...(kept.ignoreAdded ? { ignoreAdded: true } : {}),
+    };
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 }
 
 // Installs the skills at `tag` from `source` into `root`. { ok: true, commit, installed, removed }
-// plus movedFrom when the tag moved since the lock was written, or { ok: false, reason }.
+// plus movedFrom when the tag moved since the lock was written, untracked (the sample
+// sfdx-project.json paths git stopped tracking) when there were any, and ignoreAdded: true when this
+// run added the .gitignore line, or { ok: false, reason }.
 // Nothing is written into the project until every check has passed.
 export function installSkills({ root, source, tag, sh, fs, tmpDir = os.tmpdir() }) {
   try {

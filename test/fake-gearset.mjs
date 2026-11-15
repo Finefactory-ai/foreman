@@ -3,11 +3,15 @@
 //   fakeGearset(routes)   a fetch(url, init). routes maps a path with its query, such as
 //                         '/public/reporting/pipelines' or
 //                         '/public/reporting/environments?PipelineId=pipe-1', to
-//                         { status, body }, a function (url, init) returning one, or an Error,
-//                         which the fetch throws. A path with no route of its own, query
+//                         { status, body, headers }, a function (url, init) returning one, or an
+//                         Error, which the fetch throws. headers is an object of response
+//                         headers, such as { status: 429, headers: { 'Retry-After': '2' } }; every
+//                         response has headers.get(name), a lookup in any case that answers null
+//                         for a header the route does not carry. A path with no route of its own, query
 //                         included, falls back to the route for the bare path; with neither it
 //                         answers 404. fetch.calls records { url, path, method, headers } for
-//                         each call. As the real service does, a call whose headers lack
+//                         each call, with its `body` (the string sent, or null). As the real
+//                         service does, a call to the Reporting API whose headers lack
 //                         api-version 3.0 (the header name in any case) gets 400
 //                         UnsupportedApiVersion before any route is looked at.
 //   acmeGearset(over)     the routes for one Acme pipeline, pipe-1 'Acme', with environments QA
@@ -26,6 +30,16 @@
 //   deploymentsOf(...)    the deployments POST path with its query, as gearset.mjs builds it
 //   operationStatusOf(id), operationResultOf(id)
 //                         the operation's status and result paths
+//   gearsetStatuses(heads)
+//                         a ship-fakes rule [RegExp, answer] for `gh api repos/{owner}/{repo}/commits/
+//                         <sha>/status`, which models what Gearset does with a promotion pull
+//                         request. heads maps a commit sha to { environment, first, state =
+//                         'success', description = '' }. The head of a pull request into the FIRST
+//                         stage answers the status "Gearset <environment>" in `state`. Gearset
+//                         validates a pull request into a LATER stage only when a person presses
+//                         Run validation, so such a head, and any sha not listed (such as the
+//                         empty commit a nudge pushes), answers no status at all, whatever is
+//                         pushed to the pull request.
 
 import { ACME_QA_ID, ACME_UAT_ID } from './fake-sf.mjs';
 
@@ -87,26 +101,42 @@ export const acmeDeployments = (list = [acmeDeployment()], { id = 'op-1', status
   [operationResultOf(id)]: { status: 200, body: { Deployments: list } },
 });
 
+export function gearsetStatuses(heads = {}) {
+  const none = { state: 'pending', statuses: [] };
+  return [
+    /^gh api repos\/\{owner\}\/\{repo\}\/commits\/[^/\s]+\/status$/,
+    (line) => {
+      const sha = line.split('/commits/')[1].split('/status')[0];
+      const head = Object.hasOwn(heads, sha) ? heads[sha] : null;
+      if (!head?.first) return JSON.stringify(none);
+      const { environment, state = 'success', description = '' } = head;
+      return JSON.stringify({ state, statuses: [{ context: `Gearset ${environment}`, state, description }] });
+    },
+  ];
+}
+
 export function fakeGearset(routes = acmeGearset()) {
   const calls = [];
   const fetch = async (url, init = {}) => {
     const u = new URL(url);
     const path = `${u.pathname}${u.search}`;
     const headers = { ...(init.headers ?? {}) };
-    calls.push({ url: String(url), path, method: init.method ?? 'GET', headers });
+    calls.push({ url: String(url), path, method: init.method ?? 'GET', headers, body: typeof init.body === 'string' ? init.body : null });
     const version = Object.entries(headers).find(([name]) => name.toLowerCase() === 'api-version')?.[1];
     if (String(version ?? '').trim() !== '3.0') {
       const body = { Code: 'UnsupportedApiVersion', Message: "The HTTP resource that matches the request URI does not support the API version '1.0'." };
-      return { ok: false, status: 400, json: async () => body, text: async () => JSON.stringify(body) };
+      return { ok: false, status: 400, headers: { get: () => null }, json: async () => body, text: async () => JSON.stringify(body) };
     }
     const key = Object.hasOwn(routes, path) ? path : Object.hasOwn(routes, u.pathname) ? u.pathname : null;
     let route = key === null ? { status: 404, body: { Message: 'not found' } } : routes[key];
     if (typeof route === 'function') route = route(String(url), init);
     if (route instanceof Error) throw route;
-    const { status = 200, body = null } = route;
+    const { status = 200, body = null, headers: sent = {} } = route;
+    const lower = new Map(Object.entries(sent).map(([name, value]) => [name.toLowerCase(), String(value)]));
     return {
       ok: status >= 200 && status < 300,
       status,
+      headers: { get: (name) => lower.get(String(name).toLowerCase()) ?? null },
       json: async () => (typeof body === 'string' ? JSON.parse(body) : body),
       text: async () => (typeof body === 'string' ? body : JSON.stringify(body)),
     };

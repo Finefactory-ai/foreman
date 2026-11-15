@@ -18,6 +18,7 @@ import {
   started,
   startRun,
   state,
+  stateJson,
   texts,
   until,
   withRestartRepos,
@@ -147,8 +148,12 @@ describe('the supervisor started again with story sessions still running', () =>
       expect(isUp(pidOf('ACME-2'))).toBe(true);
       expect(isUp(pidOf('ACME-4'))).toBe(true);
 
-      second = startRun('go');
+      // A fresh start asked for one story: the two sessions left running are in hand, on top of it.
+      second = startRun('go', ['1']);
       expect(await until(() => texts().includes(KEPT), 40_000), 'the new process kept both sessions across the restart').toBe(true);
+      expect(await until(() => texts().includes('2 stories left in hand are resumed first, on top of the 1 asked for: they do not count towards it.'), 40_000), 'the start line counts the adopted sessions').toBe(true);
+      expect([...(stateJson().asked?.resumed ?? [])].sort()).toEqual(['ACME-2', 'ACME-4']);
+      expect(stateJson().asked?.max).toBe(1);
       const now = readPid(state);
       expect(now).not.toBe(old);
       expect(readAdopted(state)).toEqual({ by: now, pids: [old] });

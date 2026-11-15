@@ -139,6 +139,17 @@ describe('the settings registry', () => {
     expect(findSetting('ship.merge.keepBranch')).toMatchObject({ type: 'boolean', default: false, applies: 'next-story' });
   });
 
+  it('has the later-stage validation setting, for a Salesforce project on the gearset path', () => {
+    expect(findSetting('salesforce.gearset.validateLaterStages')).toMatchObject({ type: 'enum', values: ['foreman', 'gearset'], default: 'foreman', group: 'release', applies: 'next-story' });
+    const sf = (release) => ({ ...min(), pack: 'salesforce', salesforce: { release } });
+    const e = findSetting('salesforce.gearset.validateLaterStages');
+    expect(shown(e, min())).toBe(false);
+    expect(shown(e, sf('sf'))).toBe(false);
+    expect(shown(e, sf('ci'))).toBe(false);
+    expect(shown(e, sf('gearset'))).toBe(true);
+    expect(shown(e, { ...min(), salesforce: { release: 'gearset' } })).toBe(false);
+  });
+
   // The description is served as the settings hint by plugin/lib/dashboard/help.mjs (settingHelp), and help.test.mjs caps every hint at 100 characters.
   it('keeps every description within the dashboard hint limit: at most 100 characters', () => {
     for (const e of REGISTRY) expect(e.description.length, e.name).toBeLessThanOrEqual(100);

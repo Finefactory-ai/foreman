@@ -13,6 +13,11 @@
     Never run a check's command by hand: Foreman denies it. If any of them still
     fails, take the failed path (`failed.md`). Otherwise make a new commit (never amend) and
     run `foreman ship --story <ID>` again. A second failure takes the failed path.
+  - The JSON has `noStatus: true` (check this first) → Gearset never validated the pull
+    request, so the code is not at fault: send nothing to the builder. Leave the pull
+    request open, go back, and run `foreman story block <ID> --reason '<the reason>'`. Then
+    run `foreman decide add --story <ID> --kind task --title "Gearset did not validate <ID>'s pull request" --body '<the ship JSON line>'`,
+    each `'` inside written as `'\''`. Stop with `blocked`.
   - It says CI **never started**, **did not finish** in time, or its checks **could not be
     read** → the code is not at fault, so do not send anything to the builder. Leave the
     pull request open, go back, run `foreman story block <ID> --reason "<the reason>"`,

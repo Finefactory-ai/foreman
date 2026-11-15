@@ -9,6 +9,11 @@
 //   statusContext(name)           the commit status Gearset's validation posts on it,
 //                                 "Gearset <environment name>". It is a commit status, not a
 //                                 check run.
+//   noStatusReason(context, pr, minutes)
+//                                 the failure reason when a promotion PR got no Gearset status in
+//                                 time: it names both likely causes, a validation that stopped
+//                                 with an error before it began (read on the PR in the Gearset
+//                                 pipeline) and a Gearset webhook switched off
 //   gearsetPipelines(...)         the pipelines the token's team can see, each { id, name, enabled }
 //   gearsetEnvironments(...)      every environment of every pipeline, or of the one pipelineId
 //                                 names (salesforce.gearset.pipelineId), from the Reporting API
@@ -29,15 +34,33 @@
 //                                 (Successful), failed (only Failed or PartiallySuccessful), or
 //                                 not at all
 //
+//   NUDGE_MINUTES, MAX_NUDGES     how long a promotion PR may show no Gearset status before the
+//                                 first nudge (5 minutes; salesforce.gearset.nudgeMinutes sets it),
+//                                 and how many nudges a wait makes (2). It is also how long a
+//                                 later stage waits for a Gearset status before Foreman validates
+//                                 that stage's promotion PR itself (gearset-promote.mjs)
+//
+//   releaseEnvironments(ctx, ...) gearsetEnvironments' answer, kept on the release's ctx (one object
+//                                 for every step of a release) so the steps of one release read the
+//                                 environments once; a failed read is never kept
+//   waitOutRateLimit(read, ...)   calls read until it is not a 429, sleeping the time Gearset names
+//                                 between calls, and answers the 429 with rateLimited and retryAt
+//                                 when that wait would pass the deadline
+//
 // The Reporting API takes `Authorization: token <token>` and `api-version: 3.0` as headers (a
 // query parameter is ignored), and needs Gearset's Teams or Enterprise tier. An error names
 // only what went wrong: never the token, a header, a URL query or Gearset's own error text. A
-// failed call also carries status, the HTTP code, or null when Gearset could not be reached.
+// failed call also carries status, the HTTP code, or null when Gearset could not be reached. A 429
+// carries retryAfterMs, the time Gearset's Retry-After names (at most MAX_RATE_LIMIT_WAIT_MS, a
+// day), when it names one it can be read from.
 
 import { PIPELINE_ID } from './config.mjs';
 
 export const TOKEN_VAR = 'GEARSET_API_TOKEN';
 export const API = 'https://api.gearset.com';
+
+export const NUDGE_MINUTES = 5;
+export const MAX_NUDGES = 2;
 
 const TIMEOUT_MS = 30_000;
 const UNREADABLE = 'Gearset answered something unreadable';
@@ -49,6 +72,11 @@ const STATUS_ERRORS = {
 };
 
 const POLL_MS = 5_000;
+// The wait for a rate limit that names no time, and the least wait for one that names none or 0.
+export const RATE_LIMIT_WAIT_MS = 60_000;
+export const MIN_RATE_LIMIT_WAIT_MS = 1_000;
+// The longest wait Foreman takes from a Retry-After; a longer one is read as this.
+export const MAX_RATE_LIMIT_WAIT_MS = 24 * 60 * 60_000;
 // An operation id goes into a URL path, so only these characters.
 const OPERATION_ID = /^[A-Za-z0-9-]{1,100}$/;
 
@@ -64,6 +92,16 @@ const id15 = (v) => (typeof v === 'string' ? v.slice(0, 15) : '');
 const unreadable = (status) => ({ ok: false, error: UNREADABLE, transient: false, ...(status === undefined ? {} : { status }) });
 const realSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// A Retry-After value as milliseconds, at most MAX_RATE_LIMIT_WAIT_MS: seconds, or an HTTP date;
+// null when it is neither.
+function retryAfterOf(value) {
+  const v = typeof value === 'string' ? value.trim() : '';
+  if (/^\d+(\.\d+)?$/.test(v)) return Math.min(MAX_RATE_LIMIT_WAIT_MS, Math.round(Number(v) * 1000));
+  if (!v || /^[-+.\d]+$/.test(v)) return null;
+  const at = Date.parse(v);
+  return Number.isNaN(at) ? null : Math.min(MAX_RATE_LIMIT_WAIT_MS, Math.max(0, at - Date.now()));
+}
+
 export function gearsetToken(env) {
   const value = isObject(env) ? env[TOKEN_VAR] : undefined;
   return typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -72,6 +110,13 @@ export function gearsetToken(env) {
 export const promotionBranch = (branch, envBranch) => `gs-pipeline/${branch}_-_${envBranch}`;
 
 export const statusContext = (name) => `Gearset ${name}`;
+
+// A validation that fails before it starts sets no status at all, and so does a switched-off
+// webhook, so the wait ends the same way for both.
+export function noStatusReason(context, prNumber, minutes) {
+  const within = `${minutes} minute${minutes === 1 ? '' : 's'}`;
+  return `${context} posted no status on pull request #${prNumber} within ${within}. Either Gearset's validation stopped with an error before it began (open the pull request in the Gearset pipeline to read it), or a Gearset webhook on this repository is switched off (Settings → Webhooks; \`foreman doctor\` checks them)`;
+}
 
 // One Reporting API call. { ok: true, body } with an array body (expect 'array') or an object
 // body (expect 'object'), or { ok: false, error, transient, status } where transient is true for
@@ -90,7 +135,17 @@ async function request(fetch, token, { method = 'GET', path, expect = 'array' })
   }
   const status = Number.isInteger(res?.status) ? res.status : null;
   if (!res?.ok) {
-    return { ok: false, error: STATUS_ERRORS[status] ?? `Gearset answered ${res?.status}`, transient: status === 429, status };
+    const failed = { ok: false, error: STATUS_ERRORS[status] ?? `Gearset answered ${res?.status}`, transient: status === 429, status };
+    if (status === 429) {
+      let named = null;
+      try {
+        named = retryAfterOf(res.headers?.get?.('retry-after'));
+      } catch {
+        // an unreadable header is no header
+      }
+      if (named !== null) failed.retryAfterMs = named;
+    }
+    return failed;
   }
   let body;
   try {
@@ -162,6 +217,46 @@ export async function gearsetEnvironments({ fetch, token, pipelineId, pipelineId
     }
   }
   return { ok: true, environments };
+}
+
+const kept = new WeakMap();
+
+// gearsetEnvironments' answer for `pipelineId`, kept on `ctx` for as long as it lives: the ship
+// runner passes one ctx to every step of a release, so they read the environments once. An answer
+// is reused only for the same fetch and token; a failed read is never kept. A ctx that is not an
+// object reads directly. Never throws.
+export async function releaseEnvironments(ctx, { fetch, token, pipelineId }) {
+  if (ctx === null || typeof ctx !== 'object') return gearsetEnvironments({ fetch, token, pipelineId });
+  let byPipeline = kept.get(ctx);
+  if (!byPipeline) kept.set(ctx, (byPipeline = new Map()));
+  const key = pipelineId ?? '';
+  const held = byPipeline.get(key);
+  if (held && held.fetch === fetch && held.token === token) return held.read;
+  const read = await gearsetEnvironments({ fetch, token, pipelineId });
+  if (read.ok) byPipeline.set(key, { fetch, token, read });
+  return read;
+}
+
+// Calls `read` until it answers something other than a 429. On a 429 it waits the time the answer
+// names (retryAfterMs; RATE_LIMIT_WAIT_MS when none, never less than MIN_RATE_LIMIT_WAIT_MS and
+// never more than MAX_RATE_LIMIT_WAIT_MS),
+// after `told(seconds, retryAt)`, which may throw. When the wait would end after `deadline` (ms)
+// it sleeps no more and answers the 429 with rateLimited: true and retryAt, an ISO time.
+export async function waitOutRateLimit(read, { now, sleep, deadline, told }) {
+  for (;;) {
+    const r = await read();
+    if (r.ok || r.status !== 429) return r;
+    const waitMs = Math.min(MAX_RATE_LIMIT_WAIT_MS, Math.max(MIN_RATE_LIMIT_WAIT_MS, Number.isFinite(r.retryAfterMs) ? r.retryAfterMs : RATE_LIMIT_WAIT_MS));
+    const at = now().getTime() + waitMs;
+    const retryAt = new Date(at).toISOString();
+    if (at > deadline) return { ...r, rateLimited: true, retryAt };
+    try {
+      told?.(Math.ceil(waitMs / 1000), retryAt);
+    } catch {
+      // an event never fails a release
+    }
+    await sleep(waitMs);
+  }
 }
 
 // The environment that deploys to orgId, matched on the first 15 characters of the org ID. The

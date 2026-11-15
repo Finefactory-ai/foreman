@@ -26,6 +26,16 @@ const SETTINGS = (home) => ({
 // The session gets its settings as a file path, so no value is on the process list.
 const settingsOf = (argv) => JSON.parse(readFileSync(argv[argv.indexOf('--settings') + 1], 'utf8'));
 // The lean flags every session has, and no MCP config it was not given.
+// The session PATH without the supervisor's plugin bin, which --plugin-dir puts first (session.mjs)
+// and which holds only `foreman`: what is left is the pack's wrapper folder, then the run's PATH.
+const pathBesidePluginBin = (s) => {
+  const at = s.argv.indexOf('--plugin-dir');
+  expect(at).toBeGreaterThan(-1);
+  const pluginBin = join(s.argv[at + 1], 'bin');
+  const entries = s.PATH.split(delimiter);
+  expect(entries[0]).toBe(pluginBin);
+  return entries.slice(1);
+};
 const expectLean = (argv) => {
   expect(argv).toContain('--strict-mcp-config');
   expect(argv[argv.indexOf('--setting-sources') + 1]).toBe('project,local');
@@ -127,7 +137,7 @@ describe('foreman run with the Salesforce pack', () => {
     expect(settingsOf(s.argv)).toEqual(SETTINGS(repos.base));
     expect(s.argv[at + 2]).toBe('--allowedTools');
     expectLean(s.argv);
-    expect(s.PATH.split(delimiter)[0]).toBe(join(sfHome, '.foreman', 'bin'));
+    expect(pathBesidePluginBin(s)[0]).toBe(join(sfHome, '.foreman', 'bin'));
     expect(s.FOREMAN_SF_HOME).toBe(sfHome);
     expect(existsSync(join(sfHome, '.foreman', 'bin', 'sf'))).toBe(true);
     expect(existsSync(join(sfHome, '.foreman', 'bin', 'sfdx'))).toBe(true);
@@ -154,7 +164,7 @@ describe('foreman run without a pack', () => {
     expect(s, r.stderr).toBeDefined();
     expect(settingsOf(s.argv)).toEqual(LEAN(repos.base));
     expectLean(s.argv);
-    expect(s.PATH).toBe(runEnv().PATH);
+    expect(pathBesidePluginBin(s).join(delimiter)).toBe(runEnv().PATH);
     expect(existsSync(sfLog)).toBe(false);
     expect(existsSync(join(sfHome, '.foreman'))).toBe(false);
   }, 60_000);

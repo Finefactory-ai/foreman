@@ -52,8 +52,11 @@ const finish = () => {
   } catch {
     // no overlay yet
   }
-  writeFileSync(file, JSON.stringify({ id, status: 'blocked', blockedBy: 'Fake session', fields: {}, notes }));
-  console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, duration_ms: 18000, result: 'Could not get further.\\nFACTORY_RESULT: blocked ' + id, total_cost_usd: 0, session_id: 'fake' }));
+  // With FAKE_END=shipped it ends shipped: a blocked story does not count toward run 1, so a test
+  // whose run must end after its second session has that session ship.
+  const shipped = process.env.FAKE_END === 'shipped';
+  writeFileSync(file, JSON.stringify(shipped ? { id, status: 'done', fields: {}, notes } : { id, status: 'blocked', blockedBy: 'Fake session', fields: {}, notes }));
+  console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, duration_ms: 18000, result: shipped ? 'Done.\\nFACTORY_RESULT: shipped ' + id : 'Could not get further.\\nFACTORY_RESULT: blocked ' + id, total_cost_usd: 0, session_id: 'fake' }));
 };
 const hook = (event) =>
   new Promise((resolve) => {
@@ -205,10 +208,11 @@ const runEnv = (fake) => {
   return { ...env, ...fastTick, ...fake };
 };
 
-// Runs `foreman run 1` in the foreground until it exits; its events and run records after.
+// Runs `foreman run 1` in the foreground until it exits; its events and run records after. The fake
+// session ends blocked, which does not count toward the 1, so the run ends when nothing is left.
 export async function runFactory(fake) {
   const state = join(clone, '.foreman');
-  const child = startForeman(['run', '--foreground', '1'], { cwd: clone, env: runEnv(fake), stdio: 'ignore' });
+  const child = startForeman(['run', '--foreground', '--exit-when-idle', '1'], { cwd: clone, env: runEnv(fake), stdio: 'ignore' });
   const exited = new Promise((resolve) => child.on('exit', (code) => resolve(code)));
   const timer = setTimeout(() => endChild(child), 90_000);
   const code = await exited;

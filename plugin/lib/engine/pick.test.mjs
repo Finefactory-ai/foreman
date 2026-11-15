@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { blockedNow, buildOrder, byPriority, dependentsOf, eligible, freedBy, needsExclusive, nextStory, progress, waitersOf, waitsOnStories } from './pick.mjs';
+import { blockedNow, buildOrder, byPriority, dependentsOf, doneBlockers, eligible, freedBy, needsExclusive, nextStory, progress, waitersOf, waitsOnStories } from './pick.mjs';
 
 const ID = '[A-Z]+-\\d+';
 const s = (id, over = {}) => ({
@@ -63,6 +63,41 @@ describe('idPattern is required', () => {
     expect(() => eligible([])).toThrow('idPattern is required');
     expect(() => buildOrder([])).toThrow('idPattern is required');
     expect(() => waitsOnStories('S-1 first')).toThrow('idPattern is required');
+  });
+});
+
+describe('doneBlockers', () => {
+  const opts = { idPattern: ID };
+  const done = (id) => s(id, { status: 'done' });
+
+  it('gives the leading ids when every one is a done story', () => {
+    expect(doneBlockers('S-1 must land first', [done('S-1'), s('S-3')], opts)).toEqual(['S-1']);
+    expect(doneBlockers('S-1, S-2 must land first', [done('S-1'), done('S-2')], opts)).toEqual(['S-1', 'S-2']);
+  });
+
+  it('gives nothing while one of them is not done', () => {
+    expect(doneBlockers('S-1, S-2 must land first', [done('S-1'), s('S-2')], opts)).toEqual([]);
+    expect(doneBlockers('S-1 must land first', [s('S-1', { status: 'blocked' })], opts)).toEqual([]);
+  });
+
+  it('gives nothing for a reason in words, or an id that is not a story in the list', () => {
+    expect(doneBlockers('needs a key from the owner', [done('S-1')], opts)).toEqual([]);
+    expect(doneBlockers('Waits on S-1', [done('S-1')], opts)).toEqual([]);
+    expect(doneBlockers('S-9 must land first', [done('S-1')], opts)).toEqual([]);
+    expect(doneBlockers('', [done('S-1')], opts)).toEqual([]);
+  });
+
+  it('throws without an idPattern', () => {
+    expect(() => doneBlockers('S-1 must land first', [done('S-1')])).toThrow('idPattern is required');
+  });
+
+  it('is the case the picker would take again at once, and the recorded words form is not', () => {
+    const list = [done('S-1'), s('S-3', { status: 'blocked', blockedBy: 'S-1 must land first' })];
+    expect(eligible(list, opts).map((x) => x.id)).toEqual(['S-3']);
+    expect(blockedNow(list[1], list, opts)).toBe(false);
+    const recorded = [done('S-1'), s('S-3', { status: 'blocked', blockedBy: 'Needs you: S-1 is already done, so waiting for it cannot unblock S-3. The architect said: S-1 must land first' })];
+    expect(eligible(recorded, opts).map((x) => x.id)).toEqual([]);
+    expect(blockedNow(recorded[1], recorded, opts)).toBe(true);
   });
 });
 

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { command, logPath, result, start, testCoreShare } from './session.mjs';
+import { command, logPath, result, SHIP_TIMEOUT_MS, start, testCoreShare } from './session.mjs';
 
 const TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'Agent', 'Skill', 'ToolSearch', 'Workflow(foreman:pipeline)'];
 
@@ -118,6 +118,31 @@ describe('session.command', () => {
       FOREMAN_STORY: 'S-2',
       FOREMAN_SUPERVISOR_PID: '4242',
       CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '0',
+      BASH_MAX_TIMEOUT_MS: '14400000',
+    });
+  });
+
+  describe('BASH_MAX_TIMEOUT_MS (the Bash timeout the story skill gives foreman ship)', () => {
+    const withEnv = (extra) => command({ ...base({ adapter: 'files' }), ...extra }).env.BASH_MAX_TIMEOUT_MS;
+
+    it('SHIP_TIMEOUT_MS is four hours: past the default limit and past two default release waits', () => {
+      expect(SHIP_TIMEOUT_MS).toBe(14_400_000);
+      expect(SHIP_TIMEOUT_MS).toBeGreaterThan(600_000);
+      expect(SHIP_TIMEOUT_MS).toBeGreaterThan(2 * 30 * 60_000);
+    });
+
+    it('keeps a larger value the user set', () => {
+      expect(withEnv({ baseEnv: { BASH_MAX_TIMEOUT_MS: '30000000' } })).toBe('30000000');
+    });
+
+    it('raises a smaller or unreadable value to the ship timeout', () => {
+      for (const v of ['1000', 'abc', '-5', '', '1.5']) expect(withEnv({ baseEnv: { BASH_MAX_TIMEOUT_MS: v } })).toBe('14400000');
+    });
+
+    it('cannot be lowered by the slot environment or the pack', () => {
+      const lowAdapter = { env: () => ({ BASH_MAX_TIMEOUT_MS: '1000' }) };
+      expect(withEnv({ envAdapter: lowAdapter })).toBe('14400000');
+      expect(withEnv({ packSession: { env: { BASH_MAX_TIMEOUT_MS: '1000' } } })).toBe('14400000');
     });
   });
 
@@ -553,6 +578,90 @@ describe("session.command with the plugin folder the run loads", () => {
     }
     const carried = { ...base({ adapter: 'files' }), baseEnv: { PATH: '/bin', ...OTHER } };
     expect(command(carried).env.FOREMAN_PLUGIN_ROOT).toBe('/elsewhere/plugin');
+  });
+});
+
+describe("session.command: the session's foreman command (FM-469)", () => {
+  const CACHE = { id: 'foreman@foreman', path: '/opt/acme/cache/0.0.1' };
+  const withPlugin = (extra = {}) => ({ ...base({ adapter: 'files' }), baseEnv: { PATH: '/opt/acme/cache/0.0.1/bin:/bin', HOME: '/home/me' }, pluginDir: '/plugins/foreman', shadowed: [CACHE], ...extra });
+
+  it("puts the plugin's bin first on PATH, drops the installed copy's bin and turns its id off", () => {
+    const c = withPlugin();
+    const run = command(c);
+    expect(run.env.PATH).toBe('/plugins/foreman/bin:/bin');
+    expect(fileOf(run, '--settings').enabledPlugins['foreman@foreman']).toBe(false);
+    expect(JSON.parse(run.envFile.text).PATH).toBe('/plugins/foreman/bin:/bin');
+  });
+
+  it('drops a shadowed bin written with a trailing slash or a dot segment, and every one of several', () => {
+    const run = command(withPlugin({
+      baseEnv: { PATH: '/opt/acme/cache/0.0.1/bin/:/bin:/opt/acme/other/./bin:/usr/bin', HOME: '/home/me' },
+      shadowed: [CACHE, { id: 'foreman@acme', path: '/opt/acme/other' }],
+    }));
+    expect(run.env.PATH).toBe('/plugins/foreman/bin:/bin:/usr/bin');
+    expect(fileOf(run, '--settings').enabledPlugins).toEqual({ 'foreman@foreman': false, 'foreman@acme': false });
+  });
+
+  it("keeps the plugin's off layer ahead of a scope that turns the plugin on", () => {
+    const scope = { settings: { enabledPlugins: { 'foreman@foreman': true, 'acme-tools@acme': true } }, mcpServers: {} };
+    const settings = fileOf(command(withPlugin({ scope })), '--settings');
+    expect(settings.enabledPlugins).toEqual({ 'foreman@foreman': false, 'acme-tools@acme': true });
+  });
+
+  it('keeps the off layer ahead of a pack that turns the plugin on', () => {
+    const packSession = { env: {}, pathPrefix: [], settings: { enabledPlugins: { 'foreman@foreman': true } } };
+    expect(fileOf(command(withPlugin({ packSession })), '--settings').enabledPlugins['foreman@foreman']).toBe(false);
+  });
+
+  it("puts a pack's path prefix after the plugin's bin", () => {
+    const packSession = { env: {}, pathPrefix: ['/srv/acme/bin'], settings: {} };
+    expect(command(withPlugin({ packSession })).env.PATH).toBe('/plugins/foreman/bin:/srv/acme/bin:/bin');
+  });
+
+  it('works the same when the folder comes from FOREMAN_PLUGIN_DIR', () => {
+    const c = withPlugin({ pluginDir: undefined, baseEnv: { PATH: '/opt/acme/cache/0.0.1/bin:/bin', HOME: '/home/me', FOREMAN_PLUGIN_DIR: '/plugins/foreman' } });
+    const run = command(c);
+    expect(run.env.PATH).toBe('/plugins/foreman/bin:/bin');
+    expect(fileOf(run, '--settings').enabledPlugins['foreman@foreman']).toBe(false);
+  });
+
+  it('with no plugin folder, ignores shadowed: PATH and settings are as without it', () => {
+    for (const pluginDir of [null, '', undefined]) {
+      const run = command(withPlugin({ pluginDir }));
+      expect(run, String(pluginDir)).toEqual(command({ ...withPlugin({ pluginDir }), shadowed: [] }));
+      expect(run.env.PATH).toBe('/opt/acme/cache/0.0.1/bin:/bin');
+      expect(fileOf(run, '--settings')).toEqual({ ...LEAN });
+    }
+  });
+
+  it('adds nothing for an invalid shadowed entry', () => {
+    const run = command(withPlugin({ shadowed: [{ id: 'foreman', path: '/opt/acme/cache/0.0.1' }, { id: 'foreman@foreman', path: '' }, { id: 'a b@c', path: '/x' }, null, 'x'] }));
+    expect(run.env.PATH).toBe('/plugins/foreman/bin:/opt/acme/cache/0.0.1/bin:/bin');
+    expect(fileOf(run, '--settings')).toEqual(LEAN);
+    expect(command(withPlugin({ shadowed: undefined })).env.PATH).toBe('/plugins/foreman/bin:/opt/acme/cache/0.0.1/bin:/bin');
+  });
+
+  it('still puts the plugin bin first when there is no PATH', () => {
+    expect(command(withPlugin({ baseEnv: { HOME: '/home/me' }, shadowed: [] })).env.PATH).toBe('/plugins/foreman/bin');
+  });
+
+  it('keeps the arguments in their order', () => {
+    const run = command(withPlugin());
+    const at = (flag) => run.args.indexOf(flag);
+    expect(at('--plugin-dir') + 2).toBe(at('--settings'));
+    expect(at('--settings') + 2).toBe(at('--allowedTools'));
+    expect(run.args.slice(at('--allowedTools') + 1)).toEqual(TOOLS);
+  });
+
+  it('gives FOREMAN_PLUGIN_LABEL from pluginLabel, which no other environment can change', () => {
+    const packSession = { env: { FOREMAN_PLUGIN_LABEL: 'evil' }, pathPrefix: [], settings: {} };
+    const run = command({ ...withPlugin({ packSession }), pluginLabel: 'a1b2c3d' });
+    expect(run.env.FOREMAN_PLUGIN_LABEL).toBe('a1b2c3d');
+    expect(JSON.parse(run.envFile.text).FOREMAN_PLUGIN_LABEL).toBe('a1b2c3d');
+  });
+
+  it('has no FOREMAN_PLUGIN_LABEL for an empty or missing label', () => {
+    for (const pluginLabel of [undefined, null, '', 5]) expect(command({ ...withPlugin(), pluginLabel }).env, String(pluginLabel)).not.toHaveProperty('FOREMAN_PLUGIN_LABEL');
   });
 });
 

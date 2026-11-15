@@ -198,12 +198,12 @@ no attribution lines to it.
 
     foreman ship --story <ID>
 
-It loads the project's environment file by itself. It waits for the ship lock (one release
-at a time); the command centre shows the slot as waiting. Then it runs the project's ship
-steps: bring in `<base>`, push, open the pull request, wait for CI, and whatever release
-steps the project configures (merge, migrate, deploy, verify). With no CI step, bringing in
-`<base>` also runs the project's checks on the merged code when it brought in new commits.
-Its last line is JSON. By exit code:
+Run it in the foreground with the Bash `timeout` at 14400000, never in the background. It
+waits for the ship lock (one release at a time); the command centre shows the slot as
+waiting. Then it runs the project's ship steps: bring in `<base>`, push, open the pull
+request, wait for CI, and whatever release steps the project configures (merge, migrate,
+deploy, verify). With no CI step, bringing in `<base>` also runs the project's checks on
+the merged code when it brought in new commits. Its last line is JSON. By exit code:
 
 - **0** — shipped. Go to step 6.
 

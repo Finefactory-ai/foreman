@@ -46,7 +46,7 @@
 // handled as any other.
 //
 // Exit codes (a contract the per-story skill depends on):
-//   0 shipped   1 nothing to ship or wrong state
+//   0 shipped   1 nothing to ship or wrong state, or stopped by a signal (stage `interrupted`)
 //   2 CI, the Salesforce validation, or the project's checks on the merged code failed (nothing merged)
 //   3 hosted credentials missing (nothing merged)  4 migration failed (nothing merged)
 //   5 deploy or smoke failed, or a failure after a point of no return
@@ -70,7 +70,7 @@ const HALT_CODES = new Set([4, 5]);
 // The most times one run brings the base in again because it moved under the release.
 const BASE_MOVES = 5;
 // ctx keys a step's facts may not replace.
-const RESERVED = new Set(['sh', 'env', 'fetch', 'root', 'config', 'story', 'branch', 'locks', 'report', 'halt', 'sleep', 'now', 'pid', 'slot', 'holderPid', 'isHalted', 'event', 'beat', 'testedBy', 'pass', 'rolledBackAt']);
+const RESERVED = new Set(['sh', 'env', 'fetch', 'root', 'config', 'story', 'branch', 'locks', 'report', 'halt', 'sleep', 'now', 'pid', 'slot', 'holderPid', 'isHalted', 'event', 'beat', 'progress', 'testedBy', 'pass', 'rolledBackAt']);
 
 // The lock files behind the keys the runner and steps use: `ship` and `resource:<name>`.
 export function lockStore(dir) {
@@ -187,7 +187,22 @@ async function rollBack(ctx, onFailure, result, report) {
 }
 
 // ctx: { config, story, slot, pid, holderPid, sh, env?, fetch?, root?, locks, sleep, now, report,
-// beat?, halt, isHalted, event, rolledBackAt? }; the runner adds branch, testedBy and pass.
+// beat?, progress?, halt, isHalted, event, rolledBackAt? }; the runner adds branch, testedBy and
+// pass. progress(line) is told at least once a minute, from the first lock wait to the end,
+// what the release is waiting on ("still releasing <story>: <what> (<n> min)"): a wait goes
+// through ctx.sleep, which the runner wraps for the run, and a 60 s timer covers a step that
+// waits some other way. The last line `foreman ship` prints is still the JSON.
+//
+// interrupts(stopped): called once, before the lock wait, with a function the caller runs when a
+// signal ends the process (SIGTERM, SIGINT, SIGHUP); it returns the function that takes that
+// back, called when the run ends. stopped(signal) is synchronous and gives { code: 1, result }
+// with stage `interrupted`, the `step` it stopped at ('waiting' for the lock wait), `signal` and
+// `lockReleased`. It releases the ship lock only when this run holds it and nothing may be live
+// (no point of no return, deploy or noRollback step passed or running); past that the lock stays
+// as the record start-up recovery reads, and while waiting another release's lock is never
+// touched. It never writes HALT, and no later step starts after it. Once a signal has been
+// answered, runShip returns that same answer whatever the running step returns, and a kept lock
+// is never released on the way out.
 // rolledBackAt is the time the pack says the story's last release was rolled back, or null; the
 // pr step opens a new pull request instead of reusing one merged before it. sh(cmd, args,
 // { env, cwd }?) runs a command; env is the environment it runs with (the project's env file
@@ -198,9 +213,14 @@ async function rollBack(ctx, onFailure, result, report) {
 // live. Nor does it run once a step marked `noRollback` has started (a later stage that
 // people share): that failure halts, with a reason that starts "Not rolled back".
 // Returns { code, result }; the caller prints and exits.
-export async function runShip({ steps, ctx, onFailure = null }) {
+export async function runShip({ steps, ctx, onFailure = null, interrupts = null }) {
   const { remote, baseBranch, branchPrefix } = ctx.config;
-  const report = (detail) => quiet(() => ctx.report(detail));
+  // What the release is doing now: the progress lines name it.
+  let label = WAITING;
+  const report = (detail) => {
+    label = detail;
+    quiet(() => ctx.report(detail));
+  };
   const frozen = { stage: 'start', reason: 'Releases are frozen by a halt.' };
 
   if (ctx.isHalted()) return { code: 8, result: frozen };
@@ -219,80 +239,157 @@ export async function runShip({ steps, ctx, onFailure = null }) {
   ctx.branch = branch;
   ctx.testedBy = steps.find((s) => s.testsMergedCode === true)?.name ?? null;
 
-  if (!(await waitForShipLock(ctx, report))) return { code: 8, result: frozen };
+  // What an interrupt reads: where the release is, and whether anything may be live.
+  let facts = {};
+  let pastNoReturn = false;
+  let deployed = false;
+  let noRollbackFrom = null;
+  let current = null;
+  let holding = false;
+  // The answer given to a signal. The caller exits right after, but a step that was blocked in a
+  // command when the signal came may return first: no further step starts once this is set.
+  let interruption = null;
+  // Set when a signal kept the ship lock (it holds it and something may be live): never released after.
+  let keptLock = false;
 
-  const timer = ctx.beat ? setInterval(() => quiet(ctx.beat), 60_000) : null;
-  timer?.unref?.();
-  try {
-    if (!(await fetchBase(ctx))) {
-      return { code: 1, result: { stage: 'start', reason: `git fetch ${remote} ${baseBranch} failed three times.` } };
-    }
-    if (out(ctx, 'git', ['rev-list', '--count', `${remote}/${baseBranch}..HEAD`]) === '0') {
-      return { code: 1, result: { stage: 'start', reason: `The branch has no commits ahead of ${baseBranch}.` } };
-    }
-
-    let moves = 0;
-    pass: for (;;) {
-      const facts = {};
-      ctx.pass = moves + 1;
-      let pastNoReturn = false;
-      let deployed = false;
-      let noRollbackFrom = null;
-      for (const step of steps) {
-        quiet(() => ctx.locks.setStage('ship', ctx.pid, step.name));
-        report(labelOf(step, ctx));
-        if (step.noRollback === true && !noRollbackFrom) noRollbackFrom = step.name;
-        let r;
-        try {
-          r = await step.run(ctx);
-        } catch (err) {
-          r = { ok: false, code: 1, stage: step.name, reason: `${step.name} failed: ${err?.message ?? err}` };
-        }
-        let { ok, code, stage, reason, noReturn, parked, again, ...rest } = r ?? { ok: false, code: 1, reason: `${step.name} returned nothing.` };
-        for (const [key, value] of Object.entries(rest)) {
-          if (RESERVED.has(key)) continue;
-          facts[key] = value;
-          ctx[key] = value;
-        }
-        if (ok && parked !== undefined) {
-          if (validPark(parked)) {
-            return { code: 9, result: { ...facts, stage: 'parked', story: ctx.story, step: step.name, parked: { reason: parked.reason, check: parked.check } } };
-          }
-          ok = false;
-          code = 1;
-          stage = step.name;
-          reason = `${step.name} parked the release without a reason and a check that can be stored.`;
-        }
-        if (ok) {
-          if (step.pointOfNoReturn || noReturn === true) pastNoReturn = true;
-          if (step.deploys) deployed = true;
-          continue;
-        }
-        // The base moved under the release before anything live changed: bring it in again.
-        if (again === true && !pastNoReturn && !deployed && !noRollbackFrom) {
-          if (moves < BASE_MOVES) {
-            moves += 1;
-            for (const key of Object.keys(facts)) delete ctx[key];
-            quiet(() => ctx.event(`${baseBranch} moved while ${ctx.story} was releasing; bringing it in again (${moves} of ${BASE_MOVES}).`, 'info'));
-            report(`${baseBranch} moved; bringing it in again`);
-            continue pass;
-          }
-          reason = `${baseBranch} kept moving: brought it in ${BASE_MOVES} times during this release. ${reason ?? `${step.name} failed.`}`;
-        }
-        // Past a point of no return the release must be finished by hand, whatever went wrong.
-        const failCode = pastNoReturn ? 5 : Number.isInteger(code) && code > 0 ? code : 1;
-        const result = { ...facts, stage: stage ?? step.name, reason: reason === undefined || reason === null ? `${step.name} failed.` : reasonOf(reason, stage ?? step.name) };
-        if (deployed && onFailure && noRollbackFrom) {
-          result.reason = `Not rolled back: Foreman never rolls back once ${noRollbackFrom} has started; put it right by hand. ${result.reason}`;
-        }
-        if (deployed && onFailure && !noRollbackFrom) await rollBack(ctx, onFailure, result, report);
-        else if (step.halts || pastNoReturn || noRollbackFrom || HALT_CODES.has(failCode)) writeHalt(ctx, result);
-        return { code: failCode, result };
+  // A signal from outside (a time limit, the owner): says where the release stopped. The ship lock
+  // is released only when this release holds it and nothing may be live; otherwise it stays, as
+  // the record start-up recovery reads. Never writes HALT.
+  const stopped = (signal) => {
+    const live = !!(pastNoReturn || deployed || noRollbackFrom || current?.pointOfNoReturn || current?.mayMarkNoReturn || current?.deploys || current?.noRollback);
+    const at = current?.name ?? 'waiting';
+    let lockReleased = false;
+    let reason;
+    if (!holding) {
+      reason = `The release was stopped (${signal}) while waiting for the ship lock; nothing was done.`;
+    } else if (!live) {
+      try {
+        lockReleased = ctx.locks.release('ship', ctx.pid) === true;
+      } catch {
+        lockReleased = false;
       }
-      return { code: 0, result: { stage: 'shipped', story: ctx.story, ...facts } };
+      reason = `The release was stopped (${signal}) at ${at}, before anything went live; the ship lock is released.`;
+      quiet(() => ctx.event(`${ctx.story} release stopped (${signal}) at ${at}; the ship lock is released.`, 'info'));
+    } else {
+      keptLock = true;
+      reason = `The release was stopped (${signal}) at ${at}, after it may have changed something live; the ship lock is kept as the record of where it stopped.`;
+      quiet(() => ctx.event(`${ctx.story} release stopped (${signal}) at ${at}, after it may have changed something live; the ship lock is kept.`, 'warn'));
+    }
+    interruption = { code: 1, result: { ...facts, stage: 'interrupted', step: at, story: ctx.story, signal, lockReleased, reason } };
+    return interruption;
+  };
+
+  // A line at least once a minute while the release waits, from the sleeps every wait goes
+  // through and from a timer for a step that waits some other way.
+  const startedAt = ctx.now().getTime();
+  let last = startedAt;
+  const tick = () => {
+    const now = ctx.now().getTime();
+    if (now - last < 60_000) return;
+    last = now;
+    if (typeof ctx.progress === 'function') quiet(() => ctx.progress(`still releasing ${ctx.story}: ${label} (${Math.floor((now - startedAt) / 60_000)} min)`));
+  };
+  const original = ctx.sleep;
+  ctx.sleep = async (ms) => {
+    await original(ms);
+    tick();
+  };
+  const timer =
+    ctx.beat || ctx.progress
+      ? setInterval(() => {
+          if (ctx.beat) quiet(ctx.beat);
+          tick();
+        }, 60_000)
+      : null;
+  timer?.unref?.();
+  const off = interrupts?.(stopped);
+
+  try {
+    if (!(await waitForShipLock(ctx, report))) return { code: 8, result: frozen };
+    holding = true;
+
+    try {
+      if (interruption) return interruption;
+      if (!(await fetchBase(ctx))) {
+        return { code: 1, result: { stage: 'start', reason: `git fetch ${remote} ${baseBranch} failed three times.` } };
+      }
+      if (out(ctx, 'git', ['rev-list', '--count', `${remote}/${baseBranch}..HEAD`]) === '0') {
+        return { code: 1, result: { stage: 'start', reason: `The branch has no commits ahead of ${baseBranch}.` } };
+      }
+
+      let moves = 0;
+      pass: for (;;) {
+        facts = {};
+        ctx.pass = moves + 1;
+        pastNoReturn = false;
+        deployed = false;
+        noRollbackFrom = null;
+        for (const step of steps) {
+          if (interruption) return interruption;
+          quiet(() => ctx.locks.setStage('ship', ctx.pid, step.name));
+          report(labelOf(step, ctx));
+          if (step.noRollback === true && !noRollbackFrom) noRollbackFrom = step.name;
+          let r;
+          current = step;
+          try {
+            r = await step.run(ctx);
+          } catch (err) {
+            r = { ok: false, code: 1, stage: step.name, reason: `${step.name} failed: ${err?.message ?? err}` };
+          }
+          current = null;
+          if (interruption) return interruption;
+          let { ok, code, stage, reason, noReturn, parked, again, ...rest } = r ?? { ok: false, code: 1, reason: `${step.name} returned nothing.` };
+          for (const [key, value] of Object.entries(rest)) {
+            if (RESERVED.has(key)) continue;
+            facts[key] = value;
+            ctx[key] = value;
+          }
+          if (ok && parked !== undefined) {
+            if (validPark(parked)) {
+              return { code: 9, result: { ...facts, stage: 'parked', story: ctx.story, step: step.name, parked: { reason: parked.reason, check: parked.check } } };
+            }
+            ok = false;
+            code = 1;
+            stage = step.name;
+            reason = `${step.name} parked the release without a reason and a check that can be stored.`;
+          }
+          if (ok) {
+            if (step.pointOfNoReturn || noReturn === true) pastNoReturn = true;
+            if (step.deploys) deployed = true;
+            continue;
+          }
+          // The base moved under the release before anything live changed: bring it in again.
+          if (again === true && !pastNoReturn && !deployed && !noRollbackFrom) {
+            if (moves < BASE_MOVES) {
+              moves += 1;
+              for (const key of Object.keys(facts)) delete ctx[key];
+              quiet(() => ctx.event(`${baseBranch} moved while ${ctx.story} was releasing; bringing it in again (${moves} of ${BASE_MOVES}).`, 'info'));
+              report(`${baseBranch} moved; bringing it in again`);
+              continue pass;
+            }
+            reason = `${baseBranch} kept moving: brought it in ${BASE_MOVES} times during this release. ${reason ?? `${step.name} failed.`}`;
+          }
+          // Past a point of no return the release must be finished by hand, whatever went wrong.
+          const failCode = pastNoReturn ? 5 : Number.isInteger(code) && code > 0 ? code : 1;
+          const result = { ...facts, stage: stage ?? step.name, reason: reason === undefined || reason === null ? `${step.name} failed.` : reasonOf(reason, stage ?? step.name) };
+          if (deployed && onFailure && noRollbackFrom) {
+            result.reason = `Not rolled back: Foreman never rolls back once ${noRollbackFrom} has started; put it right by hand. ${result.reason}`;
+          }
+          if (deployed && onFailure && !noRollbackFrom) {
+            current = onFailure;
+            await rollBack(ctx, onFailure, result, report);
+            current = null;
+          } else if (step.halts || pastNoReturn || noRollbackFrom || HALT_CODES.has(failCode)) writeHalt(ctx, result);
+          return { code: failCode, result };
+        }
+        return { code: 0, result: { stage: 'shipped', story: ctx.story, ...facts } };
+      }
+    } finally {
+      if (!keptLock) quiet(() => ctx.locks.release('ship', ctx.pid));
     }
   } finally {
     if (timer) clearInterval(timer);
-    quiet(() => ctx.locks.release('ship', ctx.pid));
+    ctx.sleep = original;
+    off?.();
   }
 }

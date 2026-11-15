@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { API, SUCCESSFUL, TOKEN_VAR, deploymentOfPr, environmentFor, gearsetDeployments, gearsetEnvironments, gearsetPipelines, gearsetToken, matchEnvironments, promotionBranch, statusContext } from './gearset.mjs';
+import { API, MAX_NUDGES, MAX_RATE_LIMIT_WAIT_MS, MIN_RATE_LIMIT_WAIT_MS, NUDGE_MINUTES, RATE_LIMIT_WAIT_MS, SUCCESSFUL, TOKEN_VAR, deploymentOfPr, environmentFor, gearsetDeployments, gearsetEnvironments, gearsetPipelines, gearsetToken, matchEnvironments, noStatusReason, promotionBranch, releaseEnvironments, statusContext, waitOutRateLimit } from './gearset.mjs';
 import { layout } from './config.mjs';
 import { ACME_QA_ID, ACME_UAT_ID } from '../../../test/fake-sf.mjs';
 import {
@@ -37,6 +37,16 @@ describe('gearset helpers', () => {
   it('names the promotion branch and the status context', () => {
     expect(promotionBranch('story/fm-1', 'qa')).toBe('gs-pipeline/story/fm-1_-_qa');
     expect(statusContext('QA')).toBe('Gearset QA');
+  });
+
+  it('names both causes of a validation that posted no status', () => {
+    const one = noStatusReason('Gearset QA', 7, 1);
+    expect(one).toContain('Gearset QA posted no status on pull request #7 within 1 minute.');
+    expect(one).not.toContain('1 minutes');
+    expect(one).toContain('Gearset pipeline');
+    expect(one).toContain('webhook');
+    expect(one).toContain('foreman doctor');
+    expect(noStatusReason('Gearset QA', 7, 30)).toContain('within 30 minutes');
   });
 });
 
@@ -444,5 +454,220 @@ describe('deploymentOfPr', () => {
   it('ignores the branch when none is given', () => {
     const d = dep({ pullRequests: [{ number: 2, environmentBranch: 'other' }] });
     expect(deploymentOfPr([d], { environmentId: 'env-qa', prNumber: 2 })).toEqual({ state: 'deployed', deployment: d });
+  });
+});
+
+describe('a rate limit carries the time Gearset names', () => {
+  const limited = (headers) => fakeGearset(acmeGearset({ [PIPELINES]: { status: 429, body: {}, ...(headers ? { headers } : {}) } }));
+
+  it('reads Retry-After in seconds', async () => {
+    const r = await gearsetPipelines({ fetch: limited({ 'Retry-After': '2' }), token: TOKEN });
+    expect(r).toEqual({ ok: false, error: 'Gearset rate-limited the request; try again later', transient: true, status: 429, retryAfterMs: 2000 });
+  });
+
+  it('reads Retry-After as an HTTP date', async () => {
+    const at = new Date(Date.now() + 120_000).toUTCString();
+    const r = await gearsetPipelines({ fetch: limited({ 'retry-after': at }), token: TOKEN });
+    expect(r.retryAfterMs).toBeGreaterThanOrEqual(115_000);
+    expect(r.retryAfterMs).toBeLessThanOrEqual(120_000);
+  });
+
+  it('reads a date in the past as no wait', async () => {
+    const r = await gearsetPipelines({ fetch: limited({ 'Retry-After': new Date(Date.now() - 60_000).toUTCString() }), token: TOKEN });
+    expect(r.retryAfterMs).toBe(0);
+  });
+
+  it.each([[undefined], [{ 'Retry-After': 'soon' }], [{ 'Retry-After': '-5' }], [{ 'Retry-After': '' }]])('adds no retryAfterMs without a readable header (%#)', async (headers) => {
+    const r = await gearsetPipelines({ fetch: limited(headers), token: TOKEN });
+    expect(r).toEqual({ ok: false, error: 'Gearset rate-limited the request; try again later', transient: true, status: 429 });
+    expect(Object.hasOwn(r, 'retryAfterMs')).toBe(false);
+  });
+
+  it.each([['99999999999999999999999'], ['10000000000000'], ['9'.repeat(400)]])('caps a huge Retry-After at a day (%#)', async (value) => {
+    const r = await gearsetPipelines({ fetch: limited({ 'Retry-After': value }), token: TOKEN });
+    expect(r).toEqual({ ok: false, error: 'Gearset rate-limited the request; try again later', transient: true, status: 429, retryAfterMs: MAX_RATE_LIMIT_WAIT_MS });
+  });
+
+  it('caps an HTTP date at the far edge', async () => {
+    const r = await gearsetPipelines({ fetch: limited({ 'Retry-After': new Date(8.64e15).toUTCString() }), token: TOKEN });
+    expect(r.retryAfterMs).toBe(MAX_RATE_LIMIT_WAIT_MS);
+  });
+
+  it('keeps a value just under the cap', async () => {
+    const r = await gearsetPipelines({ fetch: limited({ 'Retry-After': '86399' }), token: TOKEN });
+    expect(r.retryAfterMs).toBe(86_399_000);
+  });
+
+  it('adds none to an answer that is not a rate limit', async () => {
+    const fetch = fakeGearset(acmeGearset({ [PIPELINES]: { status: 500, body: {}, headers: { 'Retry-After': '2' } } }));
+    expect(await gearsetPipelines({ fetch, token: TOKEN })).toEqual({ ok: false, error: 'Gearset answered 500', transient: false, status: 500 });
+  });
+
+  it('gearsetEnvironments passes it through when the environments call answers it', async () => {
+    const fetch = fakeGearset(acmeGearset({ [environmentsOf('pipe-1')]: { status: 429, body: {}, headers: { 'Retry-After': '7' } } }));
+    expect(await gearsetEnvironments({ fetch, token: TOKEN })).toMatchObject({ ok: false, status: 429, transient: true, retryAfterMs: 7000 });
+  });
+
+  it('gearsetDeployments passes it through from the POST', async () => {
+    const fetch = fakeGearset({ [DEPLOYMENTS]: { status: 429, body: {}, headers: { 'Retry-After': '600' } } });
+    const r = await gearsetDeployments({ fetch, token: TOKEN, pipelineId: 'pipe-1', environmentId: 'env-qa', from: '2026-10-15T12:00:00Z', to: '2026-10-15T13:00:00Z', sleep: async () => {} });
+    expect(r).toMatchObject({ ok: false, status: 429, retryAfterMs: 600_000 });
+  });
+});
+
+describe('waitOutRateLimit', () => {
+  const START = Date.UTC(2026, 9, 15, 12, 0, 0);
+  const iso = (ms) => new Date(ms).toISOString();
+  const limit = (retryAfterMs) => ({ ok: false, error: 'Gearset rate-limited the request; try again later', transient: true, status: 429, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) });
+  const clock = () => {
+    let t = START;
+    const sleeps = [];
+    return { sleeps, now: () => new Date(t), sleep: async (ms) => { sleeps.push(ms); t += ms; } };
+  };
+  const answers = (...list) => {
+    let i = 0;
+    return async () => list[Math.min(i++, list.length - 1)];
+  };
+
+  it('has the default and minimum waits', () => {
+    expect(RATE_LIMIT_WAIT_MS).toBe(60_000);
+    expect(MIN_RATE_LIMIT_WAIT_MS).toBe(1_000);
+  });
+
+  it('caps every wait at a day', () => {
+    expect(MAX_RATE_LIMIT_WAIT_MS).toBe(86_400_000);
+  });
+
+  it('(g) answers rateLimited with a day from now, without throwing, for a huge wait', async () => {
+    const c = clock();
+    const r = await waitOutRateLimit(answers(limit(1e26)), { ...c, deadline: START + 120_000, told: () => {} });
+    expect(r).toEqual({ ...limit(1e26), rateLimited: true, retryAt: iso(START + MAX_RATE_LIMIT_WAIT_MS) });
+    expect(c.sleeps).toEqual([]);
+  });
+
+  it('(h) waits a day at most for a huge wait', async () => {
+    const c = clock();
+    const told = [];
+    const r = await waitOutRateLimit(answers(limit(1e26), { ok: true }), { ...c, deadline: START + 2 * MAX_RATE_LIMIT_WAIT_MS, told: (...args) => told.push(args) });
+    expect(r).toEqual({ ok: true });
+    expect(c.sleeps).toEqual([MAX_RATE_LIMIT_WAIT_MS]);
+    expect(told).toEqual([[86_400, iso(START + MAX_RATE_LIMIT_WAIT_MS)]]);
+  });
+
+  it('(a) waits the named time once, says so, and answers the next read', async () => {
+    const c = clock();
+    const told = [];
+    const done = { ok: true, environments: [] };
+    const r = await waitOutRateLimit(answers(limit(2000), done), { ...c, deadline: START + 60_000, told: (...args) => told.push(args) });
+    expect(r).toBe(done);
+    expect(c.sleeps).toEqual([2000]);
+    expect(told).toEqual([[2, iso(START + 2000)]]);
+  });
+
+  it('(b) answers rateLimited with the time, and does not sleep, when the wait passes the deadline', async () => {
+    const c = clock();
+    const r = await waitOutRateLimit(answers(limit(675_000)), { ...c, deadline: START + 120_000, told: () => {} });
+    expect(r).toEqual({ ...limit(675_000), rateLimited: true, retryAt: iso(START + 675_000) });
+    expect(c.sleeps).toEqual([]);
+  });
+
+  it('(c) waits a minute when Gearset names no time', async () => {
+    const c = clock();
+    await waitOutRateLimit(answers(limit(), { ok: true }), { ...c, deadline: START + 600_000, told: () => {} });
+    expect(c.sleeps).toEqual([60_000]);
+  });
+
+  it('(d) waits at least a second, and a repeated 0 ends at the deadline', async () => {
+    const c = clock();
+    const r = await waitOutRateLimit(answers(limit(0), { ok: true }), { ...c, deadline: START + 600_000, told: () => {} });
+    expect(r).toEqual({ ok: true });
+    expect(c.sleeps).toEqual([1000]);
+
+    const again = clock();
+    const stuck = await waitOutRateLimit(answers(limit(0)), { ...again, deadline: START + 5_000, told: () => {} });
+    expect(stuck).toMatchObject({ ok: false, status: 429, rateLimited: true });
+    expect(again.sleeps).toEqual([1000, 1000, 1000, 1000, 1000]);
+  });
+
+  it('(e) returns any other failure at once', async () => {
+    const c = clock();
+    const refused = { ok: false, error: 'Gearset refused GEARSET_API_TOKEN', transient: false, status: 401 };
+    expect(await waitOutRateLimit(answers(refused), { ...c, deadline: START + 60_000, told: () => {} })).toBe(refused);
+    expect(c.sleeps).toEqual([]);
+  });
+
+  it('(f) keeps waiting when told throws', async () => {
+    const c = clock();
+    const r = await waitOutRateLimit(answers(limit(2000), { ok: true }), { ...c, deadline: START + 60_000, told: () => { throw new Error('no'); } });
+    expect(r).toEqual({ ok: true });
+    expect(c.sleeps).toEqual([2000]);
+  });
+});
+
+describe('releaseEnvironments', () => {
+  const pipelineCalls = (fetch) => fetch.calls.filter((c) => c.path === PIPELINES).length;
+  const environmentCalls = (fetch) => fetch.calls.filter((c) => c.path.startsWith('/public/reporting/environments')).length;
+
+  it('reads once for one ctx, fetch and token', async () => {
+    const fetch = fakeGearset();
+    const ctx = {};
+    const first = await releaseEnvironments(ctx, { fetch, token: TOKEN });
+    const second = await releaseEnvironments(ctx, { fetch, token: TOKEN });
+    expect(first.ok).toBe(true);
+    expect(second).toEqual(first);
+    expect(pipelineCalls(fetch)).toBe(1);
+    expect(environmentCalls(fetch)).toBe(1);
+  });
+
+  it('keeps one answer per pipelineId', async () => {
+    const fetch = fakeGearset(acmeTwoPipelines());
+    const ctx = {};
+    await releaseEnvironments(ctx, { fetch, token: TOKEN, pipelineId: 'pipe-1' });
+    await releaseEnvironments(ctx, { fetch, token: TOKEN });
+    await releaseEnvironments(ctx, { fetch, token: TOKEN, pipelineId: 'pipe-1' });
+    await releaseEnvironments(ctx, { fetch, token: TOKEN });
+    expect(pipelineCalls(fetch)).toBe(2);
+  });
+
+  it('reads again for a different ctx', async () => {
+    const fetch = fakeGearset();
+    await releaseEnvironments({}, { fetch, token: TOKEN });
+    await releaseEnvironments({}, { fetch, token: TOKEN });
+    expect(environmentCalls(fetch)).toBe(2);
+  });
+
+  it('reads again for a different token or fetch', async () => {
+    const fetch = fakeGearset();
+    const ctx = {};
+    await releaseEnvironments(ctx, { fetch, token: TOKEN });
+    await releaseEnvironments(ctx, { fetch, token: 't-other' });
+    expect(environmentCalls(fetch)).toBe(2);
+    const other = fakeGearset();
+    await releaseEnvironments(ctx, { fetch: other, token: 't-other' });
+    expect(environmentCalls(other)).toBe(1);
+  });
+
+  it('does not keep a failed read', async () => {
+    let status = 500;
+    const fetch = fakeGearset(acmeGearset({ [PIPELINES]: () => (status === 500 ? { status, body: {} } : { status: 200, body: [{ PipelineId: 'pipe-1' }] }) }));
+    const ctx = {};
+    expect(await releaseEnvironments(ctx, { fetch, token: TOKEN })).toMatchObject({ ok: false, status: 500 });
+    status = 200;
+    expect((await releaseEnvironments(ctx, { fetch, token: TOKEN })).ok).toBe(true);
+    expect(pipelineCalls(fetch)).toBe(2);
+  });
+
+  it('reads directly, never throwing, when ctx is not an object', async () => {
+    const fetch = fakeGearset();
+    expect((await releaseEnvironments(null, { fetch, token: TOKEN })).ok).toBe(true);
+    expect((await releaseEnvironments(undefined, { fetch, token: TOKEN })).ok).toBe(true);
+    expect(environmentCalls(fetch)).toBe(2);
+  });
+});
+
+describe('the nudge limits', () => {
+  it('waits 5 minutes for a status, and nudges at most twice', () => {
+    expect(NUDGE_MINUTES).toBe(5);
+    expect(MAX_NUDGES).toBe(2);
   });
 });

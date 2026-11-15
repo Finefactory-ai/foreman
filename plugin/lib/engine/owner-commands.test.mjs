@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ownerCommands } from './owner-commands.mjs';
 import { trackedRun, useSupervisors } from '../../../test/supervisors.mjs';
+import { supervisorSource } from '../../../test/supervisor-source.mjs';
 
 const made = [];
 afterEach(() => {
@@ -253,7 +254,7 @@ describe('settled', () => {
 });
 
 describe('the supervisor', () => {
-  const src = readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+  const src = supervisorSource();
   const body = (sig) => {
     const start = src.indexOf(sig);
     expect(start, sig).toBeGreaterThan(-1);

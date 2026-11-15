@@ -8,9 +8,12 @@
 // Pure apart from the `fs` it is given (default node:fs); nothing here throws.
 //
 //   FIX_HINT         what to do about it: guard the user's alias or function with FOREMAN_RUN
-//   overrideText({ found, expected })
+//   updateHint(id)   what to do when `foreman` is an installed plugin copy: update it with
+//                    `claude plugin update <id>`
+//   overrideText({ found, expected, foundVersion, expectedVersion })
 //                    the sentence: `foreman` in story sessions runs <found>, not the plugin's CLI
-//                    at <expected>
+//                    at <expected>; a version given (a non-empty string) is added as
+//                    ` (Foreman <version>)` after its path
 //   readType({ status, stdout, stderr }, { env })
 //                    reads the answer of `<shell> -ic 'type foreman'`: { kind: 'alias' },
 //                    { kind: 'function' }, { kind: 'file', path }, { kind: 'missing' },
@@ -20,31 +23,43 @@
 //                    a secret. The failed reason is the first stderr line, with secrets blanked
 //                    (the values of the named secrets in `env`, then anything that looks like
 //                    one), cut to 120 characters.
-//   selfCheck({ env, self, fs, now })
+//   selfCheck({ env, self, fs, now, home })
 //                    the CLI's own check, run first in every `foreman` call of a story session
 //                    (FOREMAN_RUN=1). `self` is the plugin folder the CLI runs from, and
 //                    FOREMAN_PLUGIN_ROOT the one the supervisor gave the session. When they are
 //                    two places, it adds one warn event on the slot (state.mjs addEvent) and
 //                    returns its text, once per session: the marker
 //                    <stateDir>/slots/<slot>/plugin-check holds the supervisor, story and folder
-//                    it last warned about. It does nothing, and returns null, when a variable it
+//                    it last warned about. The text names both copies' versions (from their
+//                    .claude-plugin/plugin.json) and, after the supervisor's, its commit
+//                    (FOREMAN_PLUGIN_LABEL, left out when it only repeats the version). It does nothing, and returns null, when a variable it
 //                    needs is missing, when the state folder is not there (it never creates it),
 //                    when `self` is inside FOREMAN_PROJECT_DIR (Foreman building its own repo runs
 //                    its worktree's plugin on purpose), when FOREMAN_SLOT is not a plain name
 //                    (letters, digits, `_` or `-`), so the marker cannot land outside
 //                    <stateDir>/slots, or on any error. It writes nothing outside
-//                    the state folder.
+//                    the state folder. The text ends with FIX_HINT, except when `self` is an
+//                    installed copy listed in <CLAUDE_CONFIG_DIR or home/.claude>/plugins/
+//                    installed_plugins.json (user scope, or project scope under
+//                    FOREMAN_PROJECT_DIR; it reads only that file): then it ends with
+//                    updateHint(<its id>), the same words as doctor. `home` stands in for the
+//                    home folder in tests.
 
 import nodeFs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { samePlace } from './plugin-copy.mjs';
+import { installedCopies, ownCopy, samePlace } from './plugin-copy.mjs';
 import { redact as redactNamed } from '../secrets/redact.mjs';
 import { addEvent, redact as redactLooksSecret } from './state.mjs';
 
 export const FIX_HINT = 'wrap it in `if [[ -z "$FOREMAN_RUN" ]]; then … fi` in your shell start-up file (such as ~/.zshrc), so story sessions run the plugin\'s own foreman';
 
-export function overrideText({ found, expected }) {
-  return `\`foreman\` in story sessions runs ${found}, not the plugin's CLI at ${expected}, so the run's steps use other code than its agents`;
+export const updateHint = (id) => `update it with \`claude plugin update ${id}\``;
+
+const versioned = (place, version) => (nonEmpty(version) ? `${place} (Foreman ${version})` : place);
+
+export function overrideText({ found, expected, foundVersion, expectedVersion }) {
+  return `\`foreman\` in story sessions runs ${versioned(found, foundVersion)}, not the plugin's CLI at ${versioned(expected, expectedVersion)}, so the run's steps use other code than its agents`;
 }
 
 const lines = (text) => (typeof text === 'string' ? text.split('\n') : []);
@@ -83,7 +98,7 @@ function inside(root, dir) {
   return !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
-export function selfCheck({ env, self, fs = nodeFs, now = new Date() } = {}) {
+export function selfCheck({ env, self, fs = nodeFs, now = new Date(), home = os.homedir() } = {}) {
   try {
     if (env?.FOREMAN_RUN !== '1') return null;
     const { FOREMAN_PLUGIN_ROOT: expected, FOREMAN_STATE_DIR: stateDir, FOREMAN_SLOT: slot } = env;
@@ -105,7 +120,14 @@ export function selfCheck({ env, self, fs = nodeFs, now = new Date() } = {}) {
     fs.mkdirSync(folder, { recursive: true });
     fs.writeFileSync(marker, key);
     const story = env.FOREMAN_STORY ? `${env.FOREMAN_STORY}: ` : '';
-    const text = `${story}${overrideText({ found: path.join(self, 'bin', 'foreman'), expected: path.join(path.resolve(expected), 'bin', 'foreman') })}; ${FIX_HINT}.`;
+    const foundVersion = ownCopy({ pluginDir: self, fs })?.version ?? null;
+    const v = ownCopy({ pluginDir: expected, fs })?.version ?? null;
+    const label = nonEmpty(env.FOREMAN_PLUGIN_LABEL) && env.FOREMAN_PLUGIN_LABEL !== `v${v}` ? env.FOREMAN_PLUGIN_LABEL : null;
+    const expectedVersion = v && label ? `${v} ${label}` : (v ?? label ?? null);
+    const pluginsDir = path.join(nonEmpty(env.CLAUDE_CONFIG_DIR) ? env.CLAUDE_CONFIG_DIR : path.join(home, '.claude'), 'plugins');
+    const copy = installedCopies({ pluginsDir, root: env.FOREMAN_PROJECT_DIR, fs }).find((c) => samePlace(c.path, self, { fs, home }));
+    const fix = copy ? updateHint(copy.id) : FIX_HINT;
+    const text = `${story}${overrideText({ found: path.join(self, 'bin', 'foreman'), expected: path.join(path.resolve(expected), 'bin', 'foreman'), foundVersion, expectedVersion })}; ${fix}.`;
     addEvent(stateDir, text, 'warn', now, slot);
     return text;
   } catch {

@@ -3,6 +3,24 @@
 What changed in each release of Foreman. Install a release with
 `/plugin marketplace add finefactory-ai/foreman#vX.Y.Z`, then `/plugin install foreman@foreman`.
 
+## 0.13.0 — 2026-11-15
+
+Foreman's agents now start on a sensible mix of models, with no setting needed. The architect, the tester and the security reviewer run on Opus, where a miss costs the most. The builder and the compliance reviewer run on Sonnet. Set a role's model in the settings, as before, and your choice wins.
+
+On the Gearset path, Foreman now validates a later stage's promotion pull request itself, because Gearset leaves that one pending until someone clicks. The Gearset path has now shipped stories to QA and UAT unattended.
+
+A Gearset rate limit no longer fails the story: the release waits the time Gearset names and tries again. The wait for Gearset now lasts its full 30 minutes instead of being cut short, notices a switched-off Gearset webhook, and posts a status when validation fails with an error.
+
+Gearset no longer refuses every pull request once the Salesforce skills are installed. Their sample project files, which were tracked in git, are left out.
+
+A follow-up story no longer loops blocked on a Salesforce project that stops before production.
+
+After `foreman fixed` and a shipped story, the halt's urgent task now closes instead of staying open and saying the release line is stopped.
+
+A story session now runs the same Foreman code as the supervisor that started it, so `foreman ship` no longer runs an older installed copy.
+
+When some stories are left in hand, Foreman now says how many a run will really ship.
+
 ## 0.12.0 — 2026-11-11
 
 The Salesforce pack is no longer a preview. Stories have now shipped through it unattended on live Salesforce sandboxes: through the `sf` path straight to a QA org, through the `ci` path to a QA org and then a UAT org, in scratch mode inside the runner container, and with an Agentforce agent published and tested in both QA and UAT. The Gearset path is built but still unproven: it has not run against a live Gearset pipeline.

@@ -3,9 +3,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { gearsetPromote } from './gearset-promote.mjs';
+import gearsetPr from './gearset-pr.mjs';
 import { runShip } from '../../../lib/engine/ship.mjs';
 import { fakeCtx } from '../../../../test/ship-fakes.mjs';
-import { ACME_DEV1_ID, ACME_QA_ID, ACME_UAT_ID, sfError, sfOk } from '../../../../test/fake-sf.mjs';
+import { ACME_DEV1_ID, ACME_QA_ID, ACME_UAT_ID, acmePlugins, orgRecord, orgRoute, sfError, sfOk, sfRaw } from '../../../../test/fake-sf.mjs';
 import {
   DEPLOYMENTS,
   PIPELINES,
@@ -17,6 +18,7 @@ import {
   deploymentsOf,
   environmentsOf,
   fakeGearset,
+  gearsetStatuses,
   operationStatusOf,
 } from '../../../../test/fake-gearset.mjs';
 
@@ -27,6 +29,7 @@ const PROMO = 'https://github.com/acme/app/pull/2';
 const PROMO_UAT = 'https://github.com/acme/app/pull/3';
 const MERGED_AT = '2026-10-15T12:00:30Z';
 const DEPLOY = '0Af000000000001AAA';
+const BASE = '0123456789abcdef0123456789abcdef01234567';
 
 const listOf = (head, base) => `gh pr list --head ${head} --base ${base} --state all --json number,url,state,headRefOid,mergedAt,isCrossRepository`;
 const QA_LIST = listOf('gs-pipeline/story/s-1_-_qa', 'qa');
@@ -55,6 +58,33 @@ const inTurn = (...answers) => {
   let i = 0;
   return () => answers[Math.min(i++, answers.length - 1)];
 };
+
+// package.xml or destructiveChanges.xml holding `types` ({ ApexClass: ['AcmeService'] }), as sgd writes it.
+const manifest = (types = {}) =>
+  [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<Package xmlns="http://soap.sforce.com/2006/04/metadata">',
+    ...Object.entries(types).map(([name, members]) => `  <types>\n${members.map((m) => `    <members>${m}</members>`).join('\n')}\n    <name>${name}</name>\n  </types>`),
+    '  <version>62.0</version>',
+    '</Package>',
+    '',
+  ].join('\n');
+
+// The `sf sgd source delta` fake: writes the two manifests into the --output-dir on the line.
+const sgd = ({ package: pkg, destructive }) => (line) => {
+  const words = line.split(' ');
+  const out = words[words.indexOf('--output-dir') + 1];
+  fs.mkdirSync(path.join(out, 'package'), { recursive: true });
+  fs.mkdirSync(path.join(out, 'destructiveChanges'), { recursive: true });
+  fs.writeFileSync(path.join(out, 'package', 'package.xml'), manifest(pkg ?? {}));
+  fs.writeFileSync(path.join(out, 'destructiveChanges', 'destructiveChanges.xml'), manifest(destructive ?? {}));
+  return sfOk({ error: null, 'output-dir': out, success: true });
+};
+const sgdRules = (pkg) => [
+  [/^sf plugins --core/, sfRaw(acmePlugins({ 'sfdx-git-delta': '6.45.1' }))],
+  [/^git merge-base /, `${BASE}\n`],
+  [/^sf sgd source delta /, sgd({ package: pkg })],
+];
 
 const block = () => ({
   productionBranch: 'main',
@@ -109,12 +139,12 @@ describe('gearsetPromote(stage)', () => {
     expect(gearsetPromote('uat')).not.toBe(gearsetPromote('qa'));
   });
 
-  it('is a gh and sf step that needs the Gearset token, halts, deploys and may pass the point of no return', () => {
+  it('is a gh, sf and git step that needs the Gearset token, halts, deploys and may pass the point of no return', () => {
     const qa = gearsetPromote('qa');
     expect(qa).toMatchObject({
       name: 'gearset-promote-qa',
       label: 'promoting to qa through Gearset',
-      needs: ['gh', 'sf'],
+      needs: ['gh', 'sf', 'git'],
       requires: { env: ['GEARSET_API_TOKEN'] },
       halts: true,
       deploys: true,
@@ -133,7 +163,7 @@ describe('merge mode', () => {
     expect(r).toEqual({
       ok: true,
       noReturn: true,
-      gearsetPromotions: { qa: { org: 'acme-qa', pr: PROMO, prNumber: 2, mergedAt: MERGED_AT, via: 'org', deployId: DEPLOY, testsCompleted: 12 } },
+      gearsetPromotions: { qa: { org: 'acme-qa', pr: PROMO, prNumber: 2, mergedAt: MERGED_AT, via: 'org', deployId: DEPLOY, testsCompleted: 12, validatedBy: 'gearset' } },
     });
     expect(merges(ctx)).toEqual([MERGE_QA]);
     for (const line of ctx.sh.calls) for (const flag of FORBIDDEN) expect(line).not.toContain(flag);
@@ -249,15 +279,20 @@ describe('merge mode', () => {
       expect(merges(ctx)).toEqual([]);
     });
 
-    it('fails with code 2 when the status never appears, or is still pending', async () => {
+    it('parks, with no nudge, when the status never appears before the deadline; fails with code 2 when it is still pending', async () => {
       const none = setup({ rules: [[QA_LIST, list(promo())], [statusOf(SHA), statuses(st('Gearset UAT', 'success'))]] });
       const r = await none.run();
-      expect(r).toMatchObject({ ok: false, code: 2 });
-      expect(r.reason).toContain('Gearset QA has not validated pull request #2 within 2 minutes');
+      expect(r).toMatchObject({ ok: true, parked: { check: { branch: 'story/s-1', mode: 'merge' } } });
+      expect(r.parked.reason).toContain('Run validation on pull request #2');
+      expect(r.noStatus).toBeUndefined();
+      expect(none.ctx.sleeps).toHaveLength(6);
+      expect(none.ctx.sh.calls.some((l) => l.startsWith('gh api -X'))).toBe(false);
+      expect(merges(none.ctx)).toEqual([]);
       const pending = setup({ rules: [[QA_LIST, list(promo())], [statusOf(SHA), statuses(st('Gearset QA', 'pending'))]] });
       const p = await pending.run();
       expect(p).toMatchObject({ ok: false, code: 2 });
       expect(p.reason).toContain('Gearset QA validation did not finish within 2 minutes on pull request #2');
+      expect(p.noStatus).toBeUndefined();
       expect(merges(pending.ctx)).toEqual([]);
     });
 
@@ -283,7 +318,7 @@ describe('merge mode', () => {
       expect(r).toEqual({
         ok: true,
         noReturn: true,
-        gearsetPromotions: { qa: { org: 'acme-qa', pr: PROMO, prNumber: 2, mergedAt: MERGED_AT, via: 'gearset', deployId: '0Af000000000009AAA', testsCompleted: null } },
+        gearsetPromotions: { qa: { org: 'acme-qa', pr: PROMO, prNumber: 2, mergedAt: MERGED_AT, via: 'gearset', deployId: '0Af000000000009AAA', testsCompleted: null, validatedBy: 'gearset' } },
       });
       const post = fetch.calls.find((c) => c.method === 'POST');
       expect(post.path).toBe(deploymentsOf({ from: '2026-10-15T11:55:30Z', to: '2026-10-15T12:00:00Z', pipelineId: 'pipe-1', environmentId: 'env-qa' }));
@@ -338,6 +373,95 @@ describe('merge mode', () => {
       const { ctx, run } = setup({ rules: qaMerges(inTurn(sfError('NoAuthInfoFound', 'No authorization information'), rows(deployRow()))), routes: acmeGearset(acmeDeployments([])) });
       expect(await run()).toMatchObject({ ok: true, gearsetPromotions: { qa: { via: 'org' } } });
       expect(ctx.sleeps).toContain(20_000);
+    });
+  });
+
+  describe('a Gearset rate limit', () => {
+    const limited = (seconds) => ({ status: 429, body: {}, headers: { 'Retry-After': String(seconds) } });
+    const START = Date.UTC(2026, 9, 15, 12, 0, 0);
+    const envs = acmeGearset()[environmentsOf('pipe-1')];
+
+    it('on the environments read waits the time Gearset names, says so, and merges as before', async () => {
+      const { ctx, run } = setup({ rules: qaMerges(), routes: acmeGearset({ [environmentsOf('pipe-1')]: inTurn(limited(2), envs) }) });
+      expect(await run()).toMatchObject({ ok: true, noReturn: true });
+      expect(ctx.sleeps[0]).toBe(2000);
+      expect(ctx.events.find((e) => e.kind === 'info').text).toMatch(/Gearset rate-limited gearset-promote-qa; waiting 2 seconds, as Gearset asked/);
+      expect(merges(ctx)).toEqual([MERGE_QA]);
+    });
+
+    it('on the environments read that would pass the step limit is code 1 with the time, and merges nothing', async () => {
+      const { ctx, run } = setup({ rules: qaMerges(), routes: acmeGearset({ [environmentsOf('pipe-1')]: limited(675) }) });
+      const retryAt = new Date(START + 675_000).toISOString();
+      const r = await run();
+      expect(r).toMatchObject({ ok: false, code: 1, stage: 'gearset-promote-qa', rateLimited: true, retryAt });
+      expect(r.reason).toBe(`Gearset rate-limited gearset-promote-qa until ${retryAt}, past the step's limit of 2 minutes; try the release again after ${retryAt}.`);
+      expect(merges(ctx)).toEqual([]);
+      expect(ghCalls(ctx)).toEqual([]);
+      expect(ctx.sleeps).toEqual([]);
+    });
+
+    it("on the deploys Gearset lists after the merge asks again only when Gearset says, and still ends with code 5", async () => {
+      const { ctx, fetch, run } = setup({
+        rules: qaMerges(rows()),
+        routes: acmeGearset({ [DEPLOYMENTS]: limited(600) }),
+        ship: { ci: { timeoutMinutes: 15 } },
+      });
+      const r = await run();
+      expect(r).toMatchObject({ ok: false, code: 5, stage: 'gearset-promote-qa', noReturn: true });
+      expect(r.reason).toContain('within 15 minutes of the merge');
+      const posts = fetch.calls.filter((c) => c.method === 'POST' && c.path.startsWith(DEPLOYMENTS));
+      expect(posts).toHaveLength(2);
+      expect(ctx.events.some((e) => e.kind === 'info' && /Gearset rate-limited gearset-promote-qa; asking it about the deploy again after /.test(e.text))).toBe(true);
+    });
+
+    it('a huge Retry-After on the environments read is capped at a day: code 1 with the time, and merges nothing', async () => {
+      const { ctx, run } = setup({ rules: qaMerges(), routes: acmeGearset({ [environmentsOf('pipe-1')]: limited('99999999999999999999999') }) });
+      expect(await run()).toMatchObject({ ok: false, code: 1, stage: 'gearset-promote-qa', rateLimited: true, retryAt: new Date(START + 86_400_000).toISOString() });
+      expect(merges(ctx)).toEqual([]);
+      expect(ghCalls(ctx)).toEqual([]);
+      expect(ctx.sleeps).toEqual([]);
+    });
+
+    it('a huge Retry-After on the deploys listed after the merge does not throw: code 5 with noReturn, and asks once', async () => {
+      const { ctx, fetch, run } = setup({
+        rules: qaMerges(rows()),
+        routes: acmeGearset({ [DEPLOYMENTS]: limited('99999999999999999999999') }),
+        ship: { ci: { timeoutMinutes: 10 } },
+      });
+      const r = await run();
+      expect(r).toMatchObject({ ok: false, code: 5, stage: 'gearset-promote-qa', noReturn: true });
+      expect(r.reason).toContain('within 10 minutes of the merge');
+      expect(r.reason).not.toContain('Invalid time value');
+      expect(fetch.calls.filter((c) => c.method === 'POST' && c.path.startsWith(DEPLOYMENTS))).toHaveLength(1);
+      expect(ctx.events.some((e) => e.kind === 'info' && /asking it about the deploy again after \d{4}-\d{2}-\d{2}T/.test(e.text))).toBe(true);
+    });
+
+    it('on the deploys Gearset lists with no time named keeps the 3 minute spacing and says nothing', async () => {
+      const { ctx, fetch, run } = setup({ rules: qaMerges(rows()), routes: acmeGearset({ [DEPLOYMENTS]: { status: 429, body: {} } }), ship: { ci: { timeoutMinutes: 10 } } });
+      expect(await run()).toMatchObject({ ok: false, code: 5 });
+      expect(fetch.calls.filter((c) => c.method === 'POST')).toHaveLength(4);
+      expect(ctx.events.filter((e) => e.kind === 'info')).toEqual([]);
+    });
+  });
+
+  describe('one release with two stages', () => {
+    it('reads the pipeline environments once for gearset-pr, gearset-promote-qa and gearset-promote-uat', async () => {
+      const { ctx, fetch } = setup({
+        rules: [
+          [/^gh pr list --head gs-pipeline\/story\/s-1_-_qa --base qa --state all --json number,url,state,headRefOid$/, list(promo())],
+          ...qaMerges(),
+          [UAT_LIST, inTurn(list(promoUat()), list(mergedUat()))],
+          [statusOf(SHA_UAT), UAT_OK],
+          [MERGE_UAT, ''],
+          [sfFor('acme-uat'), rows(deployRow({ CompletedDate: '2026-10-15T12:11:00.000+0000' }))],
+        ],
+      });
+      expect(await gearsetPr.run(ctx, { fetch, raiseStoryEvent: () => ({ ok: true }) })).toMatchObject({ ok: true, prNumber: 2 });
+      expect(await gearsetPromote('qa').run(ctx, { fetch })).toMatchObject({ ok: true, noReturn: true });
+      expect(await gearsetPromote('uat').run(ctx, { fetch })).toMatchObject({ ok: true, noReturn: true });
+      expect(fetch.calls.filter((c) => c.path.startsWith('/public/reporting/environments'))).toHaveLength(1);
+      expect(fetch.calls.filter((c) => c.path === PIPELINES)).toHaveLength(1);
+      expect(merges(ctx)).toEqual([MERGE_QA, MERGE_UAT]);
     });
   });
 
@@ -398,6 +522,654 @@ describe('merge mode', () => {
     expect(ctx.config.salesforce.gearset).toEqual({ promote: 'merge' });
     expect(await run()).toMatchObject({ ok: true, noReturn: true });
     expect(merges(ctx)).toEqual([MERGE_QA]);
+  });
+});
+
+describe('a promotion PR Gearset never validates', () => {
+  const OLD_SHA = 'b2c3d4e5f60718293a4b5c6d7e8f9012345678a1';
+  const NEW_SHA = 'd4e5f60718293a4b5c6d7e8f9012345678a1b2c3';
+  const TREE = 'e5f60718293a4b5c6d7e8f9012345678a1b2c3d4';
+  const HEAD_UAT = 'gs-pipeline/story/s-1_-_uat';
+  const COMMITS = 'gh api repos/{owner}/{repo}/pulls/3/commits';
+  const CREATE = 'gh api -X POST repos/{owner}/{repo}/git/commits';
+  const PATCH = `gh api -X PATCH repos/{owner}/{repo}/git/refs/heads/${HEAD_UAT}`;
+  const START = Date.UTC(2026, 9, 15, 12, 0, 0);
+  const NUDGING = { promote: 'merge', nudgeMinutes: 1, validateLaterStages: 'gearset' };
+  // Gearset makes a validation job for each pull request; its id is in the target_url of the
+  // status an earlier commit of that PR carries. It is not the environment's CI job id (job-uat).
+  const JOB_URL = 'https://app.gearset.com/continuous-integration-runs?jobId=job-val-3';
+  const REASON = 'Gearset has not started validating pull request #3 for uat. In Gearset, open the pipeline, select the UAT environment and press Run validation on pull request #3; Foreman merges it when Gearset UAT passes, and the release finishes when Gearset has deployed it.';
+  const UAT_STAGE = { name: 'uat', org: 'acme-uat', orgId: ACME_UAT_ID, branch: 'uat' };
+  const deployed = [sfFor('acme-uat'), rows(deployRow({ CompletedDate: '2026-10-15T12:11:00.000+0000' }))];
+  const patches = (ctx) => ctx.sh.calls.filter((l) => l.startsWith('gh api -X PATCH'));
+  const automation = (fetch) => fetch.calls.filter((c) => c.path.startsWith('/public/automation/'));
+
+  // The calls that push an empty commit, with the time each PATCH was made.
+  const pushRules = (holder, { patch = '', at = [] } = {}) => [
+    [`gh api repos/{owner}/{repo}/git/commits/${SHA_UAT}`, `${TREE}\n`],
+    [CREATE, `${NEW_SHA}\n`],
+    [PATCH, () => { at.push(holder.ctx.now().getTime()); return patch; }],
+  ];
+  const nudging = (opts = {}) => {
+    const holder = {};
+    const s = setup({ gearset: NUDGING, ship: { ci: { timeoutMinutes: 30 } }, ...opts, rules: opts.rules ? opts.rules(holder) : [] });
+    holder.ctx = s.ctx;
+    return s;
+  };
+  const never = (holder, over = {}) => [[UAT_LIST, list(promoUat())], [statusOf(SHA_UAT), statuses(st('Gearset QA', 'success'))], ...pushRules(holder, over)];
+
+  it('nudges once with an empty commit after the delay, and merges the new head once its status arrives', async () => {
+    const at = [];
+    const { ctx, fetch, run } = nudging({
+      rules: (holder) => [
+        [UAT_LIST, inTurn(list(promoUat()), list(promoUat()), list(promoUat()), list(promoUat()), list(promoUat({ headRefOid: NEW_SHA })), list(mergedUat({ headRefOid: NEW_SHA })))],
+        [statusOf(SHA_UAT), statuses(st('Gearset QA', 'success'))],
+        [statusOf(NEW_SHA), UAT_OK],
+        [`gh pr merge 3 --merge --match-head-commit ${NEW_SHA}`, ''],
+        deployed,
+        ...pushRules(holder, { at }),
+      ],
+    });
+    const r = await run('uat');
+    expect(r).toMatchObject({ ok: true, noReturn: true, gearsetPromotions: { uat: { prNumber: 3, via: 'org' } } });
+    expect(patches(ctx)).toEqual([`${PATCH} -f sha=${NEW_SHA} -F force=false`]);
+    expect(at).toHaveLength(1);
+    expect(at[0]).toBeGreaterThanOrEqual(START + 60_000);
+    expect(ctx.sh.calls.filter((l) => l.startsWith(CREATE))[0]).toContain(`parents[]=${SHA_UAT}`);
+    expect(merges(ctx)).toEqual([`gh pr merge 3 --merge --match-head-commit ${NEW_SHA}`]);
+    expect(ctx.events.some((e) => e.kind === 'info' && /pushed an empty commit to gs-pipeline\/story\/s-1_-_uat .*\(nudge 1 of 2\)/.test(e.text))).toBe(true);
+    expect(automation(fetch)).toEqual([]);
+    expect(ctx.sh.calls.some((l) => l.startsWith(COMMITS))).toBe(false);
+    for (const line of ctx.sh.calls) for (const flag of FORBIDDEN) expect(line).not.toContain(flag);
+  });
+
+  it('parks the story with the plain task after two nudges, and merges nothing', async () => {
+    // Gearset posts nothing on a later stage's PR, whatever is pushed to it.
+    const { ctx, run } = nudging({ rules: (holder) => [[UAT_LIST, list(promoUat())], gearsetStatuses({ [SHA_UAT]: { environment: 'UAT' } }), ...pushRules(holder)] });
+    const r = await run('uat');
+    expect(r).toEqual({ ok: true, parked: { reason: REASON, check: { branch: 'story/s-1', mode: 'merge', stages: [UAT_STAGE] } } });
+    expect(patches(ctx)).toHaveLength(2);
+    expect(ctx.sleeps).toHaveLength(9);
+    expect(merges(ctx)).toEqual([]);
+    for (const c of ['{', '"', '`', '$']) expect(r.parked.reason).not.toContain(c);
+    expect(r.parked.reason).toContain('Run validation');
+    expect(r.parked.reason).toContain('#3');
+    expect(JSON.parse(JSON.stringify(r.parked.check))).toEqual(r.parked.check);
+    expect(ctx.events.some((e) => e.kind === 'warn' && /has not validated pull request #3 after 2 nudges/.test(e.text))).toBe(true);
+  });
+
+  // The park reason goes into a double-quoted `story end` argument, and a Gearset environment name
+  // is whatever a Gearset admin typed.
+  describe('a Gearset environment named with shell characters', () => {
+    const HOSTILE = 'Acme "UAT" $(x) `y` {z} \\w';
+    const hostileRoutes = () => acmeGearset({ [environmentsOf('pipe-1')]: { status: 200, body: [acmeEnvironment('QA', ACME_QA_ID), acmeEnvironment(HOSTILE, ACME_UAT_ID, 'Release')] } });
+
+    it('parks with a reason and a warn event that carry none of those characters', async () => {
+      const { ctx, run } = nudging({ routes: hostileRoutes(), rules: (holder) => never(holder) });
+      const r = await run('uat');
+      expect(r.parked.reason).toBe('Gearset has not started validating pull request #3 for uat. In Gearset, open the pipeline, select the Acme UAT (x) y z w environment and press Run validation on pull request #3; Foreman merges it when Gearset Acme UAT (x) y z w passes, and the release finishes when Gearset has deployed it.');
+      const warn = ctx.events.find((e) => e.kind === 'warn' && /has not validated pull request #3 after 2 nudges/.test(e.text));
+      expect(warn).toBeDefined();
+      for (const c of ['"', '`', '$', '{', '}', '\\']) {
+        expect(r.parked.reason).not.toContain(c);
+        expect(warn.text).not.toContain(c);
+      }
+      expect(patches(ctx)).toHaveLength(2);
+      expect(merges(ctx)).toEqual([]);
+    });
+
+    it('still merges on a status posted under the raw name', async () => {
+      const { ctx, run } = nudging({
+        routes: hostileRoutes(),
+        rules: () => [
+          [UAT_LIST, inTurn(list(promoUat()), list(mergedUat()))],
+          [statusOf(SHA_UAT), statuses(st(`Gearset ${HOSTILE}`, 'success'))],
+          [MERGE_UAT, ''],
+          deployed,
+        ],
+      });
+      expect(await run('uat')).toMatchObject({ ok: true, noReturn: true });
+      expect(merges(ctx)).toEqual([MERGE_UAT]);
+    });
+  });
+
+  it('names the stages still to promote in the park of the first stage', async () => {
+    const { run } = setup({
+      gearset: NUDGING,
+      ship: { ci: { timeoutMinutes: 30 } },
+      rules: [[QA_LIST, list(promo())], [statusOf(SHA), statuses()]],
+    });
+    const r = await run('qa');
+    expect(r.parked.reason).toBe('Gearset has not started validating pull request #2 for qa. In Gearset, open the pipeline, select the QA environment and press Run validation on pull request #2; Foreman merges it when Gearset QA passes, then promotes uat, and the release finishes when Gearset has deployed it. Gearset never validates a later stage by itself, so press Run validation on the promotion pull request of uat too once Gearset opens it.');
+    expect(r.parked.check.stages.map((s) => s.name)).toEqual(['qa', 'uat']);
+    for (const c of ['{', '}', '"', '`', '$', '\\']) expect(r.parked.reason).not.toContain(c);
+  });
+
+  it('through the ship runner is code 9 with no halt, and the ship lock is released', async () => {
+    const { ctx } = nudging({ rules: (holder) => [...qaMerges(), ...never(holder)] });
+    const { code, result } = await runShip({ steps: [gearsetPromote('qa'), gearsetPromote('uat')], ctx });
+    expect(code).toBe(9);
+    expect(result).toMatchObject({ stage: 'parked', step: 'gearset-promote-uat', gearsetPromotions: { qa: { via: 'org' } }, parked: { reason: REASON } });
+    expect(ctx.halts).toEqual([]);
+    expect(ctx.locks.holderOf('ship')).toBeNull();
+    expect(patches(ctx)).toHaveLength(2);
+  });
+
+  // Gearset's per-PR validation job id, read from an earlier commit's status, is never used: a
+  // commit status is anyone's to post, and the id is in no API that could confirm it. The nudge
+  // is the push, whatever the earlier statuses carry.
+  describe('a job id in an earlier commit status', () => {
+    const earlier = (url, routes = {}) => {
+      const at = [];
+      return nudging({
+        routes: acmeGearset(routes),
+        rules: (holder) => [
+          [UAT_LIST, inTurn(list(promoUat()), list(promoUat()), list(promoUat()), list(promoUat()), list(promoUat()), list(mergedUat()))],
+          [statusOf(SHA_UAT), inTurn(statuses(), statuses(), statuses(), statuses(), UAT_OK)],
+          [statusOf(OLD_SHA), statuses({ ...st('Gearset UAT', 'success'), target_url: url })],
+          [COMMITS, JSON.stringify([OLD_SHA, SHA_UAT])],
+          [MERGE_UAT, ''],
+          deployed,
+          ...pushRules(holder, { at }),
+        ],
+      });
+    };
+
+    it('is not used: a per-PR job id, as Gearset posts it, leads to a push and no Automation API call', async () => {
+      const { ctx, fetch, run } = earlier(JOB_URL);
+      expect(await run('uat')).toMatchObject({ ok: true, noReturn: true });
+      expect(automation(fetch)).toEqual([]);
+      expect(patches(ctx)).toHaveLength(1);
+      expect(ctx.events.some((e) => e.kind === 'info' && /pushed an empty commit/.test(e.text))).toBe(true);
+      expect(ctx.events.some((e) => /validation job/.test(e.text))).toBe(false);
+      expect(JSON.stringify(ctx.events)).not.toContain('job-val-3');
+      expect(merges(ctx)).toEqual([MERGE_UAT]);
+    });
+
+    it('is not used even when it is the environment\'s own CI job (that job deploys the branch): it pushes', async () => {
+      const { ctx, fetch, run } = earlier('https://app.gearset.com/continuous-integration-runs?jobId=job-uat');
+      expect(await run('uat')).toMatchObject({ ok: true, noReturn: true });
+      expect(automation(fetch)).toEqual([]);
+      expect(patches(ctx)).toHaveLength(1);
+    });
+
+    it('is not used from another host: it pushes', async () => {
+      const { ctx, fetch, run } = earlier('https://evil.example/x?jobId=job-val-3');
+      expect(await run('uat')).toMatchObject({ ok: true, noReturn: true });
+      expect(automation(fetch)).toEqual([]);
+      expect(patches(ctx)).toHaveLength(1);
+    });
+  });
+
+  it('warns when the push fails, counts it as a nudge, and still parks after exactly two', async () => {
+    const { ctx, run } = nudging({ rules: (holder) => never(holder, { patch: { status: 1, stderr: 'gh: Update is not a fast forward (HTTP 422)' } }) });
+    const r = await run('uat');
+    expect(r).toMatchObject({ ok: true, parked: { reason: REASON } });
+    expect(patches(ctx)).toHaveLength(2);
+    const warns = ctx.events.filter((e) => e.kind === 'warn' && e.text.startsWith('Could not nudge Gearset on pull request #3: '));
+    expect(warns).toHaveLength(2);
+    expect(warns[0].text).toContain('not a fast forward');
+  });
+
+  it('warns and counts a nudge when the commit cannot be made', async () => {
+    const { ctx, run } = nudging({ rules: () => [[UAT_LIST, list(promoUat())], [statusOf(SHA_UAT), statuses()], [`gh api repos/{owner}/{repo}/git/commits/${SHA_UAT}`, { status: 1, stderr: 'HTTP 404' }]] });
+    const r = await run('uat');
+    expect(r).toMatchObject({ ok: true, parked: { reason: REASON } });
+    expect(patches(ctx)).toEqual([]);
+    expect(ctx.events.filter((e) => e.kind === 'warn' && e.text.startsWith('Could not nudge Gearset')).length).toBe(2);
+  });
+
+  it('never nudges before the delay: the deadline first parks with no push', async () => {
+    const { ctx, run } = setup({ gearset: { ...MERGE, validateLaterStages: 'gearset' }, ship: { ci: { timeoutMinutes: 2 } }, rules: [[UAT_LIST, list(promoUat())], [statusOf(SHA_UAT), statuses()]] });
+    const r = await run('uat');
+    expect(r).toMatchObject({ ok: true, parked: { reason: REASON } });
+    expect(ctx.sh.calls.some((l) => l.startsWith('gh api -X'))).toBe(false);
+    expect(ctx.sleeps).toHaveLength(6);
+  });
+
+  it('does not nudge when a status is pending, and fails with code 2 at the deadline as before', async () => {
+    const { ctx, run } = nudging({ ship: { ci: { timeoutMinutes: 5 } }, rules: (holder) => [[UAT_LIST, list(promoUat())], [statusOf(SHA_UAT), statuses(st('Gearset UAT', 'pending'))], ...pushRules(holder)] });
+    expect(await run('uat')).toMatchObject({ ok: false, code: 2 });
+    expect(patches(ctx)).toEqual([]);
+  });
+
+  it('keeps the code-2 failure for a promotion PR that never appears', async () => {
+    const { ctx, run } = nudging({ rules: () => [[UAT_LIST, list()]] });
+    expect(await run('uat')).toMatchObject({ ok: false, code: 2 });
+    expect(patches(ctx)).toEqual([]);
+  });
+
+  // Gearset never validates a pull request into a later stage by itself, so with the default
+  // setting Foreman does the check-only deploy against the stage's org and merges that head.
+  describe('a later stage Gearset never validates (validateLaterStages foreman, the default)', () => {
+    const DRY_JOB = '0Af000000000002AAA';
+    const QUIET_MS = 5 * 60_000;
+    const heads = { [SHA]: { environment: 'QA', first: true }, [SHA_UAT]: { environment: 'UAT' } };
+    const dryRun = (status, details = {}) => ({ id: DRY_JOB, status, numberComponentsDeployed: 2, numberComponentsTotal: 2, numberTestsCompleted: 5, numberTestErrors: details.runTestResult ? 1 : 0, details });
+    const FAILED_RUN = { componentFailures: { componentType: 'ApexClass', fullName: 'AcmeService', problem: 'Variable does not exist: total', lineNumber: '14' } };
+    const startsOf = (ctx) => ctx.sh.calls.filter((l) => l.startsWith('sf project deploy start'));
+    const uatInfo = (ctx) => ctx.events.filter((e) => e.kind === 'info').map((e) => e.text);
+
+    let state;
+    beforeEach(() => {
+      state = fs.mkdtempSync(path.join(os.tmpdir(), 'foreman-gspromote-state-'));
+    });
+    afterEach(() => {
+      fs.rmSync(state, { recursive: true, force: true });
+    });
+
+    // qa merges (Gearset validates it) and uat gets no status; Foreman's dry run is `report`, of
+    // the pull request's own sgd delta `pkg`. `over` rules come first and so win. `at` holds the
+    // clock when each dry run started, `manifests` the manifest text each one deployed.
+    function scenario({ over = [], gearset = { promote: 'merge' }, ship = { ci: { timeoutMinutes: 30 } }, report = sfOk(dryRun('Succeeded')), org = orgRecord(ACME_UAT_ID), pkg = { ApexClass: ['AcmeService'] }, salesforce, merge = '' } = {}) {
+      const holder = {};
+      const at = [];
+      const manifests = [];
+      const s = setup({
+        gearset,
+        salesforce,
+        ship,
+        env: { GEARSET_API_TOKEN: TOKEN, FOREMAN_STATE_DIR: state },
+        rules: [
+          ...over,
+          [QA_LIST, inTurn(list(promo()), list(merged()))],
+          [UAT_LIST, (line, calls) => (calls.includes(MERGE_UAT) ? list(mergedUat()) : list(promoUat()))],
+          gearsetStatuses(heads),
+          [MERGE_QA, ''],
+          [MERGE_UAT, merge],
+          [new RegExp(orgRoute('acme-uat')), org],
+          ...sgdRules(pkg),
+          [/^sf project deploy start /, (line) => {
+            at.push(holder.ctx.now().getTime());
+            const words = line.split(' ');
+            manifests.push(fs.readFileSync(words[words.indexOf('--manifest') + 1], 'utf8'));
+            return sfOk({ id: DRY_JOB, done: false, status: 'Queued' });
+          }],
+          [/^sf project deploy report /, report],
+          [sfFor('acme-qa'), rows(deployRow())],
+          [sfFor('acme-uat'), rows(deployRow({ Id: '0Af000000000003AAA', CompletedDate: '2026-10-15T12:11:00.000+0000' }))],
+        ],
+      });
+      holder.ctx = s.ctx;
+      s.at = at;
+      s.manifests = manifests;
+      return s;
+    }
+    const ship = (ctx) => runShip({ steps: [gearsetPromote('qa'), gearsetPromote('uat')], ctx });
+
+    it('validates the head against acme-uat itself, merges it and confirms the deploy: no nudge, no park, no halt, no owner task', async () => {
+      const { ctx, fetch, at } = scenario();
+      const { code, result } = await ship(ctx);
+      expect(code).toBe(0);
+      expect(result).not.toHaveProperty('parked');
+      expect(ctx.halts).toEqual([]);
+      expect(merges(ctx)).toEqual([MERGE_QA, MERGE_UAT]);
+      expect(ctx.sh.calls.some((l) => l.startsWith('gh api -X'))).toBe(false);
+      expect(fetch.calls.filter((c) => c.path.startsWith('/public/automation/'))).toEqual([]);
+
+      const [start] = startsOf(ctx);
+      expect(startsOf(ctx)).toHaveLength(1);
+      expect(start).toContain('--dry-run');
+      expect(start).toContain('--target-org acme-uat');
+      expect(start).toContain('--test-level RunLocalTests');
+      expect(ctx.sh.calls.filter((l) => l.startsWith('sf sgd source delta')).map((l) => l.split(' ').slice(4, 8).join(' '))).toEqual([`--from ${BASE} --to ${SHA_UAT}`]);
+      expect(at[0]).toBeGreaterThanOrEqual(START + QUIET_MS);
+      // The merge is after the dry run, and the deploy confirmation after the merge.
+      const calls = ctx.sh.calls;
+      expect(calls.findIndex((l) => l.startsWith('sf project deploy start'))).toBeLessThan(calls.indexOf(MERGE_UAT));
+      expect(calls.indexOf(MERGE_UAT)).toBeLessThan(calls.findIndex((l) => sfFor('acme-uat').test(l)));
+
+      expect(result.gearsetPromotions.qa).toMatchObject({ validatedBy: 'gearset', via: 'org' });
+      expect(result.gearsetPromotions.uat).toMatchObject({
+        org: 'acme-uat',
+        prNumber: 3,
+        via: 'org',
+        deployId: '0Af000000000003AAA',
+        validatedBy: 'foreman',
+        validation: { jobId: DRY_JOB, components: { deployed: 2, total: 2 }, tests: { completed: 5, errors: 0 } },
+      });
+      const told = uatInfo(ctx);
+      expect(told).toContain('Gearset posted no Gearset UAT status on pull request #3 after 5 minutes, as it does not validate a later stage by itself; Foreman is validating it against acme-uat (uat) instead.');
+      expect(told).toContain(`Foreman, not Gearset, validated pull request #3 against acme-uat (uat): job ${DRY_JOB}, 5 tests run; merging it.`);
+      for (const line of calls) for (const flag of FORBIDDEN) expect(line).not.toContain(flag);
+    });
+
+    it('dry-runs another queued change the pull request carries, not only the story delta', async () => {
+      const { ctx, run, manifests } = scenario({ pkg: { ApexClass: ['AcmeService', 'AcmeOther'] } });
+      const r = await run('uat');
+      expect(r).toMatchObject({ ok: true, noReturn: true, gearsetPromotions: { uat: { validatedBy: 'foreman', validation: { jobId: DRY_JOB } } } });
+      expect(manifests).toHaveLength(1);
+      expect(manifests[0]).toContain('AcmeOther');
+      expect(merges(ctx)).toEqual([MERGE_UAT]);
+    });
+
+    it('stops the release when the dry run fails: only qa is merged, the uat pull request is not', async () => {
+      const { ctx } = scenario({ report: sfOk(dryRun('Failed', FAILED_RUN)) });
+      const { code, result } = await ship(ctx);
+      expect(code).toBe(5);
+      expect(result.stage).toBe('gearset-promote-uat');
+      expect(result.reason.startsWith("Foreman's validation of pull request #3 on acme-uat (uat) failed")).toBe(true);
+      expect(result.failures).toHaveLength(1);
+      expect(result.validatedBy).toBe('foreman');
+      expect(result.gearsetPromotions.qa).toMatchObject({ validatedBy: 'gearset' });
+      expect(merges(ctx)).toEqual([MERGE_QA]);
+      expect(ctx.halts).toHaveLength(1);
+    });
+
+    it('is code 2 with nothing merged when the uat step runs alone and the dry run fails', async () => {
+      const { ctx, run } = scenario({ report: sfOk(dryRun('Failed', FAILED_RUN)) });
+      const r = await run('uat');
+      expect(r).toMatchObject({ ok: false, code: 2, stage: 'gearset-promote-uat', validatedBy: 'foreman' });
+      expect(r.failures).toHaveLength(1);
+      expect(merges(ctx)).toEqual([]);
+      expect(ctx.sh.calls.some((l) => sfFor('acme-uat').test(l))).toBe(false);
+    });
+
+    it('validates and merges when the deadline comes before the quiet window, with no park', async () => {
+      const { ctx, run } = scenario({ ship: { ci: { timeoutMinutes: 2 } } });
+      const r = await run('uat');
+      expect(r).toMatchObject({ ok: true, noReturn: true, gearsetPromotions: { uat: { validatedBy: 'foreman' } } });
+      expect(r).not.toHaveProperty('parked');
+      expect(startsOf(ctx)).toHaveLength(1);
+      expect(merges(ctx)).toEqual([MERGE_UAT]);
+      expect(ctx.sh.calls.some((l) => l.startsWith('gh api -X'))).toBe(false);
+    });
+
+    it('does not validate when Gearset posts a success on the head: it merges, validatedBy gearset', async () => {
+      const { ctx, run } = scenario({ over: [[statusOf(SHA_UAT), UAT_OK]] });
+      const r = await run('uat');
+      expect(r).toMatchObject({ ok: true, noReturn: true, gearsetPromotions: { uat: { validatedBy: 'gearset' } } });
+      expect(r.gearsetPromotions.uat).not.toHaveProperty('validation');
+      expect(startsOf(ctx)).toEqual([]);
+      expect(merges(ctx)).toEqual([MERGE_UAT]);
+    });
+
+    it('does not validate when Gearset posts a failure: code 2, no dry run, nothing merged', async () => {
+      const { ctx, run } = scenario({ over: [[statusOf(SHA_UAT), statuses(st('Gearset UAT', 'failure', 'Validation failed'))]] });
+      expect(await run('uat')).toEqual({ ok: false, code: 2, stage: 'gearset-promote-uat', reason: 'Gearset UAT validation failed on pull request #3: Validation failed' });
+      expect(startsOf(ctx)).toEqual([]);
+      expect(merges(ctx)).toEqual([]);
+    });
+
+    it("lets Gearset's status win when it turns to failure on the validated head after Foreman passed: code 2, nothing merged", async () => {
+      const failing = statuses(st('Gearset UAT', 'failure', 'Validation failed'));
+      const { ctx, run } = scenario({ over: [[statusOf(SHA_UAT), (line, calls) => (calls.some((l) => l.startsWith('sf project deploy start')) ? failing : statuses())]] });
+      const r = await run('uat');
+      expect(r).toMatchObject({ ok: false, code: 2, stage: 'gearset-promote-uat', reason: 'Gearset UAT validation failed on pull request #3: Validation failed' });
+      expect(startsOf(ctx)).toHaveLength(1);
+      expect(merges(ctx)).toEqual([]);
+    });
+
+    it('merges only the validated head: gh refuses when it moved, and nothing is merged', async () => {
+      const { ctx, run } = scenario({ merge: { status: 1, stderr: 'GraphQL: Head branch was modified. Review and try the merge again.' }, over: [[UAT_LIST, list(promoUat())]] });
+      const r = await run('uat');
+      expect(r).toEqual({ ok: false, code: 1, stage: 'gearset-promote-uat', reason: 'Could not merge promotion pull request #3: GraphQL: Head branch was modified. Review and try the merge again.' });
+      expect(merges(ctx)).toEqual([`gh pr merge 3 --merge --match-head-commit ${SHA_UAT}`]);
+      expect(sfCalls(ctx).some((l) => sfFor('acme-uat').test(l))).toBe(false);
+    });
+
+    it('is refused for an org marked production, with no dry run and no merge', async () => {
+      const salesforce = { ...block(), gearset: MERGE, orgs: { ...block().orgs, 'acme-uat': { orgId: ACME_UAT_ID, production: true } } };
+      const { ctx, run } = scenario({ salesforce });
+      const r = await run('uat');
+      expect(r).toMatchObject({ ok: false, code: 1, stage: 'gearset-promote-uat' });
+      expect(r.reason).toContain('production is never a target');
+      expect(startsOf(ctx)).toEqual([]);
+      expect(merges(ctx)).toEqual([]);
+    });
+
+    it('is refused for an org its server says is not a sandbox, with no dry run and no merge', async () => {
+      const { ctx, run } = scenario({ org: orgRecord(ACME_UAT_ID, false) });
+      const r = await run('uat');
+      expect(r).toMatchObject({ ok: false, code: 1, stage: 'gearset-promote-uat', validatedBy: 'foreman' });
+      expect(r.reason).toContain('not a sandbox; production is never a target');
+      expect(startsOf(ctx)).toEqual([]);
+      expect(merges(ctx)).toEqual([]);
+    });
+
+    it('still nudges and parks the first stage when Gearset posts no status, as before', async () => {
+      const { ctx, run } = scenario({ gearset: { promote: 'merge', nudgeMinutes: 1 }, over: [[QA_LIST, list(promo())], [statusOf(SHA), statuses()]] });
+      const r = await run('qa');
+      expect(r).toMatchObject({ ok: true, parked: { check: { mode: 'merge' } } });
+      expect(r.parked.reason).toBe('Gearset has not started validating pull request #2 for qa. In Gearset, open the pipeline, select the QA environment and press Run validation on pull request #2; Foreman merges it when Gearset QA passes, then validates and promotes uat itself, and the release finishes when Gearset has deployed it.');
+      for (const c of ['{', '}', '"', '`', '$', '\\']) expect(r.parked.reason).not.toContain(c);
+      expect(ctx.events.filter((e) => /empty commit|Could not nudge/.test(e.text))).toHaveLength(2);
+      expect(startsOf(ctx)).toEqual([]);
+      expect(merges(ctx)).toEqual([]);
+    });
+
+    it('merges with nothing to dry-run when the pull request changes no Salesforce metadata', async () => {
+      const { ctx, run } = scenario({ pkg: {} });
+      const r = await run('uat');
+      expect(r).toMatchObject({ ok: true, noReturn: true, gearsetPromotions: { uat: { validatedBy: 'foreman', validation: { skipped: true } } } });
+      expect(startsOf(ctx)).toEqual([]);
+      expect(merges(ctx)).toEqual([MERGE_UAT]);
+      expect(uatInfo(ctx).some((t) => /it changes no Salesforce metadata, so there was nothing to dry-run/.test(t))).toBe(true);
+    });
+
+    it('does not record who validated a pull request that was already merged (a re-run)', async () => {
+      const { ctx, run } = scenario({ over: [[UAT_LIST, list(mergedUat())]] });
+      const r = await run('uat');
+      expect(r).toMatchObject({ ok: true, noReturn: true });
+      expect(r.gearsetPromotions.uat).not.toHaveProperty('validatedBy');
+      expect(startsOf(ctx)).toEqual([]);
+      expect(merges(ctx)).toEqual([]);
+    });
+
+    it('with validateLaterStages "gearset" is today\'s behaviour: two nudges, then the park, with no dry run and no merge', async () => {
+      const { ctx } = scenario({
+        gearset: { ...NUDGING },
+        over: [
+          [`gh api repos/{owner}/{repo}/git/commits/${SHA_UAT}`, `${TREE}\n`],
+          [CREATE, `${NEW_SHA}\n`],
+          [PATCH, ''],
+        ],
+      });
+      const { code, result } = await ship(ctx);
+      expect(code).toBe(9);
+      expect(result).toMatchObject({ stage: 'parked', step: 'gearset-promote-uat', parked: { reason: REASON, check: { branch: 'story/s-1', mode: 'merge', stages: [UAT_STAGE] } } });
+      expect(patches(ctx)).toHaveLength(2);
+      expect(startsOf(ctx)).toEqual([]);
+      expect(ctx.sh.calls.some((l) => l.includes('FROM Organization --target-org acme-uat'))).toBe(false);
+      expect(merges(ctx)).toEqual([MERGE_QA]);
+      expect(ctx.halts).toEqual([]);
+    });
+  });
+});
+
+describe('merge mode: check', () => {
+  const STORED = { branch: 'story/s-1', mode: 'merge', stages: [{ name: 'uat', org: 'acme-uat', orgId: ACME_UAT_ID, branch: 'uat' }] };
+  const STORED_QA_UAT = { branch: 'story/s-1', mode: 'merge', stages: [{ name: 'qa', org: 'acme-qa', orgId: ACME_QA_ID, branch: 'qa' }, STORED.stages[0]] };
+  const deploy = [sfFor('acme-uat'), rows(deployRow({ CompletedDate: '2026-10-15T12:11:00.000+0000' }))];
+  const WAIT_NONE = 'waiting for Gearset UAT on pull request #3: in Gearset, press Run validation on it in the UAT environment';
+  const DRY_JOB = '0Af000000000002AAA';
+  const GEARSET_ONLY = { promote: 'merge', validateLaterStages: 'gearset' };
+  const dryRun = (status, details = {}) => ({ id: DRY_JOB, status, numberComponentsDeployed: 2, numberComponentsTotal: 2, numberTestsCompleted: 5, numberTestErrors: details.runTestResult ? 1 : 0, details });
+  const FAILED_RUN = { componentFailures: { componentType: 'ApexClass', fullName: 'AcmeService', problem: 'Variable does not exist: total', lineNumber: '14' } };
+  const startsOf = (ctx) => ctx.sh.calls.filter((l) => l.startsWith('sf project deploy start'));
+
+  let state;
+  beforeEach(() => {
+    state = fs.mkdtempSync(path.join(os.tmpdir(), 'foreman-gspromote-check-state-'));
+  });
+  afterEach(() => {
+    fs.rmSync(state, { recursive: true, force: true });
+  });
+
+  function checking({ rules = [], routes, env = { GEARSET_API_TOKEN: TOKEN }, stored = STORED, gearset = MERGE, pkg = { ApexClass: ['AcmeService'] }, org = orgRecord(ACME_UAT_ID), report = sfOk(dryRun('Succeeded')) } = {}) {
+    const s = setup({
+      gearset,
+      routes,
+      env: { FOREMAN_STATE_DIR: state, ...env },
+      rules: [
+        ...rules,
+        [new RegExp(orgRoute('acme-uat')), org],
+        ...sgdRules(pkg),
+        [/^sf project deploy start /, sfOk({ id: DRY_JOB, done: false, status: 'Queued' })],
+        [/^sf project deploy report /, report],
+      ],
+    });
+    s.ctx.check = JSON.parse(JSON.stringify(stored));
+    const check = () => gearsetPromote('qa').check(s.ctx, { fetch: s.fetch });
+    return { ...s, check };
+  }
+  const writes = (ctx) => ctx.sh.calls.filter((l) => l.startsWith('gh api -X'));
+  // uat is OPEN until it is merged, then MERGED, with no Gearset UAT status on its head.
+  const uatOpen = (...more) => [[UAT_LIST, (line, calls) => (calls.includes(MERGE_UAT) ? list(mergedUat()) : list(promoUat()))], [statusOf(SHA_UAT), statuses(st('Gearset QA', 'success'))], [MERGE_UAT, ''], deploy, ...more];
+
+  describe('a later stage Gearset posted no status on (validateLaterStages foreman, the default)', () => {
+    it('validates it itself, merges, and is done after the deploy, with no write and no Automation API call', async () => {
+      const { ctx, fetch, check } = checking({ rules: uatOpen() });
+      expect(await check()).toEqual({ ok: true, done: true, note: 'Gearset deployed uat (pull request #3)' });
+      expect(startsOf(ctx)).toHaveLength(1);
+      expect(startsOf(ctx)[0]).toContain('--dry-run');
+      expect(startsOf(ctx)[0]).toContain('--target-org acme-uat');
+      const calls = ctx.sh.calls;
+      expect(calls.findIndex((l) => l.startsWith('sf project deploy start'))).toBeLessThan(calls.indexOf(MERGE_UAT));
+      expect(merges(ctx)).toEqual([MERGE_UAT]);
+      const told = ctx.events.filter((e) => e.kind === 'info').map((e) => e.text);
+      expect(told).toContain('Gearset posted no Gearset UAT status on pull request #3, as it does not validate a later stage by itself; Foreman is validating it against acme-uat (uat) instead.');
+      expect(told).toContain(`Foreman, not Gearset, validated pull request #3 against acme-uat (uat): job ${DRY_JOB}, 5 tests run; merging it.`);
+      expect(told).toContain("Merged Gearset's uat promotion pull request #3 for S-1 once Foreman's validation passed.");
+      expect(writes(ctx)).toEqual([]);
+      expect(fetch.calls.filter((c) => c.path.startsWith('/public/automation/'))).toEqual([]);
+      for (const line of calls) for (const flag of FORBIDDEN) expect(line).not.toContain(flag);
+    });
+
+    it('fails the story, and merges nothing, when the dry run fails', async () => {
+      const { ctx, check } = checking({ rules: uatOpen(), report: sfOk(dryRun('Failed', FAILED_RUN)) });
+      const r = await check();
+      expect(r.ok).toBe(false);
+      expect(r.reason.startsWith("Foreman's validation of pull request #3 on acme-uat (uat) failed")).toBe(true);
+      expect(merges(ctx)).toEqual([]);
+    });
+
+    it('waits, and merges nothing, when the validation never started', async () => {
+      const { ctx, check } = checking({ rules: [[/^git fetch /, { status: 128, stderr: 'fatal: unable to access' }], ...uatOpen()] });
+      const r = await check();
+      expect(r).toMatchObject({ ok: true, done: false });
+      expect(r.detail).toContain('never started');
+      expect(merges(ctx)).toEqual([]);
+    });
+
+    it('waits, and merges nothing, when the dry run did not finish', async () => {
+      const { ctx, check } = checking({ rules: uatOpen(), report: sfOk(dryRun('InProgress')) });
+      const r = await check();
+      expect(r).toMatchObject({ ok: true, done: false });
+      expect(r.detail).toContain('did not finish within 30 minutes');
+      expect(merges(ctx)).toEqual([]);
+    });
+
+    it('fails the story, with no dry run and no merge, when the org is not a sandbox', async () => {
+      const { ctx, check } = checking({ rules: uatOpen(), org: orgRecord(ACME_UAT_ID, false) });
+      const r = await check();
+      expect(r.ok).toBe(false);
+      expect(r.reason).toContain('not a sandbox');
+      expect(startsOf(ctx)).toEqual([]);
+      expect(merges(ctx)).toEqual([]);
+    });
+
+    it("lets Gearset's status win when it turns to failure after Foreman passed", async () => {
+      const failing = statuses(st('Gearset UAT', 'failure', 'Validation failed'));
+      const { ctx, check } = checking({ rules: [[statusOf(SHA_UAT), (line, calls) => (calls.some((l) => l.startsWith('sf project deploy start')) ? failing : statuses())], ...uatOpen()] });
+      expect(await check()).toEqual({ ok: false, reason: 'Gearset UAT validation failed on pull request #3: Validation failed' });
+      expect(startsOf(ctx)).toHaveLength(1);
+      expect(merges(ctx)).toEqual([]);
+    });
+
+    it('merges with nothing to dry-run when the pull request changes no Salesforce metadata', async () => {
+      const { ctx, check } = checking({ rules: uatOpen(), pkg: {} });
+      expect(await check()).toEqual({ ok: true, done: true, note: 'Gearset deployed uat (pull request #3)' });
+      expect(startsOf(ctx)).toEqual([]);
+      expect(merges(ctx)).toEqual([MERGE_UAT]);
+      expect(ctx.events.some((e) => e.kind === 'info' && /it changes no Salesforce metadata, so there was nothing to dry-run/.test(e.text))).toBe(true);
+    });
+
+    it('does not validate a first stage: it waits for Gearset QA, with no dry run', async () => {
+      const { ctx, check } = checking({ stored: STORED_QA_UAT, rules: [[QA_LIST, list(promo())], [statusOf(SHA), statuses()]] });
+      expect(await check()).toEqual({ ok: true, done: false, detail: 'waiting for Gearset QA on pull request #2: in Gearset, press Run validation on it in the QA environment' });
+      expect(startsOf(ctx)).toEqual([]);
+      expect(ctx.sh.calls.some((l) => l.startsWith('git '))).toBe(false);
+      expect(merges(ctx)).toEqual([]);
+    });
+  });
+
+  it('with validateLaterStages "gearset" waits with the Run validation detail while Gearset has posted no status, and does nothing', async () => {
+    const { ctx, fetch, check } = checking({ gearset: GEARSET_ONLY, rules: [[UAT_LIST, list(promoUat())], [statusOf(SHA_UAT), statuses(st('Gearset QA', 'success'))]] });
+    expect(await check()).toEqual({ ok: true, done: false, detail: WAIT_NONE });
+    expect(writes(ctx)).toEqual([]);
+    expect(merges(ctx)).toEqual([]);
+    expect(startsOf(ctx)).toEqual([]);
+    expect(fetch.calls.filter((c) => c.path.startsWith('/public/automation/'))).toEqual([]);
+  });
+
+  it('waits while the validation is pending', async () => {
+    const { ctx, check } = checking({ rules: [[UAT_LIST, list(promoUat())], [statusOf(SHA_UAT), statuses(st('Gearset UAT', 'pending'))]] });
+    expect(await check()).toEqual({ ok: true, done: false, detail: 'waiting for Gearset UAT to finish validating pull request #3' });
+    expect(merges(ctx)).toEqual([]);
+  });
+
+  it('merges once the validation passes and is done after the deploy, with an info event', async () => {
+    const { ctx, check } = checking({ rules: [[UAT_LIST, inTurn(list(promoUat()), list(mergedUat()))], [statusOf(SHA_UAT), UAT_OK], [MERGE_UAT, ''], deploy] });
+    expect(await check()).toEqual({ ok: true, done: true, note: 'Gearset deployed uat (pull request #3)' });
+    expect(merges(ctx)).toEqual([MERGE_UAT]);
+    expect(ctx.events).toContainEqual({ text: "Merged Gearset's uat promotion pull request #3 for S-1 once Gearset UAT passed.", kind: 'info' });
+    for (const line of ctx.sh.calls) for (const flag of FORBIDDEN) expect(line).not.toContain(flag);
+  });
+
+  it('waits when the merge fails and the PR stays open', async () => {
+    const { check } = checking({ rules: [[UAT_LIST, list(promoUat())], [statusOf(SHA_UAT), UAT_OK], [MERGE_UAT, { status: 1, stderr: 'GraphQL: Head branch was modified' }]] });
+    expect(await check()).toEqual({ ok: true, done: false, detail: 'could not merge promotion pull request #3 yet: GraphQL: Head branch was modified' });
+  });
+
+  it('fails the story, not the line, when the validation failed', async () => {
+    const { ctx, check } = checking({ rules: [[UAT_LIST, list(promoUat())], [statusOf(SHA_UAT), statuses(st('Gearset UAT', 'failure', 'Validation failed'))]] });
+    expect(await check()).toEqual({ ok: false, reason: 'Gearset UAT validation failed on pull request #3: Validation failed' });
+    expect(merges(ctx)).toEqual([]);
+  });
+
+  it('waits without a token, naming it, and merges nothing', async () => {
+    const { ctx, fetch, check } = checking({ env: {}, rules: [[UAT_LIST, list(promoUat())], [statusOf(SHA_UAT), UAT_OK]] });
+    const r = await check();
+    expect(r).toMatchObject({ ok: true, done: false });
+    expect(r.detail).toContain('GEARSET_API_TOKEN is not set');
+    expect(merges(ctx)).toEqual([]);
+    expect(fetch.calls).toEqual([]);
+  });
+
+  it("refuses an org that Gearset lists as its production environment, and merges nothing", async () => {
+    const routes = acmeGearset({ [environmentsOf('pipe-1')]: { status: 200, body: [acmeEnvironment('QA', ACME_QA_ID), acmeEnvironment('UAT', ACME_UAT_ID, 'Production')] } });
+    const { ctx, check } = checking({ routes, rules: [[UAT_LIST, list(promoUat())], [statusOf(SHA_UAT), UAT_OK]] });
+    const r = await check();
+    expect(r).toMatchObject({ ok: false, reason: expect.stringContaining('production') });
+    expect(merges(ctx)).toEqual([]);
+  });
+
+  it('waits when the Gearset environments cannot be read', async () => {
+    const { ctx, check } = checking({ routes: acmeGearset({ [PIPELINES]: { status: 500, body: {} } }), rules: [[UAT_LIST, list(promoUat())], [statusOf(SHA_UAT), UAT_OK]] });
+    const r = await check();
+    expect(r).toMatchObject({ ok: true, done: false });
+    expect(merges(ctx)).toEqual([]);
+  });
+
+  it('still answers the click-Promote detail for a stored check without a mode', async () => {
+    const { mode: _mode, ...owner } = STORED;
+    const { check } = checking({ stored: owner, rules: [[UAT_LIST, list(promoUat())]] });
+    expect(await check()).toEqual({ ok: true, done: false, detail: 'waiting for you to click Promote for uat in Gearset (pull request #3)' });
+  });
+
+  it('never puts the token in an answer', async () => {
+    const secret = 't-acme-secret-77';
+    const scenarios = [
+      { gearset: GEARSET_ONLY, rules: [[UAT_LIST, list(promoUat())], [statusOf(SHA_UAT), statuses()]] },
+      { rules: [[UAT_LIST, list(promoUat())], [statusOf(SHA_UAT), UAT_OK], [MERGE_UAT, { status: 1, stderr: 'no' }]] },
+      { rules: [[UAT_LIST, list(promoUat())]], routes: acmeGearset({ [PIPELINES]: new Error(`refused ${secret}`) }) },
+      { rules: [[UAT_LIST, list(promoUat())], [statusOf(SHA_UAT), statuses(st('Gearset UAT', 'failure', 'bad'))]] },
+    ];
+    for (const s of scenarios) {
+      const { check } = checking({ ...s, env: { GEARSET_API_TOKEN: secret } });
+      expect(JSON.stringify(await check())).not.toContain(secret);
+    }
   });
 });
 

@@ -2,6 +2,7 @@
 name: builder
 description: Build stage of the Foreman pipeline. Builds one story from the architect's design, tests first, and fixes the findings when the tester or a reviewer sends it back.
 tools: Read, Write, Edit, Grep, Glob, Bash
+model: sonnet
 ---
 
 You build one story from the design you are given. The design names the files and the

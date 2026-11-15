@@ -7,7 +7,11 @@
 //      pipeline salesforce.gearset.pipelineId names, or in every pipeline when it is unset. The
 //      environment's name names the status to wait for: "Gearset <name>", for this environment
 //      only. Nothing is opened before this passes, so a missing token, a refused team, no
-//      environment for the org, or Gearset's production environment is code 1 with no PR.
+//      environment for the org, or Gearset's production environment is code 1 with no PR. The
+//      read is kept on the release's ctx (gearset.mjs releaseEnvironments), so the later steps
+//      do not read again. When Gearset answers 429 it waits the time Retry-After names, with an
+//      info event, inside the step's own limit (ship.ci.timeoutMinutes below); a wait that
+//      would pass it is code 1 with `rateLimited: true` and `retryAt`, and no PR opened.
 //   2. finds the promotion PR by its head branch (an OPEN one, else a MERGED one; a CLOSED one
 //      is ignored). With none yet, it opens the story's pull request into the target unless one
 //      is open already, and only when both lists (the promotion PR and the story's open PR)
@@ -15,6 +19,11 @@
 //   3. polls every 20 seconds, for ship.ci.timeoutMinutes (default 30), re-finding the promotion
 //      PR each time so a head Gearset re-syncs is followed, and reads its head commit's statuses.
 //      Only the exact context counts: another environment's on the same commit is ignored.
+//
+// With the promotion PR found but no status of that context by the deadline, the failure says
+// `noStatus: true` and names both causes (gearset.mjs noStatusReason): a validation error shown
+// on the PR in the Gearset pipeline, and a switched-off webhook. The story then asks on Waiting
+// on you rather than sending the code back to the builder.
 //
 // success is ok, with the facts `pr` (url) and `prNumber` of the promotion PR, which the later
 // steps read. failure or error is code 2, as is the deadline. Once the promotion PR is found it
@@ -26,7 +35,7 @@
 // prTarget is a copy of the pr step's rule.
 
 import { layout } from '../config.mjs';
-import { environmentFor, gearsetEnvironments, gearsetToken, promotionBranch, statusContext } from '../gearset.mjs';
+import { environmentFor, gearsetToken, noStatusReason, promotionBranch, releaseEnvironments, statusContext, waitOutRateLimit } from '../gearset.mjs';
 
 const STAGE = 'gearset-pr';
 const POLL_MS = 20_000;
@@ -58,7 +67,20 @@ export default {
 
     const token = gearsetToken(ctx.env ?? process.env);
     if (!token) return fail(1, `GEARSET_API_TOKEN is not set; gearset-pr reads stage ${stage.name}'s Gearset environment from the Gearset Reporting API`);
-    const read = await gearsetEnvironments({ fetch, token, pipelineId: ctx.config.salesforce?.gearset?.pipelineId });
+    // The step's own limit counts the wait for a rate limit too.
+    const minutes = ctx.config.ship?.ci?.timeoutMinutes ?? 30;
+    const deadline = ctx.now().getTime() + minutes * 60_000;
+    const told = (seconds, retryAt) => {
+      ctx.event?.(`Gearset rate-limited ${STAGE}; waiting ${seconds} seconds, as Gearset asked, then trying again (at ${retryAt}).`, 'info');
+      ctx.report?.(`waiting for Gearset's rate limit until ${retryAt}`);
+    };
+    const read = await waitOutRateLimit(
+      () => releaseEnvironments(ctx, { fetch, token, pipelineId: ctx.config.salesforce?.gearset?.pipelineId }),
+      { now: ctx.now, sleep: ctx.sleep, deadline, told },
+    );
+    if (read.rateLimited) {
+      return fail(1, `Gearset rate-limited ${STAGE} until ${read.retryAt}, past the step's limit of ${plural(minutes)}; try the release again after ${read.retryAt}.`, { rateLimited: true, retryAt: read.retryAt });
+    }
     if (!read.ok) return fail(1, read.error);
     const found = environmentFor(read.environments, stage.orgId);
     if (!found.ok) return fail(1, found.error);
@@ -133,8 +155,6 @@ export default {
     };
 
     let promo = null;
-    const minutes = ctx.config.ship?.ci?.timeoutMinutes ?? 30;
-    const deadline = ctx.now().getTime() + minutes * 60_000;
     let pr = null; // the promotion PR, once found
     let state = null; // the last state read of the target environment's status
     for (;;) {
@@ -168,7 +188,7 @@ export default {
         }
         const facts = { pr: pr.url, prNumber: pr.number };
         if (state === null) {
-          return fail(2, `${context} has not validated pull request #${pr.number} within ${plural(minutes)}; turn on "Validate pull requests targeting the source branch" for its CI job${ghError}`, facts);
+          return fail(2, noStatusReason(context, pr.number, minutes) + ghError, { ...facts, noStatus: true });
         }
         return fail(2, `${context} validation did not finish within ${plural(minutes)} on pull request #${pr.number}${ghError}`, facts);
       }

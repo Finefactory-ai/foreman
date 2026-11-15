@@ -4,7 +4,8 @@
 // note is older and answered first, so a supervisor that applied it during the run would do so
 // before the learned note, and the session would see it. A fake `claude` (and `gh`) on the PATH
 // stand in for the session and GitHub; the session watches the learned note's file and records
-// when it is applied.
+// when it is applied. The fake session ends shipped: a blocked story would not count toward the 1,
+// and the run would go on to the next story.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -22,7 +23,7 @@ const REAL_TICK_MS = 5000;
 // Says it started, then polls the learned note every 250 ms for up to 30 s. Once the note is
 // applied it writes when, and whether the review note was applied by then, to the seen file. The
 // review note is older and answered first, so if the supervisor applied it during the run, it
-// did so before the learned note and shows here. Then it marks its story blocked in the state
+// did so before the learned note and shows here. Then it marks its story done in the state
 // overlay and says so.
 const FAKE_CLAUDE = `#!/usr/bin/env node
 const { appendFileSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs');
@@ -36,8 +37,8 @@ const end = Date.now() + 30000;
 const finish = () => {
   const stories = join(state, 'stories');
   mkdirSync(stories, { recursive: true });
-  writeFileSync(join(stories, id + '.json'), JSON.stringify({ id, status: 'blocked', blockedBy: 'Fake session', fields: {}, notes: [] }));
-  console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, duration_ms: 1000, result: 'Could not get further.\\nFACTORY_RESULT: blocked ' + id, total_cost_usd: 0, session_id: 'fake' }));
+  writeFileSync(join(stories, id + '.json'), JSON.stringify({ id, status: 'done', fields: {}, notes: [] }));
+  console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, duration_ms: 1000, result: 'Done.\\nFACTORY_RESULT: shipped ' + id, total_cost_usd: 0, session_id: 'fake' }));
   process.exit(0);
 };
 const timer = setInterval(() => {

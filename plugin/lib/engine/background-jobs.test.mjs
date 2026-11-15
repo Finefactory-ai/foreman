@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { backgroundJobs, STOP_SWEEP_MS } from './background-jobs.mjs';
+import { supervisorSource } from '../../../test/supervisor-source.mjs';
 
 const made = [];
 afterEach(() => {
@@ -92,7 +93,7 @@ describe('sweepAtStop', () => {
     await expect(loud.sweepAtStop()).resolves.toBeUndefined();
   });
   it('is awaited by the supervisor stop, after the sessions are ended and before the loop is set stopped, and not by a restart', () => {
-    const src = readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     const stop = src.slice(src.indexOf('async function stop('), src.indexOf('async function restartOnNewCode('));
     const ended = stop.indexOf("process.kill(-s.pid, 'SIGKILL')");
     const sweep = stop.indexOf('await sweepAtStop()');

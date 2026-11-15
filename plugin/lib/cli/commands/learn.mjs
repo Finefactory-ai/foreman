@@ -34,6 +34,10 @@
 // While `learning.auto` is on (the default), Foreman writes learned traits itself (`foreman
 // learning tick`), so `learn` proposes no traits, only follow-ups. A key it ignored or applied
 // still keeps the learning tick off that lesson (engine/lessons.mjs skip).
+//
+// While pull requests merge into a branch other than the one every story starts from (ship.pr.into,
+// or a Salesforce stage branch), no follow-up is proposed or created, since it would start without
+// the code it fixes; an older proposal applied then creates nothing and ignores its keys.
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -43,7 +47,7 @@ import { openConsole } from '../../engine/console.mjs';
 import { createdSummary, createdTitle, followUpDoneWhen, followUps, followUpSummary, followUpTitle, followUpWhat, parseFindings, proposals, traitExplain, traitHints, traitSummary } from '../../engine/learn.mjs';
 import { claims } from '../../engine/locks.mjs';
 import { refuseInRun } from '../../engine/run-guard.mjs';
-import { doneChange, openStorySource } from '../../engine/story-source.mjs';
+import { doneChange, openStorySource, storyTarget } from '../../engine/story-source.mjs';
 import { noteOnStory } from '../../engine/story-notes.mjs';
 import { resolveTraits, roleNames, TRAITS_DIR } from '../../engine/traits.mjs';
 import { openProject } from './console-shared.mjs';
@@ -149,6 +153,14 @@ function followUpBody(p) {
   ].join('\n');
 }
 
+// Why a follow-up cannot be built, or null. Every story starts from the base branch; when pull
+// requests merge into another branch, a shipped story's code never reaches the base.
+function followUpsUnbuildable(config) {
+  const target = storyTarget(config);
+  if (!target) return null;
+  return `stories here merge into ${target.branch}, but every story starts from ${config.baseBranch ?? 'main'}, which never gets their code, so a follow-up would start without the code it fixes`;
+}
+
 // The shipped stories' new minor findings, checked against the existing stories' titles. Only
 // a source that can create stories gets proposals; a problem opening it is said and skipped.
 // None at all while features.followUps is off; and unless features.followUpsOfFollowUps is on,
@@ -160,6 +172,11 @@ function followUpProposals({ root, config, env, now, stdout, stderr }, lines, se
   if (!followUps(lines, { seen }).length) return [];
   if (config.features?.followUps === false) {
     stdout.write('Follow-up proposals are off (features.followUps).\n');
+    return [];
+  }
+  const unbuildable = followUpsUnbuildable(config);
+  if (unbuildable) {
+    stdout.write(`Follow-up proposals are off here: ${unbuildable}.\n`);
     return [];
   }
   const deeper = config.features?.followUpsOfFollowUps === true;
@@ -364,6 +381,15 @@ async function createFollowUp(detail, ledger, { root, dir, config, env, clock, s
   const title = followUpStoryTitle(detail.story);
   if (detail.created) {
     stdout.write(`Already created ${detail.created}: ${title}\n`);
+    return 0;
+  }
+  // A proposal made before stories merged into another branch: nothing is created, and its findings
+  // are ignored, so `learn` does not ask again (learn reopen takes them back).
+  const unbuildable = followUpsUnbuildable(config);
+  if (unbuildable) {
+    for (const key of detail.keys ?? []) if (!ledger.ignored.includes(key) && !ledger.applied.includes(key)) ledger.ignored.push(key);
+    saveLedger(dir, ledger);
+    stdout.write(`Did not create ${title}: ${unbuildable}.\n`);
     return 0;
   }
   const source = openStorySource({ root, config, now: clock, env });

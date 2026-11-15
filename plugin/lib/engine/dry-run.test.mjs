@@ -12,7 +12,7 @@ afterEach(() => {
   for (const dir of made.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function run(prepare = () => {}) {
+function run(prepare = () => {}, { MAX = 0, plan = [] } = {}) {
   const DIR = mkdtempSync(join(tmpdir(), 'foreman-dry-run-'));
   made.push(DIR);
   prepare(DIR);
@@ -22,14 +22,14 @@ function run(prepare = () => {}) {
     loaded: { localWarnings: [] },
     START: { events: [], from: 'flag' },
     workers: 1,
-    MAX: 0,
+    MAX,
     SLOT_IDS: ['w1'],
     DIR,
     CONFIG: { generated: [] },
     slotIndex: (slot) => ['w1'].indexOf(slot),
-    stories: () => ({ list: () => [], idPattern: /^ACME-\d+$/ }),
+    stories: () => ({ list: () => [], idPattern: '^ACME-\\d+$'}),
     pickStory: () => ({ id: 'ACME-1', title: 'First' }),
-    recoveryPlan: () => [],
+    recoveryPlan: () => plan,
     endedFolderStory: () => null,
     schemaExtra: () => [],
     schemaFree: () => true,
@@ -49,5 +49,24 @@ describe('dryRun', () => {
   it('starts nothing in a parked slot', () => {
     const lines = run((DIR) => setSlot(DIR, 'w1', { state: 'parked' }));
     expect(lines).toContain('w1 is parked; nothing starts there');
+  });
+
+  it('says the stories left in hand are resumed on top of the number asked for', () => {
+    const plan = [1, 2, 3].map((n) => ({ type: 'resume', id: `ACME-${n}`, slot: null, from: null }));
+    const lines = run(() => {}, { MAX: 1, plan: [...plan, { type: 'clear-stale' }] });
+    const line = '3 stories left in hand are resumed first, on top of the 1 asked for: they do not count towards it.';
+    expect(lines).toContain(line);
+    expect(lines.indexOf(line)).toBeGreaterThan(lines.indexOf('1 worker (--workers)'));
+  });
+
+  it('adds no line with nothing left in hand', () => {
+    const lines = run(() => {}, { MAX: 1, plan: [] });
+    expect(lines.some((l) => l.includes('left in hand'))).toBe(false);
+  });
+
+  it('adds no line when no number was asked for', () => {
+    const plan = [{ type: 'resume', id: 'ACME-1', slot: null, from: null }];
+    const lines = run(() => {}, { MAX: 0, plan });
+    expect(lines.some((l) => l.includes('left in hand'))).toBe(false);
   });
 });

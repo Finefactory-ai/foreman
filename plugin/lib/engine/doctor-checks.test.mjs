@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { buildChecks, parsePluginList, requirements } from './doctor-checks.mjs';
+import { overrideText } from './foreman-command.mjs';
 import { copyWarning, ownCopy } from './plugin-copy.mjs';
 import { withDefaults } from '../config/defaults.mjs';
 import { fakePack } from '../../../test/fake-pack.mjs';
@@ -1357,6 +1358,26 @@ describe('doctor: foreman command', () => {
     expect(res).toMatchObject({ ok: false, level: 'warn' });
     expect(res.detail).toContain('/usr/local/bin/foreman');
     expect(res.detail).toContain(own());
+  });
+
+  it('names the installed Foreman plugin when `foreman` is its bin, and says how to update it', () => {
+    const cache = path.join(plugins, 'cache', 'foreman', 'foreman', '0.0.1');
+    fs.writeFileSync(path.join(plugins, 'installed_plugins.json'), JSON.stringify({ version: 2, plugins: { 'foreman@foreman': [{ scope: 'user', installPath: cache, version: '0.0.1' }] } }));
+    const { res } = run({ stdout: `foreman is ${path.join(cache, 'bin', 'foreman')}\n` });
+    expect(res).toMatchObject({ ok: false, level: 'warn' });
+    expect(res.detail).toContain('installed Foreman plugin 0.0.1');
+    expect(res.detail).toContain(cache);
+    expect(res.detail).toContain(own());
+    expect(res.detail).not.toContain('if [[ -z');
+    expect(res.fix.hint).toContain('claude plugin update foreman@foreman');
+  });
+
+  it('keeps the plain warning for a file that is not an installed copy, even with copies installed', () => {
+    const cache = path.join(plugins, 'cache', 'foreman', 'foreman', '0.0.1');
+    fs.writeFileSync(path.join(plugins, 'installed_plugins.json'), JSON.stringify({ version: 2, plugins: { 'foreman@foreman': [{ scope: 'user', installPath: cache, version: '0.0.1' }] } }));
+    const { res } = run({ stdout: 'foreman is /usr/local/bin/foreman\n' });
+    expect(res.detail).toBe(overrideText({ found: '/usr/local/bin/foreman', expected: own() }));
+    expect(res.fix.hint).toContain('if [[ -z "$FOREMAN_RUN" ]]');
   });
 
   it("is ok for the plugin's own bin, plain or hashed", () => {

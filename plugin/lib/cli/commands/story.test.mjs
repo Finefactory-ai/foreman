@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { main } from '../main.mjs';
 import { savePark } from '../../engine/parks.mjs';
-import { applyAnswers } from '../../engine/answers.mjs';
+import { applyAnswers, waitsForAnswer } from '../../engine/answers.mjs';
 import { ownerWaiting, setStage } from '../../engine/state.mjs';
 import { markSession } from '../../engine/session-files.mjs';
 import storyCommand from './story.mjs';
@@ -178,6 +178,99 @@ describe('foreman story start / block / done / todo', () => {
   });
 });
 
+describe('foreman story block on stories already done', () => {
+  const overlay = (id) => JSON.parse(fs.readFileSync(path.join(dir, '.foreman', 'stories', `${id}.json`), 'utf8'));
+  const found = async (id) => JSON.parse((await run(['story', 'next', '--id', id])).out);
+  const pending = async () => JSON.parse((await run(['decide', 'pending'])).out);
+  const BLOCK = ['story', 'block', 'S-3', '--reason', 'S-1 must land first'];
+  const WORDS = 'Needs you: S-1 is already done, so waiting for it cannot unblock S-3. The architect said: S-1 must land first';
+  beforeEach(async () => {
+    fs.writeFileSync(path.join(dir, 'stories', 'S-3.md'), story('S-3', 'todo', 'depends_on: []\n'));
+    expect((await run(['story', 'done', 'S-1', '--note', 'x'])).code).toBe(0);
+  });
+
+  it('records the block in words, so the story is left out of next and the plan, and asks the owner once', async () => {
+    const r = await run(BLOCK);
+    expect(r.code).toBe(0);
+    expect(overlay('S-3')).toMatchObject({ status: 'blocked', blockedBy: WORDS, notes: [{ text: `Blocked: ${WORDS}` }] });
+    expect(JSON.parse((await run(['story', 'next'])).out).id).toBe('S-2');
+    expect(JSON.parse((await run(['story', 'next', '--id', 'S-3', '--strict'])).out)).toEqual({ none: true });
+    const plan = (await run(['story', 'plan'])).out;
+    expect(plan).toContain('The factory can build 1 stories, in this order:\n  S-2');
+    expect(plan).toContain(`S-3  waits on: ${WORDS}`);
+    const items = await pending();
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ story: 'S-3', kind: 'task', title: 'S-3 is blocked on S-1, which is already done', options: ['Retry the story', 'Close the task'] });
+    expect(items[0].summary).toBe('The architect still blocks S-3 on S-1, which is already done.');
+    expect(items[0].body.split('\n\n')).toEqual([
+      'The architect blocked S-3: S-1 must land first',
+      'S-1 is already done, so S-3 would be picked again at once and block again. Foreman leaves it blocked until you answer.',
+      '"Retry the story" puts it back in line with your note for the architect, for example where the code it needs is. "Close the task" leaves it blocked.',
+    ]);
+    expect(r.out).toMatch(new RegExp(`^S-3 is blocked on S-1, which is already done; asked the owner: ${items[0].id}\\.\\n$`));
+    expect(r.out).toContain('already done; asked the owner: d-');
+  });
+
+  it('a second identical block asks nothing more', async () => {
+    await run(BLOCK);
+    const [item] = await pending();
+    const again = await run(BLOCK);
+    expect(again.code).toBe(0);
+    expect(again.out).toBe(`S-3 is blocked on S-1, which is already done; the owner was already asked: ${item.id}.\n`);
+    expect(await pending()).toHaveLength(1);
+  });
+
+  it('Retry the story, applied, puts the story back to todo', async () => {
+    await run(BLOCK);
+    const [item] = await pending();
+    expect((await run(['decide', 'answer', item.id, 'Retry the story'])).code).toBe(0);
+    const foreman = async (args) => {
+      const r = await run(args);
+      return { status: r.code, stdout: r.out };
+    };
+    const blocked = await found('S-3');
+    const canRequeue = () => waitsForAnswer(blocked, { idPattern: '[A-Z]+-\\d+' });
+    const results = await applyAnswers(await pending(), { foreman, gh: () => ({ status: 1 }), git: () => ({ status: 1 }), branchPrefix: 'story/', remote: 'origin', today: '2026-10-15', canRequeue });
+    expect(results).toMatchObject([{ id: item.id, ok: true }]);
+    expect(await found('S-3')).toMatchObject({ id: 'S-3', status: 'todo' });
+  });
+
+  it('writes both ids when two done stories block it', async () => {
+    expect((await run(['story', 'done', 'S-2', '--note', 'x'])).code).toBe(0);
+    const r = await run(['story', 'block', 'S-3', '--reason', 'S-1, S-2 must land first']);
+    expect(r.code).toBe(0);
+    expect(overlay('S-3').blockedBy).toBe('Needs you: S-1 and S-2 are already done, so waiting for them cannot unblock S-3. The architect said: S-1, S-2 must land first');
+    const [item] = await pending();
+    expect(item.title).toBe('S-3 is blocked on S-1 and S-2, which are already done');
+    expect(r.out).toContain('S-3 is blocked on S-1 and S-2, which are already done; asked the owner: ');
+  });
+
+  it('keeps the reason as it is, and asks nothing, while a blocker is not done', async () => {
+    fs.writeFileSync(path.join(dir, 'stories', 'S-1.md'), story('S-1', 'todo', 'depends_on: []\n'));
+    fs.rmSync(path.join(dir, '.foreman', 'stories', 'S-1.json'));
+    const r = await run(BLOCK);
+    expect(r.code).toBe(0);
+    expect(r.out).toBe('');
+    expect(overlay('S-3')).toMatchObject({ status: 'blocked', blockedBy: 'S-1 must land first', notes: [{ text: 'Blocked: S-1 must land first' }] });
+    expect(await pending()).toEqual([]);
+  });
+
+  it('keeps a reason in words as it is, and asks nothing', async () => {
+    expect((await run(['story', 'block', 'S-3', '--reason', 'needs a key'])).code).toBe(0);
+    expect(overlay('S-3').blockedBy).toBe('needs a key');
+    expect(await pending()).toEqual([]);
+  });
+
+  it('exits 1 and says so when the owner cannot be told, the block still recorded', async () => {
+    fs.mkdirSync(path.join(dir, '.foreman'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.foreman', 'decisions'), 'not a folder');
+    const r = await run(BLOCK);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain('S-3 is blocked, but the owner was not told: ');
+    expect(overlay('S-3').blockedBy).toBe(WORDS);
+  });
+});
+
 describe('foreman story set --depends-on', () => {
   const overlay = (id) => JSON.parse(fs.readFileSync(path.join(dir, '.foreman', 'stories', `${id}.json`), 'utf8'));
   const dependsOf = async (id) => JSON.parse((await run(['story', 'next', '--id', id])).out).dependsOn;
@@ -308,6 +401,23 @@ describe('foreman story depend', () => {
     expect(note('S-3')).toBe(before);
     expect(fs.existsSync(overlayFile('S-3'))).toBe(false);
     expect(await pending()).toEqual([]);
+  });
+
+  it('refuses ids that are all done: the story would start again at once; nothing is written', async () => {
+    expect((await run(['story', 'done', 'S-1', '--note', 'x'])).code).toBe(0);
+    const before = note('S-3');
+    const r = await run(DEPEND);
+    expect(r.code).toBe(1);
+    expect(r.err).toBe('S-1 is already done: waiting for it would start S-3 again at once. Leave it blocked for the owner.\n');
+    expect(note('S-3')).toBe(before);
+    expect(fs.existsSync(overlayFile('S-3'))).toBe(false);
+    expect((await found('S-3')).status).toBe('blocked');
+    expect(await pending()).toEqual([]);
+    expect(fs.existsSync(path.join(dir, '.foreman', 'decisions'))).toBe(false);
+    // One done and one not done is allowed: it waits for the one that is not.
+    fs.writeFileSync(path.join(dir, 'stories', 'S-4.md'), story('S-4', 'todo', 'depends_on: []\n'));
+    expect((await run(['story', 'depend', 'S-3', '--on', 'S-1,S-4', '--reason', 'S-4 must land first'])).code).toBe(0);
+    expect((await found('S-3')).dependsOn).toEqual(['S-1', 'S-4']);
   });
 
   it('refuses when features.autoApplyDependsOn is off, the default, and writes nothing', async () => {

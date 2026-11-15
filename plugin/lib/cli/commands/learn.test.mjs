@@ -295,6 +295,88 @@ describe('foreman learn: follow-ups from minor findings', () => {
     });
   });
 
+  describe('stories merge into a stage branch', () => {
+    const localSettings = (values) => {
+      mkdirSync(state(), { recursive: true });
+      writeFileSync(join(state(), 'settings.json'), JSON.stringify(values));
+    };
+    const SF = {
+      productionBranch: 'main',
+      orgs: { 'acme-dev1': { orgId: '00D000000000001AAA' }, 'acme-qa': { orgId: '00D000000000002AAA' } },
+      build: ['acme-dev1'],
+      stages: [{ name: 'qa', org: 'acme-qa', branch: 'qa' }],
+    };
+    const WHY = 'Follow-up proposals are off here: stories here merge into qa, but every story starts from main, which never gets their code, so a follow-up would start without the code it fixes.\n';
+    const stage = () => localSettings({ 'ship.pr.into': 'qa' });
+    const keysOf = () => (existsSync(join(state(), 'learn.json')) ? Object.keys(ledger().proposed).filter((k) => k.startsWith('followup:')) : []);
+
+    it('proposes no follow-up and says why', async () => {
+      stage();
+      findings(minor('S-3', 'Cover the empty case'));
+      const { code, out } = await run(['learn']);
+      expect(code).toBe(0);
+      expect(out).toContain(WHY);
+      expect(out).toContain('Proposed 0 follow-up(s) from minor findings.');
+      expect(await pending()).toEqual([]);
+      expect(keysOf()).toEqual([]);
+    });
+
+    it('the dry run shows none either', async () => {
+      stage();
+      findings(minor('S-3', 'Cover the empty case'));
+      const { out } = await run(['learn', '--dry-run']);
+      expect(out).toContain(WHY);
+      expect(out).not.toContain('Would ask: Follow up on');
+      expect(out).not.toContain('Would create:');
+    });
+
+    it('creates none with features.autoCreateFollowUps on', async () => {
+      localSettings({ 'ship.pr.into': 'qa', 'features.autoCreateFollowUps': true });
+      findings(minor('S-3', 'Cover the empty case'));
+      const { code, out } = await run(['learn']);
+      expect(code).toBe(0);
+      expect(out).toContain(WHY);
+      expect(existsSync(waiting())).toBe(false);
+      expect(await pending()).toEqual([]);
+    });
+
+    it('a Salesforce project whose stage has a branch gets none', async () => {
+      writeFileSync(join(dir, 'foreman.config.json'), JSON.stringify({ version: 1, project: { name: 'Acme' }, pack: 'salesforce', salesforce: SF, checks: [{ run: 'true', when: 'always' }], learning: { auto: false } }));
+      findings(minor('S-3', 'Cover the empty case'));
+      const { code, out } = await run(['learn']);
+      expect(code).toBe(0);
+      expect(out).toContain(WHY);
+      expect(await pending()).toEqual([]);
+      expect(existsSync(waiting())).toBe(false);
+    });
+
+    it('the findings come back when stories merge into the base branch again', async () => {
+      stage();
+      findings(minor('S-3', 'Cover the empty case'));
+      await run(['learn']);
+      rmSync(join(state(), 'settings.json'));
+      const { out } = await run(['learn']);
+      expect(out).toContain('Proposed 1 follow-up(s) from minor findings.');
+    });
+
+    it('an older proposal, applied, creates nothing and ignores its findings', async () => {
+      findings(minor('S-3', 'Cover the empty case'), minor('S-3', 'Name the constant', { where: 'src/b.js' }));
+      await run(['learn']);
+      const [item] = await pending();
+      stage();
+      await run(['decide', 'answer', item.id, 'Create a follow-up story']);
+      const { code, out } = await run(['learn', 'apply', item.id]);
+      expect(code).toBe(0);
+      expect(out).toContain('Did not create Follow-ups from S-3: stories here merge into qa');
+      expect(existsSync(waiting())).toBe(false);
+      expect(ledger().ignored).toEqual(['followup:S-3:cover the empty case', 'followup:S-3:name the constant']);
+      expect(ledger().applied).toEqual([]);
+      expect(await pending()).toEqual([]);
+      // learn reopen takes it back.
+      expect((await run(['learn', 'reopen', item.id])).out).toContain('Reopened Follow up on S-3');
+    });
+  });
+
   describe('follow-ups of follow-ups (features.followUpsOfFollowUps)', () => {
     const followUpFile = () => {
       writeFileSync(join(dir, 'stories', 'F-1.md'), '---\nid: F-1\ntitle: Follow-ups from S-3\nstatus: done\nfollow_up_of: S-3\n---\n\n# F-1\n');

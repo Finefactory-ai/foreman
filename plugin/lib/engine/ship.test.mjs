@@ -782,6 +782,347 @@ describe('runShip', () => {
     const { result } = await runShip({ steps: [a], ctx });
     expect(result.holder).toMatchObject({ pid: 100, slot: 'w1', story: 'S-1', by: 'factory' });
   });
+
+  describe('progress lines', () => {
+    // A step that waits: 12 sleeps of 20 s, four minutes on the fake clock.
+    const waiter = (extra = {}) => ({
+      name: 'wait',
+      label: 'acme waiting',
+      async run(ctx) {
+        for (let i = 0; i < 12; i++) await ctx.sleep(20_000);
+        return { ok: true };
+      },
+      ...extra,
+    });
+
+    it('says once a minute what the release is waiting on, with the minutes so far', async () => {
+      const lines = [];
+      const ctx = fakeCtx({ progress: (l) => lines.push(l) });
+      const { code } = await runShip({ steps: [waiter()], ctx });
+      expect(code).toBe(0);
+      expect(lines).toEqual([1, 2, 3, 4].map((m) => `still releasing S-1: acme waiting (${m} min)`));
+    });
+
+    it('is optional', async () => {
+      const ctx = fakeCtx();
+      expect((await runShip({ steps: [waiter()], ctx })).code).toBe(0);
+    });
+
+    it('a progress that throws never fails the release', async () => {
+      const ctx = fakeCtx({
+        progress: () => {
+          throw new Error('pipe closed');
+        },
+      });
+      expect((await runShip({ steps: [waiter()], ctx })).code).toBe(0);
+    });
+
+    it('puts the real sleep back afterwards, and the fake still records every sleep', async () => {
+      const ctx = fakeCtx({ progress: () => {} });
+      const original = ctx.sleep;
+      await runShip({ steps: [waiter()], ctx });
+      expect(ctx.sleep).toBe(original);
+      expect(ctx.sleeps).toHaveLength(12);
+    });
+
+    it('puts the real sleep back after a failure too', async () => {
+      const ctx = fakeCtx({ progress: () => {} });
+      const original = ctx.sleep;
+      await runShip({ steps: [step('a', { ok: false, code: 2, stage: 'ci', reason: 'x' })], ctx });
+      expect(ctx.sleep).toBe(original);
+    });
+
+    it('names the ship lock while it waits for it', async () => {
+      const locks = fakeLocks({ ship: { pid: 999, slot: 'w2', story: 'S-9' } });
+      const lines = [];
+      const ctx = fakeCtx({ locks, progress: (l) => lines.push(l) });
+      const slow = ctx.sleep;
+      let waits = 0;
+      ctx.sleep = async (ms) => {
+        await slow(ms);
+        if (++waits === 6) locks.held.delete('ship');
+      };
+      const { code } = await runShip({ steps: [step('a')], ctx });
+      expect(code).toBe(0);
+      expect(lines).toEqual(['still releasing S-1: waiting for the ship lock (1 min)', 'still releasing S-1: waiting for the ship lock (2 min)']);
+    });
+
+    it('the 60 s timer also gives a line, and beats, while a step waits on something that is not ctx.sleep', async () => {
+      const lines = [];
+      const beats = [];
+      const ctx = fakeCtx({ progress: (l) => lines.push(l), beat: () => beats.push(1) });
+      let now = ctx.now().getTime();
+      ctx.now = () => new Date(now);
+      const real = globalThis.setInterval;
+      let fire = null;
+      globalThis.setInterval = (fn) => {
+        fire = fn;
+        return { unref() {} };
+      };
+      try {
+        const slowStep = {
+          name: 'x',
+          async run() {
+            now += 61_000;
+            fire();
+            return { ok: true };
+          },
+        };
+        await runShip({ steps: [slowStep], ctx });
+      } finally {
+        globalThis.setInterval = real;
+      }
+      expect(beats).toEqual([1]);
+      expect(lines).toEqual(['still releasing S-1: x (1 min)']);
+    });
+  });
+
+  describe('a signal (interrupts)', () => {
+    // Registers the runner's handler, as `foreman ship` does for SIGTERM, SIGINT and SIGHUP.
+    const hooks = () => {
+      const h = { handler: null, offed: false, got: null };
+      h.interrupts = (fn) => {
+        h.handler = fn;
+        return () => {
+          h.offed = true;
+        };
+      };
+      return h;
+    };
+
+    it('before anything went live it releases the lock and says what stopped', async () => {
+      const h = hooks();
+      const ctx = fakeCtx();
+      let heldAfter = null;
+      const a = {
+        name: 'push',
+        run() {
+          h.got = h.handler('SIGTERM');
+          heldAfter = ctx.locks.held.has('ship');
+          return { ok: true };
+        },
+      };
+      await runShip({ steps: [a], ctx, interrupts: h.interrupts });
+      expect(h.got).toMatchObject({ code: 1, result: { stage: 'interrupted', step: 'push', lockReleased: true, signal: 'SIGTERM', story: 'S-1' } });
+      expect(h.got.result.reason).toContain('before anything went live');
+      expect(heldAfter).toBe(false);
+      expect(ctx.events.some((e) => e.kind === 'info')).toBe(true);
+      expect(h.offed).toBe(true);
+      expect(ctx.halts).toEqual([]);
+    });
+
+    it('keeps the facts of the steps that ran', async () => {
+      const h = hooks();
+      const ctx = fakeCtx();
+      const a = step('pr', { ok: true, pr: 'https://x/pull/1' });
+      const b = {
+        name: 'ci',
+        run() {
+          h.got = h.handler('SIGINT');
+          return { ok: true };
+        },
+      };
+      await runShip({ steps: [a, b], ctx, interrupts: h.interrupts });
+      expect(h.got.result).toMatchObject({ pr: 'https://x/pull/1', step: 'ci', signal: 'SIGINT' });
+    });
+
+    it('keeps the lock during a point-of-no-return step, as the record of where it stopped, and warns', async () => {
+      const h = hooks();
+      const ctx = fakeCtx();
+      let heldAfter = null;
+      const merge = {
+        name: 'merge',
+        pointOfNoReturn: true,
+        run() {
+          h.got = h.handler('SIGTERM');
+          heldAfter = ctx.locks.held.get('ship');
+          return { ok: true };
+        },
+      };
+      await runShip({ steps: [merge], ctx, interrupts: h.interrupts });
+      expect(h.got).toMatchObject({ code: 1, result: { stage: 'interrupted', step: 'merge', lockReleased: false } });
+      expect(h.got.result.reason).toContain('lock is kept');
+      expect(heldAfter).toMatchObject({ stage: 'merge' });
+      expect(ctx.events.some((e) => e.kind === 'warn')).toBe(true);
+      expect(ctx.halts).toEqual([]);
+    });
+
+    it('keeps the lock in a later step once a point of no return has passed', async () => {
+      const h = hooks();
+      const ctx = fakeCtx();
+      let heldAfter = null;
+      const merge = step('merge', { ok: true }, { pointOfNoReturn: true });
+      const verify = {
+        name: 'verify',
+        run() {
+          h.got = h.handler('SIGHUP');
+          heldAfter = ctx.locks.held.has('ship');
+          return { ok: true };
+        },
+      };
+      await runShip({ steps: [merge, verify], ctx, interrupts: h.interrupts });
+      expect(h.got.result).toMatchObject({ stage: 'interrupted', step: 'verify', lockReleased: false });
+      expect(heldAfter).toBe(true);
+      expect(ctx.locks.held.has('ship')).toBe(true);
+      expect(ctx.halts).toEqual([]);
+    });
+
+    it('a step that may mark the point of no return, a deploy and a noRollback step all keep the lock', async () => {
+      for (const extra of [{ mayMarkNoReturn: true }, { deploys: true }, { noRollback: true }]) {
+        const h = hooks();
+        const ctx = fakeCtx();
+        const a = {
+          name: 'live',
+          ...extra,
+          run() {
+            h.got = h.handler('SIGTERM');
+            return { ok: true };
+          },
+        };
+        await runShip({ steps: [a], ctx, interrupts: h.interrupts });
+        expect(h.got.result.lockReleased).toBe(false);
+      }
+    });
+
+    it('a step whose result said noReturn marks everything after it live', async () => {
+      const h = hooks();
+      const ctx = fakeCtx();
+      const migrate = step('migrate', { ok: true, noReturn: true });
+      const next = {
+        name: 'next',
+        run() {
+          h.got = h.handler('SIGTERM');
+          return { ok: true };
+        },
+      };
+      await runShip({ steps: [migrate, next], ctx, interrupts: h.interrupts });
+      expect(h.got.result.lockReleased).toBe(false);
+    });
+
+    it('a live step that returns after the signal keeps the lock after runShip returns', async () => {
+      const h = hooks();
+      const ctx = fakeCtx();
+      const merge = {
+        name: 'merge',
+        pointOfNoReturn: true,
+        run() {
+          h.got = h.handler('SIGTERM');
+          return { ok: true };
+        },
+      };
+      const returned = await runShip({ steps: [merge], ctx, interrupts: h.interrupts });
+      expect(returned).toBe(h.got);
+      expect(returned).toMatchObject({ code: 1, result: { stage: 'interrupted', lockReleased: false } });
+      expect(ctx.locks.held.get('ship')).toMatchObject({ pid: ctx.pid });
+      expect(ctx.halts).toEqual([]);
+      expect(h.offed).toBe(true);
+    });
+
+    it('a failure that comes after the signal neither halts nor rolls back', async () => {
+      const h = hooks();
+      const ctx = fakeCtx();
+      const onFailure = step('rollback', { ok: true, command: 'x' }, { label: 'rolling production back', commandFor: () => 'x' });
+      const merge = step('merge', { ok: true, sha: 's' }, { pointOfNoReturn: true });
+      const deploy = step('deploy-github', { ok: true }, { deploys: true, halts: true });
+      const watch = {
+        name: 'watch',
+        halts: true,
+        run() {
+          h.got = h.handler('SIGTERM');
+          return { ok: false, code: 2, stage: 'watch', reason: 'x' };
+        },
+      };
+      const returned = await runShip({ steps: [merge, deploy, watch], ctx, interrupts: h.interrupts, onFailure });
+      expect(returned).toBe(h.got);
+      expect(returned).toMatchObject({ code: 1, result: { stage: 'interrupted', lockReleased: false } });
+      expect(onFailure.ran).toEqual([]);
+      expect(ctx.halts).toEqual([]);
+      expect(ctx.locks.held.has('ship')).toBe(true);
+    });
+
+    it('a step that is not live and fails after the signal returns the interruption', async () => {
+      const h = hooks();
+      const ctx = fakeCtx();
+      const ci = {
+        name: 'ci',
+        run() {
+          h.got = h.handler('SIGTERM');
+          return { ok: false, code: 2, stage: 'ci', reason: 'x' };
+        },
+      };
+      const returned = await runShip({ steps: [ci], ctx, interrupts: h.interrupts });
+      expect(returned).toBe(h.got);
+      expect(returned).toMatchObject({ code: 1, result: { stage: 'interrupted', lockReleased: true } });
+      expect(ctx.halts).toEqual([]);
+      expect(ctx.locks.held.has('ship')).toBe(false);
+    });
+
+    it('a park after the signal is not recorded', async () => {
+      const h = hooks();
+      const ctx = fakeCtx();
+      const promote = {
+        name: 'acme-promote',
+        run() {
+          h.got = h.handler('SIGTERM');
+          return { ok: true, parked: { reason: 'r', check: { id: 'D-1' } } };
+        },
+      };
+      const returned = await runShip({ steps: [promote], ctx, interrupts: h.interrupts });
+      expect(returned.code).toBe(1);
+      expect(returned.result.stage).toBe('interrupted');
+      expect(returned).toBe(h.got);
+    });
+
+    it('while waiting for another release it touches nothing and says it was waiting', async () => {
+      const h = hooks();
+      const locks = fakeLocks({ ship: { pid: 999, slot: 'w2', story: 'S-9' } });
+      const ctx = fakeCtx({ locks });
+      const slow = ctx.sleep;
+      const counted = step('a');
+      let releasesAtStop = null;
+      ctx.sleep = async (ms) => {
+        await slow(ms);
+        if (!h.got) {
+          h.got = h.handler('SIGTERM');
+          releasesAtStop = locks.log.filter((l) => l[0] === 'release').length;
+        }
+        if (ctx.sleeps.length === 3) locks.held.delete('ship');
+      };
+      const returned = await runShip({ steps: [counted], ctx, interrupts: h.interrupts });
+      expect(h.got).toMatchObject({ code: 1, result: { stage: 'interrupted', step: 'waiting', lockReleased: false } });
+      expect(h.got.result.reason).toContain('while waiting for the ship lock');
+      expect(releasesAtStop).toBe(0);
+      expect(returned).toBe(h.got);
+      expect(counted.ran).toHaveLength(0);
+      expect(ctx.locks.held.has('ship')).toBe(false);
+      expect(ctx.sh.calls.filter((c) => c.startsWith('git fetch'))).toEqual([]);
+    });
+
+    it('while waiting, another holder\'s lock is still there', async () => {
+      const h = hooks();
+      const locks = fakeLocks({ ship: { pid: 999, slot: 'w2', story: 'S-9' } });
+      const ctx = fakeCtx({ locks });
+      ctx.sleep = async () => {
+        h.got = h.handler('SIGTERM');
+        ctx.halted = true;
+      };
+      const { code } = await runShip({ steps: [step('a')], ctx, interrupts: h.interrupts });
+      expect(code).toBe(8);
+      expect(h.got.result).toMatchObject({ step: 'waiting', lockReleased: false });
+      expect(locks.held.get('ship').pid).toBe(999);
+      expect(h.offed).toBe(true);
+    });
+
+    it('is switched off after the release ends, whatever the result', async () => {
+      const h = hooks();
+      await runShip({ steps: [step('a', { ok: false, code: 2, stage: 'ci', reason: 'x' })], ctx: fakeCtx(), interrupts: h.interrupts });
+      expect(h.offed).toBe(true);
+    });
+
+    it('a release without interrupts runs as before', async () => {
+      expect((await runShip({ steps: [step('a')], ctx: fakeCtx() })).code).toBe(0);
+    });
+  });
 });
 
 describe('lockStore', () => {

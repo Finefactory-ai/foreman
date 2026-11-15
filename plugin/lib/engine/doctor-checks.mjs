@@ -47,7 +47,7 @@
 // (locks.mjs) and warns for each whose story is done, retired or missing from the story source's
 // list (scheduler.mjs ownerClaimFate), naming the story ids only. It reads the list from the
 // cache (the source's cacheOnly), so it never calls Jira or sf, and it removes nothing: the run
-// clears them on its first tick (supervisor.mjs sweepOwnerClaims). ok with no owner claims
+// clears them on its first tick (slot-starts.mjs sweepOwnerClaims, a part of supervisor.mjs). ok with no owner claims
 // (reading no stories), 'could not read the stories' when the source cannot be opened or its list
 // cannot be read (a missing stories folder), and ok when the list is empty, since an empty list
 // says nothing.
@@ -133,7 +133,10 @@
 // in story sessions (foreman-command.mjs). The fix says to wrap it in `if [[ -z "$FOREMAN_RUN" ]];
 // then ... fi`. It also warns, naming the shell, when the shell cannot be run or its answer says
 // nothing; it is ok when the shell has no foreman, or no SHELL is set (nothing is run). A warn
-// only, and it never prints an alias or function body.
+// only, and it never prints an alias or function body. When that file is the bin of an installed
+// Foreman copy (installed_plugins.json), the warning names that copy and its version and says to
+// update it (`claude plugin update <id>`): story sessions run this one anyway (session.mjs puts its
+// bin first and turns the installed copy off), but other shells and sessions run the installed one.
 //
 // With a config, 'agent models' (Claude Code step) looks at the newest run record that ended in
 // the last 7 days and has its agents (run-record.mjs; ctx.now stands in for the clock). Its
@@ -155,7 +158,7 @@ import { PACKS, packFor } from '../../packs/index.mjs';
 import * as emailResend from '../adapters/notify/email-resend.mjs';
 import { parsePluginList } from './plugin-list.mjs';
 import { copyWarning, installedCopies, ownCopy, samePlace, sessionPlugin } from './plugin-copy.mjs';
-import { FIX_HINT, overrideText, readType } from './foreman-command.mjs';
+import { FIX_HINT, overrideText, readType, updateHint } from './foreman-command.mjs';
 import { withFix } from '../setup/fix.mjs';
 import { stepForKey } from '../setup/keys.mjs';
 import { stateDir } from './paths.mjs';
@@ -618,7 +621,12 @@ export function buildChecks(config, ctx) {
     const overridden = (found) => warn(overrideText({ found, expected }), hint(FIX_HINT));
     if (t.kind === 'alias') return overridden('a shell alias');
     if (t.kind === 'function') return overridden('a shell function');
-    if (t.kind === 'file') return samePlace(t.path, expected, { fs: ctx.fs, home: ctx.home }) ? ok() : overridden(t.path);
+    if (t.kind === 'file') {
+      if (samePlace(t.path, expected, { fs: ctx.fs, home: ctx.home })) return ok();
+      const copy = installedCopies({ pluginsDir: ctx.pluginsDir, root: ctx.root, fs: ctx.fs }).find((c) => samePlace(t.path, path.join(c.path, 'bin', 'foreman'), { fs: ctx.fs, home: ctx.home }));
+      if (copy) return warn(`\`foreman\` in your shell is the installed Foreman plugin ${copy.version ?? '?'} (${copy.path}), not this one at ${expected}; story sessions run this one, but other shells and Claude Code sessions in this project run the installed copy`, hint(updateHint(copy.id)));
+      return overridden(t.path);
+    }
     if (t.kind === 'missing') return ok('your shell has no foreman of its own; story sessions use the plugin\'s');
     if (t.kind === 'failed') return warn(`could not run your shell ${shell} to check \`foreman\` (${t.reason})`, hint(`check that \`${shell} -ic 'type foreman'\` runs`));
     return warn(`could not tell what \`foreman\` is in your shell ${shell}`, hint(`run \`${shell} -ic 'type foreman'\` and check its output`));

@@ -21,6 +21,7 @@ import {
   restartFor,
   spawnSh,
 } from './node-path.mjs';
+import { SUPERVISOR_PARTS, supervisorSource } from '../../../test/supervisor-source.mjs';
 
 const DYLD = 'dyld[4242]: Library not loaded: /opt/homebrew/opt/simdjson/lib/libsimdjson.33.dylib';
 const LINUX = 'node: error while loading shared libraries: libsimdjson.so.33: cannot open shared object file';
@@ -400,14 +401,14 @@ describe('restartFor', () => {
 
 describe('the sources', () => {
   it('start no child with process.execPath', () => {
-    for (const file of ['supervisor.mjs', 'owner-commands.mjs', 'account-checks.mjs', 'story-claims.mjs', 'standby.mjs', 'session-records.mjs', 'background-jobs.mjs', 'dry-run.mjs']) {
+    for (const file of [...SUPERVISOR_PARTS, 'owner-commands.mjs', 'account-checks.mjs', 'story-claims.mjs', 'standby.mjs', 'session-records.mjs', 'background-jobs.mjs', 'dry-run.mjs']) {
       const src = fs.readFileSync(new URL(`./${file}`, import.meta.url), 'utf8');
       expect(src).not.toMatch(/\b(spawn|sh|run)\(process\.execPath/);
     }
   });
 
   it("wire the supervisor's restart and picks to the Node watch", () => {
-    const src = fs.readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     expect(src).toContain('node: () => NODE.node() });');
     expect(src).toContain('let restartNow = restartFor({ code: restartPending, node: NODE.broken(), stopping, accepts: newCodeAccepts });');
     expect(src).toContain('check: restartNow.check });');

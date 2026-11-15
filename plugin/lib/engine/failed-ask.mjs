@@ -17,8 +17,16 @@
 //   releaseAsksFor(pending, id)
 //     → the "<ID> could not be released" items still open for the story, answered or not, so a
 //       story that shipped can have them closed before a stale answer runs against it.
+//
+//   haltTasksFor(pending, { story, before, unanswered })
+//     → the halt's tasks still open: kind task, urgent, and titled exactly haltTitle(story)
+//       ("<ID> stopped the release line", the title the story skill's ship-stopped step gives), so
+//       an urgent task anyone adds with `foreman decide add --urgent` under another title is never
+//       closed. `story` keeps one story's, `before` (ms) keeps those created at or before that time
+//       (an unreadable createdAt counts as older), and `unanswered` leaves out those the owner has
+//       answered. So a shipped story, a done story or a halt that was cleared can close them.
 
-import { kindOf, OPTIONS, releaseTitle } from './answers.mjs';
+import { haltTitle, kindOf, OPTIONS, releaseTitle } from './answers.mjs';
 import { waitsOnStories } from './pick.mjs';
 
 const NOT_ASKS = ['depends', 'waits', 'trait', 'followUp', 'learned', 'rolledBack', 'created'];
@@ -37,6 +45,17 @@ export function resumesByItself(story, { idPattern } = {}) {
 
 export function releaseAsksFor(pending, id) {
   return (Array.isArray(pending) ? pending : []).filter((item) => item?.story === id && !item.appliedAt && kindOf(item) === 'release');
+}
+
+export function haltTasksFor(pending, { story, before, unanswered = false } = {}) {
+  return (Array.isArray(pending) ? pending : []).filter((item) => {
+    if (!item || item.kind !== 'task' || item.urgent !== true || item.appliedAt) return false;
+    if (typeof item.story !== 'string' || item.title !== haltTitle(item.story)) return false;
+    if (typeof story === 'string' && item.story !== story) return false;
+    if (typeof before === 'number' && Date.parse(item.createdAt) > before) return false;
+    if (unanswered && item.answer) return false;
+    return true;
+  });
 }
 
 export function failedAsk({ id, title = '', reason = '', pr = '', cause = 'story', pending = [], earlierFailures = 0 } = {}) {

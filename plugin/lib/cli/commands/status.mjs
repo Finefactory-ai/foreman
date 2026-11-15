@@ -52,6 +52,8 @@
 // no run on it, an invalid file is refused as by every other command.
 // While more stories run than the worker count (it was lowered while they ran; the snapshot's
 // draining), the Workers line says so: "Workers: 3 of 5 slots · 4 running, limit 3: draining".
+// A run with a number that has stories resumed on top of it (the snapshot's asked) gets one line
+// after the Workers line: "Stories: 1 asked for, 3 resumed on top (ACME-1, ACME-2, ACME-3)".
 // The stories skipped from the command centre this run (the snapshot's skipped) get one line after
 // the slots: "  Skipped this run: ACME-1, ACME-2 (`foreman next <id>` builds one again)".
 // Queued work (the snapshot's queued) follows it under "  Queued:", one line of its text each:
@@ -64,6 +66,7 @@ import { BUNDLES } from '../../console/bundles.mjs';
 import { taskDetails } from '../../console/task-details.mjs';
 import { learningCounts } from '../../console/learned.mjs';
 import { headline, waitingCount } from '../../console/waiting.mjs';
+import { askedText } from '../../engine/asked-for.mjs';
 import { restartWhy } from '../../engine/code-version.mjs';
 import { openConsole } from '../../engine/console.mjs';
 import { ownerWaiting, snapshot } from '../../engine/state.mjs';
@@ -193,6 +196,8 @@ export function describeStatus(snap, slots, { items = snap.waiting?.items ?? [],
     lines.push(`  Stop requested by ${snap.stoppedBy.text}: the run finishes the stories in progress, then stops.`);
   }
   lines.push(`Workers: ${snap.workers} of ${slots} ${slots === 1 ? 'slot' : 'slots'}${snap.draining?.text ? ` · ${snap.draining.text}` : ''}`);
+  const asked = askedText(snap.asked);
+  if (asked) lines.push(asked);
   const pending = snap.restartPending ?? null;
   for (const s of snap.slots ?? []) {
     const story = s.story ? `${s.story.id}${s.story.title ? ` ${s.story.title}` : ''} · ${s.story.stage}` : '';

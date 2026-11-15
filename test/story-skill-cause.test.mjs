@@ -15,6 +15,13 @@ describe('the story skill and --cause', () => {
     const text = skillFile('ship-stopped.md');
     expect(text).toMatch(/at `mergeable-recheck` a second time[^]*`--cause environment` to `foreman story end`/);
   });
+  it('ship-stopped.md tells the session, on a Gearset rate limit, not to run ship again and to stop with it', () => {
+    const text = skillFile('ship-stopped.md');
+    expect(text).toMatch(/`rateLimited: true`[^]*Do not run `foreman ship` again[^]*`--cause environment` to `foreman story end`/);
+    const at = text.indexOf('- **1, with `rateLimited: true`**');
+    expect(at).toBeGreaterThan(-1);
+    expect(at).toBeLessThan(text.indexOf('\n- **1** —'));
+  });
   it('ship-conflict.md names it for a conflict that could not be settled', () => {
     const text = skillFile('ship-conflict.md');
     expect(text).toContain('`--cause environment`');

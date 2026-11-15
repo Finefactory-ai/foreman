@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { CPU_BUSY_SHARE, CPU_SAMPLE_MS, cpuSampleMs, cpuWatch, groupCpuMs, MIN_CPU_SAMPLE_MS, parseCpuTime } from './session-cpu.mjs';
+import { supervisorSource } from '../../../test/supervisor-source.mjs';
 
 describe('parseCpuTime', () => {
   it('reads macOS minutes:seconds and Linux [D-]HH:MM:SS', () => {
@@ -112,7 +113,7 @@ describe('cpuSampleMs', () => {
   });
 
   it('the supervisor reads its sample interval from FOREMAN_CPU_SAMPLE_MS through cpuSampleMs', () => {
-    const src = readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     expect(src).toContain('const cpu = cpuWatch({ sampleMs: cpuSampleMs(process.env.FOREMAN_CPU_SAMPLE_MS) });');
   });
 });

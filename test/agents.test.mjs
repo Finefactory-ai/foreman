@@ -24,7 +24,16 @@ const frontmatter = (text) => {
 
 const tools = (name) => frontmatter(read(name)).tools.split(',').map((t) => t.trim());
 
+// The model split Foreman ships with. A project's roles.<role>.model setting overrides it.
+const MODELS = { architect: 'opus', tester: 'opus', 'security-reviewer': 'opus', builder: 'sonnet', 'compliance-reviewer': 'sonnet' };
+
 describe('template agents', () => {
+  for (const [name, model] of Object.entries(MODELS)) {
+    it(`${name} runs on ${model} unless the project sets a model`, () => {
+      expect(frontmatter(read(name)).model).toBe(model);
+    });
+  }
+
   for (const name of NAMES) {
     describe(name, () => {
       it('exists with name, description and tools, and its name matches the file', () => {

@@ -109,6 +109,29 @@
 //                                       none, no-deploy or unknown, for the Set up screen: the
 //                                       Gearset API shows no CI job's test level, so a stage it
 //                                       cannot show is confirmed there by the owner.
+//   salesforce gearset project file     release gearset only: the production branch and each stage's
+//                                       branch track exactly one sfdx-project.json, as committed
+//                                       (the remote branch, else the local one; no fetch, no write).
+//                                       The Salesforce skills ship sample ones, and Gearset refuses
+//                                       every pull request when it finds more than one. A branch git
+//                                       cannot read only warns. It counts every sfdx-project.json in
+//                                       the whole repository, even when the project is a subfolder of
+//                                       it. The detail names the extra paths, from the repository top.
+//   salesforce gearset webhooks         release gearset only: the repository's webhooks to
+//                                       webhooks.gearset.com (one for the pipeline, one for the CI
+//                                       job), read with `gh api` from the project folder: none, one
+//                                       switched off, or one whose last delivery failed warns, since
+//                                       Gearset then validates nothing and the release waits for a
+//                                       status that never comes. A sign-in that cannot read hooks
+//                                       (HTTP 403 or 404) is skipped quietly (ok). Only warns. The
+//                                       detail names hook ids and HTTP codes, never a URL.
+//   salesforce gearset later stages     release gearset only, always ok, from the config alone (no
+//                                       network): who validates each later stage's promotion pull
+//                                       request, since Gearset never does by itself. Says Foreman
+//                                       does (validateLaterStages "foreman", the default), or that
+//                                       each story waits for a Run validation click ("gearset"),
+//                                       or that the owner promotes every stage (gearset.promote
+//                                       "owner"), or that one stage has none to say.
 //   salesforce workflows                every release path: no .github/workflows file that runs
 //                                       on push to the PR target or a stage branch deploys to an
 //                                       org not in salesforce.orgs, or to a target it cannot
@@ -137,8 +160,8 @@
 // each configured value as its own argument. The org, isolation and source tracking checks run sf
 // in the isolated sf home, so they check the logins the sessions will see; the tools and telemetry
 // checks run it as the owner. A detail names only aliases, org IDs, branch names, versions,
-// variable names, skill names, agent names, test names, coverage percentages, dates, test run IDs
-// and the isolated sf home's path: never a variable's value, never a file's contents, never a
+// variable names, skill names, agent names, test names, coverage percentages, dates, test run IDs,
+// tracked file paths and the isolated sf home's path: never a variable's value, never a file's contents, never a
 // username, and never anything from an sf result but the fields read here. The skills lock check
 // fails, without naming the source, when salesforce.skills.source holds a user name or token (see
 // hasCredentials in skills.mjs).
@@ -153,7 +176,7 @@ import { checkOptions as checkStoriesOptions } from '../../lib/adapters/stories/
 import { coolingDown, isNotSignedIn, isUnreachable, runSf } from './sf.mjs';
 import { SF_PLUGIN, activeScratchQuery, aliasStray, binDir, findRealSf, homeProblem, homeVerdict, isolatedSh, listOrgs, listedEntry, sfHome } from './isolation.mjs';
 import { parsePluginList } from '../../lib/engine/plugin-list.mjs';
-import { CREDENTIALS_REASON, SKILL_NAME, hasCredentials, hashSkillDir, namedSkills, readLock } from './skills.mjs';
+import { CREDENTIALS_REASON, SAMPLE_PROJECT, SKILL_NAME, hasCredentials, namedSkills, readLock, skillUnchanged } from './skills.mjs';
 import { SUCCESSFUL, TOKEN_VAR, environmentFor, gearsetDeployments, gearsetEnvironments, gearsetToken } from './gearset.mjs';
 import { JOB_ID } from './deploy-result.mjs';
 import { pullRequestCiCheck, workflowsCheck } from './workflows.mjs';
@@ -194,6 +217,9 @@ const DATA_CLOUD_QUERY = "SELECT DeveloperName FROM PermissionSetLicense WHERE S
 const NO_AGENTFORCE = /INVALID_TYPE|not supported/i;
 const AGENTFORCE_FIX = { hint: 'turn on Agentforce and Data Cloud in that org, then run the doctor again' };
 const GIT_TIMEOUT_MS = 30_000;
+// A remote that is not a remote name (a URL, an option) is never printed: it may hold a token.
+const NOT_A_REMOTE = 'could not check: remote in foreman.config.json is not a remote name';
+const REMOTE_FIX = { hint: 'set remote in foreman.config.json to the name of a git remote, such as origin' };
 const MAX_NAMED = 5;
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const AGENT_NAME = /^[a-z0-9-]+$/;
@@ -373,7 +399,7 @@ function productionBranchCheck(config, b, plan, ctx) {
     return fail(`pull requests would merge into ${production}, the production branch`);
   }
   const remote = isText(config.remote) ? config.remote : 'origin';
-  if (remote.startsWith('-')) return warn(`could not check ${remote}`);
+  if (!BRANCH.test(remote)) return warn(NOT_A_REMOTE, REMOTE_FIX);
   const r = ctx.sh('git', ['ls-remote', '--heads', remote, production], { cwd: ctx.root, timeout: GIT_TIMEOUT_MS }) ?? {};
   if (r.status !== 0) return warn(`could not check ${remote}`);
   if (!String(r.stdout ?? '').trim()) return warn(`${production} is not a branch on ${remote}; check salesforce.productionBranch`);
@@ -413,7 +439,7 @@ function skillsLockCheck(b, ctx) {
   const changed = names.filter((name) => {
     const dir = isDir(ctx.fs, agentsDir(name)) ? agentsDir(name) : claudeDir(name);
     try {
-      return hashSkillDir(dir, ctx.fs) !== lock.skills[name].computedHash;
+      return !skillUnchanged(dir, lock.skills[name], ctx.fs);
     } catch {
       return true;
     }
@@ -515,7 +541,7 @@ const pipelineOf = (b) => (isObject(b.gearset) && isText(b.gearset.pipelineId) ?
 // last CI_DAYS days, and its NumberTestsCompleted in the stage's org. The result also carries
 // stages: [{ name, state, tests }], state 'ran', 'none' (0 tests), 'no-deploy' or 'unknown',
 // which the Set up screen reads.
-async function gearsetCiTestsCheck(cfg, b, plan, ctx, iso) {
+async function gearsetCiTestsCheck(cfg, b, plan, ctx, iso, environments) {
   const states = new Map(plan.layout.stages.map((s) => [s.name, { name: s.name, state: 'unknown', tests: null }]));
   const done = (r) => ({ ...r, stages: [...states.values()] });
   const mark = (name, state, tests = null) => states.set(name, { name, state, tests });
@@ -523,7 +549,7 @@ async function gearsetCiTestsCheck(cfg, b, plan, ctx, iso) {
   if (!token) return done(warn(`skipped: ${TOKEN_VAR} is not set`));
   const fetch = ctx.fetch ?? globalThis.fetch;
   const sleep = typeof ctx.sleep === 'function' ? ctx.sleep : realSleep;
-  const read = await gearsetEnvironments({ fetch, token, pipelineId: pipelineOf(b) });
+  const read = await environments(token);
   if (!read.ok) return done(warn(read.error));
   const now = typeof ctx.now === 'function' ? ctx.now() : new Date();
   const from = new Date(now.getTime() - CI_DAYS * 24 * 60 * 60_000);
@@ -578,10 +604,10 @@ async function gearsetCiTestsCheck(cfg, b, plan, ctx, iso) {
 
 // Whether each stage's Gearset environment has a CI job that is on: Gearset deploys every
 // promotion through it. A stage with no environment is left to the environments check.
-async function gearsetCiJobCheck(cfg, b, plan, ctx) {
+async function gearsetCiJobCheck(cfg, b, plan, ctx, environments) {
   const token = gearsetToken(projectEnv(cfg, ctx));
   if (!token) return warn(`skipped: ${TOKEN_VAR} is not set`, { hint: `add ${TOKEN_VAR} first` });
-  const read = await gearsetEnvironments({ fetch: ctx.fetch ?? globalThis.fetch, token, pipelineId: pipelineOf(b) });
+  const read = await environments(token);
   if (!read.ok) return read.transient ? warn(read.error, { hint: 'run the doctor again later' }) : fail(read.error);
   const problems = [];
   const fine = [];
@@ -596,10 +622,94 @@ async function gearsetCiJobCheck(cfg, b, plan, ctx) {
   return problems.length ? fail(problems.join('; ')) : ok(fine.join(', '));
 }
 
+// Whether each branch Gearset reads (the production branch and each stage's) tracks exactly one
+// sfdx-project.json: Gearset refuses every pull request when it finds more, and the Salesforce
+// skills ship samples of it. Reads the committed tree of the remote branch, else the local one; it
+// never fetches and never writes. It counts every sfdx-project.json in the whole repository, even
+// when the project is a subfolder of it, and names the extra paths from the repository top. A
+// branch it cannot read only warns.
+function gearsetProjectFileCheck(cfg, b, plan, ctx) {
+  const branches = [...new Set([b.productionBranch, ...plan.layout.stages.map((s) => s.branch)].filter((v) => isText(v) && BRANCH.test(v)))];
+  const remote = isText(cfg.remote) ? cfg.remote : 'origin';
+  if (!BRANCH.test(remote)) return warn(NOT_A_REMOTE, REMOTE_FIX);
+  const opts = { cwd: ctx.root, timeout: GIT_TIMEOUT_MS };
+  const problems = [];
+  const unread = [];
+  // Where the project folder sits in the repository: '' at the top, 'acme/' in a subfolder.
+  let own = SAMPLE_PROJECT;
+  if (branches.length) {
+    const top = ctx.sh('git', ['rev-parse', '--show-prefix'], opts) ?? {};
+    if (top.status !== 0) return warn(`could not read ${named(branches)}; fetch them, then run the doctor again`);
+    own = `${String(top.stdout ?? '').trim()}${SAMPLE_PROJECT}`;
+  }
+  for (const branch of branches) {
+    const ref = [`refs/remotes/${remote}/${branch}`, `refs/heads/${branch}`].find((r) => (ctx.sh('git', ['rev-parse', '--verify', '--quiet', `${r}^{commit}`], opts) ?? {}).status === 0);
+    if (!ref) {
+      unread.push(branch);
+      continue;
+    }
+    const tree = ctx.sh('git', ['ls-tree', '--full-tree', '-r', '-z', '--name-only', ref], opts) ?? {};
+    if (tree.status !== 0) {
+      unread.push(branch);
+      continue;
+    }
+    const files = String(tree.stdout ?? '').split('\0').filter((f) => f.split('/').at(-1) === SAMPLE_PROJECT);
+    if (files.length > 1) problems.push(`${branch} tracks ${files.length} sfdx-project.json files: ${named(files.filter((f) => f !== own))}`);
+  }
+  if (problems.length) return fail(`${problems.join('; ')}; Gearset needs exactly one, so it refuses every pull request`);
+  if (unread.length) return warn(`could not read ${named(unread)}; fetch them, then run the doctor again`);
+  return ok(`one sfdx-project.json on ${branches.join(', ')}`);
+}
+
+const GEARSET_HOOK_HOST = 'webhooks.gearset.com';
+
+const isGearsetHook = (h) => {
+  try {
+    return new URL(h?.config?.url).hostname === GEARSET_HOOK_HOST;
+  } catch {
+    return false;
+  }
+};
+
+// Whether the repository's Gearset webhooks are on and delivering: Gearset adds one for the
+// pipeline and one for the CI job, and with the CI job's off it never validates a pull request.
+// Read through gh, from the project folder. A sign-in that cannot read hooks (HTTP 403 or 404) is
+// skipped quietly. The detail names only hook ids, HTTP codes and the host, never a hook's URL,
+// which can carry a secret.
+function gearsetWebhooksCheck(ctx) {
+  const r = ctx.sh('gh', ['api', 'repos/{owner}/{repo}/hooks?per_page=100'], { cwd: ctx.root, timeout: GIT_TIMEOUT_MS }) ?? {};
+  if (r.status !== 0) {
+    if (/HTTP 40[34]/.test(`${r.stderr ?? ''}\n${r.stdout ?? ''}`)) return ok("skipped: the GitHub sign-in cannot read this repository's webhooks");
+    return warn("could not read the repository's webhooks");
+  }
+  let hooks;
+  try {
+    hooks = JSON.parse(String(r.stdout ?? ''));
+  } catch {
+    hooks = null;
+  }
+  if (!Array.isArray(hooks)) return warn('GitHub answered something unreadable for the webhooks');
+  const ours = hooks.filter(isGearsetHook);
+  if (!ours.length) return warn('no Gearset webhook on this repository; Gearset adds them when its pipeline connects to the repository');
+  const problems = [];
+  for (const h of ours) {
+    const code = h.last_response?.code;
+    if (h.active === false) problems.push(`Gearset webhook ${h.id} is switched off`);
+    else if (Number.isInteger(code) && (code < 200 || code > 299)) problems.push(`Gearset webhook ${h.id}'s last delivery failed (HTTP ${code})`);
+  }
+  if (problems.length) return warn(problems.join('; '));
+  return ok(ours.length === 1 ? '1 Gearset webhook on' : `${ours.length} Gearset webhooks on`);
+}
+
 // The checks the gearset release path adds. The token check names Foreman's own keys file
 // (.env.foreman), where the token belongs, never the value.
 function gearsetChecks(cfg, b, plan, ctx, add, iso) {
   const ownFile = foremanEnvName(cfg);
+  // The environments check and the two CI checks read the same Gearset data, and Gearset's rate
+  // limit is small, so one doctor run reads it once. The promise is kept, so it holds whether the
+  // checks run one after another or together.
+  let shared;
+  const environments = (token) => (shared ??= gearsetEnvironments({ fetch: ctx.fetch ?? globalThis.fetch, token, pipelineId: pipelineOf(b) }));
   add('salesforce gearset token', 'sf-gearset', () => (gearsetToken(projectEnv(cfg, ctx))
     ? ok(`${TOKEN_VAR} is set`)
     : fail(`${TOKEN_VAR} is not set in ${ownFile}; create a Gearset API access token (My account → Team security → Access token management) and add it`)), { hint: `add ${TOKEN_VAR} to ${ownFile}` });
@@ -613,7 +723,7 @@ function gearsetChecks(cfg, b, plan, ctx, add, iso) {
   add('salesforce gearset environments', 'sf-gearset', async () => {
     const token = gearsetToken(projectEnv(cfg, ctx));
     if (!token) return warn(`skipped: ${TOKEN_VAR} is not set`, { hint: `add ${TOKEN_VAR} first` });
-    const read = await gearsetEnvironments({ fetch: ctx.fetch ?? globalThis.fetch, token, pipelineId: pipelineOf(b) });
+    const read = await environments(token);
     if (!read.ok) return read.transient ? warn(read.error, { hint: 'run the doctor again later' }) : fail(read.error);
     const found = [];
     for (const stage of plan.layout.stages) {
@@ -623,8 +733,25 @@ function gearsetChecks(cfg, b, plan, ctx, add, iso) {
     }
     return ok(found.join(', '));
   }, { hint: 'make each stage org a Gearset environment that is not production, and check the token' });
-  add('salesforce gearset ci job', 'sf-gearset', () => gearsetCiJobCheck(cfg, b, plan, ctx), { hint: "turn on the CI job of each stage's Gearset environment" });
-  add('salesforce gearset ci tests', 'sf-gearset', () => gearsetCiTestsCheck(cfg, b, plan, ctx, iso), { hint: 'set a test level on each Gearset CI job' });
+  add('salesforce gearset ci job', 'sf-gearset', () => gearsetCiJobCheck(cfg, b, plan, ctx, environments), { hint: "turn on the CI job of each stage's Gearset environment" });
+  add('salesforce gearset ci tests', 'sf-gearset', () => gearsetCiTestsCheck(cfg, b, plan, ctx, iso, environments), { hint: 'set a test level on each Gearset CI job' });
+  add('salesforce gearset project file', 'sf-gearset', () => gearsetProjectFileCheck(cfg, b, plan, ctx), { hint: 'run `foreman sf skills` and commit on the production branch, then `git rm --cached` the extra sfdx-project.json files on each branch named' });
+  add('salesforce gearset webhooks', 'sf-gearset', () => gearsetWebhooksCheck(ctx), { hint: "turn the Gearset webhooks on in the repository's Settings → Webhooks" });
+  add('salesforce gearset later stages', 'sf-gearset', () => gearsetLaterStagesCheck(b, plan), { hint: 'set salesforce.gearset.validateLaterStages in foreman.config.json' });
+}
+
+// Who validates each later stage's promotion pull request: Gearset never does it by itself, so
+// Foreman does unless validateLaterStages is "gearset". Always ok; it reads only the config.
+function gearsetLaterStagesCheck(b, plan) {
+  if (b.gearset?.promote === 'owner') return ok('gearset.promote is "owner": you press Promote in Gearset for every stage');
+  const { stages, stopAt } = plan.layout;
+  const through = stages.slice(0, Math.max(stages.findIndex((s) => s.name === stopAt), 0) + 1);
+  const later = through.slice(1).map((s) => s.name);
+  if (!later.length) return ok('one stage: Gearset validates its pull requests itself');
+  if (b.gearset?.validateLaterStages === 'gearset') {
+    return ok(`Gearset validates ${later.join(', ')}: each story waits until someone presses Run validation in Gearset (validateLaterStages "gearset")`);
+  }
+  return ok(`Foreman validates the promotion pull request of ${later.join(', ')} against its org before the merge (validateLaterStages "foreman"); Gearset validates ${through[0].name}`);
 }
 
 const pick = (v, list, fallback) => (list.includes(v) ? v : fallback);

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { failedAsk, releaseAsksFor, resumesByItself } from './failed-ask.mjs';
+import { failedAsk, haltTasksFor, releaseAsksFor, resumesByItself } from './failed-ask.mjs';
 import * as decisions from '../console/decisions.mjs';
 
 const PR = 'https://github.com/acme/acme/pull/7';
@@ -129,5 +129,54 @@ describe('releaseAsksFor', () => {
     expect(releaseAsksFor(undefined, 'ACME-1')).toEqual([]);
     expect(releaseAsksFor({}, 'ACME-1')).toEqual([]);
     expect(releaseAsksFor([null, undefined], 'ACME-1')).toEqual([]);
+  });
+});
+
+describe('haltTasksFor', () => {
+  const task = (extra = {}) => open('ACME-1 stopped the release line', 'ACME-1', { kind: 'task', urgent: true, createdAt: '2026-11-10T10:00:00.000Z', ...extra });
+  const a = task({ id: 'd-a' });
+  const b = task({ id: 'd-b', answer: { option: 'Retry the story', note: 'try again' } });
+  const applied = task({ id: 'd-c', appliedAt: '2026-11-10T11:00:00.000Z' });
+  const plain = task({ id: 'd-d', title: 'Hosted credentials needed for ACME-1', urgent: false });
+  const decision = open('ACME-1 could not be released', 'ACME-1', { id: 'd-e', urgent: true });
+  const other = task({ id: 'd-f', story: 'ACME-2', title: 'ACME-2 stopped the release line' });
+
+  it("returns the story's unapplied urgent tasks, answered or not, and nothing else", () => {
+    expect(haltTasksFor([a, b, applied, plain, decision, other], { story: 'ACME-1' })).toEqual([a, b]);
+  });
+
+  it('returns the urgent tasks of every story when no story is given', () => {
+    expect(haltTasksFor([a, b, applied, plain, decision, other])).toEqual([a, b, other]);
+  });
+
+  it('drops a task created after `before` and keeps an earlier, an equal or an unreadable one', () => {
+    const before = Date.parse('2026-11-10T10:00:00.000Z');
+    const later = task({ id: 'd-g', createdAt: '2026-11-10T10:00:00.001Z' });
+    const equal = task({ id: 'd-h', createdAt: '2026-11-10T10:00:00.000Z' });
+    const early = task({ id: 'd-i', createdAt: '2026-11-10T09:00:00.000Z' });
+    const unreadable = task({ id: 'd-j', createdAt: 'not a date' });
+    const missing = task({ id: 'd-k', createdAt: undefined });
+    expect(haltTasksFor([later, equal, early, unreadable, missing], { before })).toEqual([equal, early, unreadable, missing]);
+  });
+
+  it('with unanswered, drops an item that has an answer', () => {
+    expect(haltTasksFor([a, b], { unanswered: true })).toEqual([a]);
+    expect(haltTasksFor([a, b], { unanswered: false })).toEqual([a, b]);
+  });
+
+  it("leaves out an urgent task that is not the halt's: another title, another story's title, no story", () => {
+    const key = task({ id: 'd-l', title: 'ACME-1 needs a key' });
+    const wrongStory = task({ id: 'd-m', title: 'ACME-2 stopped the release line' });
+    const storyless = task({ id: 'd-n', story: undefined });
+    expect(haltTasksFor([key, a], { story: 'ACME-1' })).toEqual([a]);
+    expect(haltTasksFor([key, a])).toEqual([a]);
+    expect(haltTasksFor([wrongStory, a])).toEqual([a]);
+    expect(haltTasksFor([storyless, a])).toEqual([a]);
+  });
+
+  it('gives an empty list when pending is not a list, and skips null entries', () => {
+    expect(haltTasksFor(undefined, { story: 'ACME-1' })).toEqual([]);
+    expect(haltTasksFor({}, { story: 'ACME-1' })).toEqual([]);
+    expect(haltTasksFor([null, undefined, a])).toEqual([a]);
   });
 });

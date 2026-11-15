@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { CREDENTIALS_REASON, SKILL_NAME, gitUrl, hasCredentials, hashSkillDir, installSkills, movedFromLock, namedSkills, readLock, sourceType } from './skills.mjs';
+import { CREDENTIALS_REASON, SAMPLE_IGNORE, SAMPLE_PROJECT, SKILL_NAME, gitUrl, hasCredentials, hashSkillDir, installSkills, isSampleProject, movedFromLock, namedSkills, readLock, skillUnchanged, sourceType } from './skills.mjs';
 import { gitIn, gitSh, makeSkillsSource, writeInstalled } from '../../../test/fake-skills.mjs';
 
 let dir;
@@ -526,5 +526,166 @@ describe('installSkills', () => {
   it('never throws, even when the shell does', () => {
     const sh = () => { throw new Error('boom'); };
     expect(install({ source: '/srv/acme/skills', tag: '1.66.0', sh })).toMatchObject({ ok: false });
+  });
+});
+
+describe('sample sfdx-project.json files', () => {
+  const NESTED = '.agents/skills/service-omni-routing/assets/sfdx-project.json';
+  const SAMPLE_TEXT = '{"packageDirectories":[]}\n';
+  let samples;
+  beforeEach(() => {
+    samples = makeSkillsSource(path.join(dir, 'samples-src'), {
+      '1.70.0': {
+        'service-omni-routing': { 'SKILL.md': '# Omni for Acme\n', 'assets/sfdx-project.json': SAMPLE_TEXT },
+        'platform-apex-generate': APEX,
+      },
+    });
+  });
+  const lockOf = () => JSON.parse(fs.readFileSync(path.join(root, 'skills-lock.json'), 'utf8'));
+  const tracked = () => gitIn(root, 'ls-files').split('\n').filter((f) => f.split('/').at(-1) === 'sfdx-project.json');
+  const ignoreCount = () => fs.readFileSync(path.join(root, '.gitignore'), 'utf8').split('\n').filter((l) => l === SAMPLE_IGNORE).length;
+  const installHere = (sh = gitSh) => installSkills({ root, source: samples, tag: '1.70.0', sh, fs, tmpDir });
+  // A project that already committed its root sfdx-project.json and, before the fix, the samples.
+  function committedBefore() {
+    gitIn(root, 'init', '-q', '-b', 'main');
+    fs.writeFileSync(path.join(root, 'sfdx-project.json'), '{"packageDirectories":[{"path":"force-app"}]}\n');
+    gitIn(root, 'add', '-A');
+    gitIn(root, 'commit', '-q', '-m', 'Acme project');
+    expect(installHere()).toMatchObject({ ok: true });
+    gitIn(root, 'add', '-A');
+    gitIn(root, 'add', '-f', NESTED);
+    gitIn(root, 'commit', '-q', '-m', 'Acme skills with their samples');
+    expect(tracked()).toEqual([NESTED, 'sfdx-project.json']);
+  }
+  const skillDir = (base, name) => path.join(base, '.agents', 'skills', name);
+
+  it('isSampleProject matches the last part of a path only', () => {
+    expect(SAMPLE_PROJECT).toBe('sfdx-project.json');
+    expect(isSampleProject('assets/sfdx-project.json')).toBe(true);
+    expect(isSampleProject('sfdx-project.json')).toBe(true);
+    for (const p of ['assets/sfdx-project.json.bak', 'assets/my-sfdx-project.json', 'sfdx-project.json/x']) expect(isSampleProject(p), p).toBe(false);
+  });
+
+  it('hashSkillDir leaves out the files skip names, and is unchanged with no skip', () => {
+    const withSample = path.join(dir, 'with');
+    const without = path.join(dir, 'without');
+    for (const [base, extra] of [[withSample, true], [without, false]]) {
+      fs.mkdirSync(path.join(base, 'assets'), { recursive: true });
+      fs.writeFileSync(path.join(base, 'SKILL.md'), '# Acme\n');
+      if (extra) fs.writeFileSync(path.join(base, 'assets', 'sfdx-project.json'), SAMPLE_TEXT);
+    }
+    expect(hashSkillDir(withSample, fs, { skip: isSampleProject })).toBe(hashSkillDir(without, fs));
+    expect(hashSkillDir(withSample, fs)).not.toBe(hashSkillDir(without, fs));
+    expect(hashSkillDir(withSample, fs, {})).toBe(hashSkillDir(withSample, fs));
+  });
+
+  it('stops git tracking a sample committed before, ignores it, keeps the file and the root project file', () => {
+    committedBefore();
+    const r = installHere();
+    expect(r).toEqual({ ok: true, commit: gitIn(samples, 'rev-parse', '1.70.0^{commit}'), installed: ['platform-apex-generate', 'service-omni-routing'], removed: [], untracked: [NESTED] });
+    expect(tracked()).toEqual(['sfdx-project.json']);
+    expect(ignoreCount()).toBe(1);
+    expect(gitSh('git', ['-C', root, 'check-ignore', '-q', NESTED]).status).toBe(0);
+    expect(gitSh('git', ['-C', root, 'check-ignore', '-q', 'sfdx-project.json']).status).not.toBe(0);
+    expect(fs.readFileSync(path.join(root, NESTED), 'utf8')).toBe(SAMPLE_TEXT);
+    const lock = lockOf();
+    for (const name of Object.keys(lock.skills)) expect(skillUnchanged(skillDir(root, name), lock.skills[name], fs), name).toBe(true);
+    expect(lock.skills['service-omni-routing'].trackedHash).toBe(hashSkillDir(skillDir(root, 'service-omni-routing'), fs, { skip: isSampleProject }));
+    expect(lock.skills['platform-apex-generate']).not.toHaveProperty('trackedHash');
+    expect(Object.keys(lock.skills['service-omni-routing'])).toEqual(['source', 'sourceType', 'ref', 'commit', 'skillPath', 'computedHash', 'trackedHash']);
+  });
+
+  it('a second install changes nothing: the same .gitignore, no untracked and no ignoreAdded', () => {
+    committedBefore();
+    installHere();
+    const before = fs.readFileSync(path.join(root, '.gitignore'), 'utf8');
+    const r = installHere();
+    expect(r.ok).toBe(true);
+    expect(r).not.toHaveProperty('untracked');
+    expect(r).not.toHaveProperty('ignoreAdded');
+    expect(fs.readFileSync(path.join(root, '.gitignore'), 'utf8')).toBe(before);
+  });
+
+  it('adds the ignore line once, after a newline when the file has none, and says so', () => {
+    gitIn(root, 'init', '-q', '-b', 'main');
+    fs.writeFileSync(path.join(root, '.gitignore'), 'node_modules');
+    const r = installHere();
+    expect(r).toMatchObject({ ok: true, ignoreAdded: true });
+    expect(r).not.toHaveProperty('untracked');
+    const text = fs.readFileSync(path.join(root, '.gitignore'), 'utf8');
+    expect(text.startsWith('node_modules\n# Sample Salesforce projects')).toBe(true);
+    expect(text.endsWith(`${SAMPLE_IGNORE}\n`)).toBe(true);
+    expect(ignoreCount()).toBe(1);
+  });
+
+  it('does not add the line when .gitignore already has it, with trailing space', () => {
+    fs.writeFileSync(path.join(root, '.gitignore'), `${SAMPLE_IGNORE}  \n`);
+    const r = installHere();
+    expect(r).not.toHaveProperty('ignoreAdded');
+    expect(fs.readFileSync(path.join(root, '.gitignore'), 'utf8')).toBe(`${SAMPLE_IGNORE}  \n`);
+  });
+
+  it('a slot worktree has no sample, and the lock still passes there; any other edit fails', () => {
+    committedBefore();
+    installHere();
+    gitIn(root, 'add', '-A');
+    gitIn(root, 'commit', '-q', '-m', 'Acme skills');
+    const slot = path.join(dir, 'slot');
+    gitIn(root, 'worktree', 'add', '-q', slot);
+    expect(fs.existsSync(path.join(slot, NESTED))).toBe(false);
+    const entry = lockOf().skills['service-omni-routing'];
+    const there = skillDir(slot, 'service-omni-routing');
+    expect(skillUnchanged(there, entry, fs)).toBe(true);
+    fs.writeFileSync(path.join(there, 'extra.md'), 'more\n');
+    expect(skillUnchanged(there, entry, fs)).toBe(false);
+    fs.rmSync(path.join(there, 'extra.md'));
+    fs.writeFileSync(path.join(there, 'SKILL.md'), '# edited\n');
+    expect(skillUnchanged(there, entry, fs)).toBe(false);
+  });
+
+  it('skillUnchanged fails a sample that is present but edited, and needs a string trackedHash to pass without it', () => {
+    installHere();
+    const entry = lockOf().skills['service-omni-routing'];
+    const here = skillDir(root, 'service-omni-routing');
+    expect(skillUnchanged(here, entry, fs)).toBe(true);
+    fs.writeFileSync(path.join(root, NESTED), '{"edited":true}\n');
+    expect(skillUnchanged(here, entry, fs)).toBe(false);
+    fs.rmSync(path.join(root, NESTED));
+    expect(skillUnchanged(here, entry, fs)).toBe(true);
+    expect(skillUnchanged(here, { ...entry, trackedHash: undefined }, fs)).toBe(false);
+    expect(skillUnchanged(here, { ...entry, trackedHash: 7 }, fs)).toBe(false);
+  });
+
+  it('a root that is not a git repo still gets the ignore line, and no git rm runs', () => {
+    const calls = [];
+    const sh = (cmd, args, opts) => { calls.push(args); return gitSh(cmd, args, opts); };
+    const r = installHere(sh);
+    expect(r).toMatchObject({ ok: true, ignoreAdded: true });
+    expect(r).not.toHaveProperty('untracked');
+    expect(fs.readFileSync(path.join(root, '.gitignore'), 'utf8')).toContain(`${SAMPLE_IGNORE}\n`);
+    expect(calls.some((a) => a.includes('rm'))).toBe(false);
+    expect(calls.some((a) => a.includes('ls-files'))).toBe(false);
+  });
+
+  it('a failing git rm is reported, naming the path and what to run', () => {
+    committedBefore();
+    const sh = (cmd, args, opts) => (args.includes('rm') ? { status: 1, stdout: '', stderr: 'fatal' } : gitSh(cmd, args, opts));
+    const r = installHere(sh);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain(NESTED);
+    expect(r.reason).toContain('git rm --cached');
+  });
+
+  it('a git that cannot list what it tracks is reported', () => {
+    committedBefore();
+    const sh = (cmd, args, opts) => (args.includes('ls-files') ? { status: 1, stdout: '', stderr: 'fatal' } : gitSh(cmd, args, opts));
+    expect(installHere(sh)).toEqual({ ok: false, reason: 'installed the skills, but could not list what git tracks under .agents/skills' });
+  });
+
+  it('a source without samples gets no trackedHash, no .gitignore and no new result keys', () => {
+    const r = install({ source: source(), tag: '1.66.0' });
+    expect(Object.keys(r)).toEqual(['ok', 'commit', 'installed', 'removed']);
+    expect(fs.existsSync(path.join(root, '.gitignore'))).toBe(false);
+    for (const entry of Object.values(lockOf().skills)) expect(entry).not.toHaveProperty('trackedHash');
   });
 });

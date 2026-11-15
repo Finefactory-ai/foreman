@@ -8,6 +8,10 @@
 // it names (--story, else the slot's story). A Jira source comments and moves the issue; the
 // markdown source ignores events.
 //
+// `block <id> --reason <text>` with a reason that leads with story ids that are all done (the
+// picker would take the story again at once) records "Needs you: <ids> already done, ..." instead,
+// which names no story, and asks the owner once with a task; `depend` refuses ids that are all done.
+//
 // A start run again by the same session (same slot, same story, and the log the slot's session
 // mark names) changes nothing and raises no event.
 //
@@ -34,7 +38,7 @@ import { basename, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { loadResolved } from '../../settings/load.mjs';
 import { currentSlot, stateDir } from '../../engine/paths.mjs';
-import { buildOrder, nextStory } from '../../engine/pick.mjs';
+import { buildOrder, doneBlockers, nextStory } from '../../engine/pick.mjs';
 import { commentSwitch, doneChange, openStorySource } from '../../engine/story-source.mjs';
 import { addEvent, endStory, readSlot, startStory } from '../../engine/state.mjs';
 import { openConsole } from '../../engine/console.mjs';
@@ -111,6 +115,47 @@ function summaryOf(text) {
   if (line.length <= 160) return line;
   const space = line.lastIndexOf(' ', 158);
   return `${line.slice(0, space > 0 ? space : 159)}…`;
+}
+
+// "A", "A and B", "A, B and C".
+const listOf = (ids) => (ids.length > 1 ? `${ids.slice(0, -1).join(', ')} and ${ids.at(-1)}` : ids.join(''));
+
+// After a block on stories that are already done: asks the owner once, with a task titled "<ID> is
+// blocked on <ids>, which are already done". An item for the same story and title that is still
+// pending is not asked again. Exit 1 when the owner cannot be told, the block recorded all the same.
+async function askAboutDoneBlock({ config, dir, clock, stdout, stderr }, { id, ids, reason }) {
+  const list = listOf(ids);
+  const verb = ids.length > 1 ? 'are' : 'is';
+  const title = `${id} is blocked on ${list}, which ${verb} already done`;
+  try {
+    const { decisions } = openConsole({ config, ctx: { stateDir: dir, now: clock } });
+    let open = null;
+    try {
+      open = (await decisions.pending()).find((i) => i.story === id && i.title === title) ?? null;
+    } catch {
+      // an unreadable list: ask again rather than not at all
+    }
+    if (open) {
+      stdout.write(`${title}; the owner was already asked: ${open.id}.\n`);
+      return 0;
+    }
+    const itemId = await decisions.add({
+      story: id,
+      kind: 'task',
+      title,
+      summary: summaryOf(`The architect still blocks ${id} on ${list}, which ${verb} already done.`),
+      body: [
+        `The architect blocked ${id}: ${reason}`,
+        `${list} ${verb} already done, so ${id} would be picked again at once and block again. Foreman leaves it blocked until you answer.`,
+        '"Retry the story" puts it back in line with your note for the architect, for example where the code it needs is. "Close the task" leaves it blocked.',
+      ].join('\n\n'),
+    });
+    stdout.write(`${title}; asked the owner: ${itemId}.\n`);
+    return 0;
+  } catch (err) {
+    stderr.write(`${id} is blocked, but the owner was not told: ${err.message}\n`);
+    return EXIT_FAILED;
+  }
 }
 
 function readFindings(file, stderr) {
@@ -353,6 +398,12 @@ export default {
       const ids = onIds;
       const problem = dependsProblem(stories, id, ids, idPattern);
       if (problem) { stderr.write(`${problem}\n`); return EXIT_FAILED; }
+      // Waiting for stories that are all done would start the story again at once.
+      if (ids.every((d) => stories.find((s) => s.id === d)?.status === 'done')) {
+        const many = ids.length > 1;
+        stderr.write(`${listOf(ids)} ${many ? 'are' : 'is'} already done: waiting for ${many ? 'them' : 'it'} would start ${id} again at once. Leave it blocked for the owner.\n`);
+        return EXIT_FAILED;
+      }
       const current = found.dependsOn ?? [];
       const added = ids.filter((d) => !current.includes(d));
       if (!added.length) {
@@ -408,10 +459,19 @@ export default {
       if (cur?.id === id && cur.session === session) return 0;
     }
     let change;
+    let done = [];
     if (sub === 'start') change = { status: 'in-progress', fields: { started: today }, note: 'Started.', event: 'started' };
     else if (sub === 'block') {
       if (!v.reason) { stderr.write('block needs --reason <text>\n'); return EXIT_USAGE; }
-      change = { status: 'blocked', fields: { blockedBy: v.reason }, note: `Blocked: ${v.reason}`, event: 'blocked' };
+      // A block on stories that are all done would be picked again at once, so it is recorded in
+      // words and the owner is asked once (after the update, below).
+      done = doneBlockers(v.reason, stories, { idPattern });
+      if (done.length) {
+        const blockedBy = `Needs you: ${listOf(done)} ${done.length > 1 ? 'are' : 'is'} already done, so waiting for ${done.length > 1 ? 'them' : 'it'} cannot unblock ${id}. The architect said: ${v.reason}`;
+        change = { status: 'blocked', fields: { blockedBy }, note: `Blocked: ${blockedBy}`, event: 'blocked' };
+      } else {
+        change = { status: 'blocked', fields: { blockedBy: v.reason }, note: `Blocked: ${v.reason}`, event: 'blocked' };
+      }
     } else if (sub === 'done') {
       if (!v.note?.trim()) { stderr.write('done needs --note <text>\n'); return EXIT_USAGE; }
       change = doneChange(v.note, clock());
@@ -432,6 +492,7 @@ export default {
         stderr.write(`warning: start not recorded in state: ${err.message}\n`);
       }
     }
+    if (done.length) return askAboutDoneBlock({ config, dir, clock, stdout, stderr }, { id, ids: done, reason: v.reason });
     return 0;
   },
 };

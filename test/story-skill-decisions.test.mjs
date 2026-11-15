@@ -239,6 +239,17 @@ describe('story skill: the architect\'s own question', () => {
     expect(blocked).not.toContain('free-text task');
   });
 
+  it('tells the blocked step to stop when the reason leads with stories that are already done', () => {
+    const blocked = collapse(skillFile('blocked.md'));
+    expect(blocked).toContain('When `story block` prints `already done`');
+    expect(blocked).toContain('propose no depends_on fix');
+    expect(blocked).toContain('run no `foreman story depend`');
+    expect(blocked).toContain('add no task of your own');
+    // Placed after the sentence on how a block is picked up again, before the depends_on proposal.
+    expect(blocked.indexOf('When `story block` prints `already done`')).toBeGreaterThan(blocked.indexOf('which is how it gets picked up again).'));
+    expect(blocked.indexOf('When `story block` prints `already done`')).toBeLessThan(blocked.indexOf('features.dependsOnProposals'));
+  });
+
   it('tells a session to leave out the body\'s last full stop when a note is given', () => {
     const answers = answersFile();
     const rule = collapse(answers.slice(answers.indexOf('Close <ID>: nothing to build?'), answers.indexOf('Decide for <ID>:')));

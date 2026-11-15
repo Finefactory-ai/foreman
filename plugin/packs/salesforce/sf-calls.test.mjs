@@ -17,6 +17,7 @@ const EXPECTED = {
   'packs/salesforce/cases.mjs': 5,
   'packs/salesforce/deploy-result.mjs': 1,
   'packs/salesforce/doctor-salesforce.mjs': 8,
+  'packs/salesforce/head-validate.mjs': 1,
   'packs/salesforce/isolation.mjs': 3,
   'packs/salesforce/rollback.mjs': 1,
   'packs/salesforce/setup.mjs': 2,

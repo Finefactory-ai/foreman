@@ -23,6 +23,21 @@
 // supervisor works it out, plugin-copy.mjs sessionPlugin). Left out (undefined), a
 // FOREMAN_PLUGIN_DIR in baseEnv, when set, is passed as --plugin-dir.
 //
+// The session's `foreman` command is the plugin folder's own. Claude Code adds an installed
+// copy's bin to PATH too (and the supervisor may have inherited one from an outer Claude Code),
+// so a bare `foreman` in the session could run an older copy than the skills and agents. When a
+// plugin folder is passed, command() puts `<folder>/bin` first on PATH (before a pack's prefix),
+// drops the bin of every copy in `shadowed` ([{ id, path }]: the installed copies elsewhere,
+// plugin-copy.mjs shadowingCopies; compared as resolved paths, no disk read), and turns each of
+// their ids off (`enabledPlugins`, in a last settings layer that beats the scope's and the pack's).
+// Entries whose id is not `name@market` or whose path is empty are ignored. With no plugin
+// folder, shadowed is ignored and PATH and settings are as without it.
+//
+// pluginLabel is the supervisor's short commit. As a non-empty string it becomes
+// FOREMAN_PLUGIN_LABEL among the FOREMAN_* keys, so no other environment can change it; the
+// `foreman` CLI names it beside the supervisor's version when it finds it runs another copy
+// (foreman-command.mjs). Without it the env is unchanged.
+//
 // A lean session: it loads Foreman, the plugins and MCP servers it is given, and nothing else of
 // the owner's own Claude Code set-up. `--setting-sources project,local` leaves out the user
 // settings (their hooks, plugins, skills, agents and MCP servers), `--strict-mcp-config` every
@@ -91,10 +106,17 @@
 // environment can change it; the `foreman` CLI compares its own folder with it at the start of a
 // session and warns when a shell alias or another copy runs instead (foreman-command.mjs).
 // Without it the command is exactly as before, and a FOREMAN_PLUGIN_ROOT in baseEnv passes through.
+//
+// BASH_MAX_TIMEOUT_MS is set to SHIP_TIMEOUT_MS among the FOREMAN_* keys, so no other environment
+// can lower it; a larger positive whole number in baseEnv is kept. Claude Code's Bash tool caps a
+// foreground command's `timeout` at BASH_MAX_TIMEOUT_MS (default 600000), so without it the story
+// skill's four-hour timeout for `foreman ship` would be cut to 10 minutes, and a release waiting
+// for Gearset's validation would be killed part-way. The env file (session-env.mjs) carries the
+// key too, which is harmless.
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync } from 'node:fs';
-import { delimiter, dirname, join } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { classifySession } from './classify.mjs';
 import { writeSecretFile } from './env-text.mjs';
 import { TOOL_NAME } from '../config/validate.mjs';
@@ -125,7 +147,15 @@ function mergeSettings(...layers) {
   return out;
 }
 
+// A plugin id as Claude Code's enabledPlugins names it: `name@market`.
+const SETTINGS_ID = /^[^@\s]+@[^@\s]+$/;
+
 const positiveWhole = (v) => Number.isInteger(v) && v > 0;
+
+// The Bash `timeout` the story skill gives `foreman ship`: longer than a Gearset release's waits
+// at the default `ship.ci.timeoutMinutes`. A longer config, or any other kill, is handled by the
+// interrupt path of the ship runner (engine/ship.mjs).
+export const SHIP_TIMEOUT_MS = 4 * 60 * 60_000;
 
 // Where a slot's session reads its settings ('settings') or MCP config ('mcp') from.
 const configFile = (stateDir, slot, kind) => join(stateDir, 'session-config', `${slot}-${kind}.json`);
@@ -137,8 +167,10 @@ export function testCoreShare(cores, slots) {
   return Math.max(2, Math.floor(c / s));
 }
 
-export function command({ id, mode = '', config, slot, n, root, stateDir, supervisorPid, envAdapter, baseEnv = {}, packSession = null, fileKeys = {}, useSubscription = false, scope = null, testCores, pluginDir, pluginRoot }) {
+export function command({ id, mode = '', config, slot, n, root, stateDir, supervisorPid, envAdapter, baseEnv = {}, packSession = null, fileKeys = {}, useSubscription = false, scope = null, testCores, pluginDir, pluginRoot, shadowed = [], pluginLabel }) {
   const artifacts = artifactsConsole(config);
+  const given = Number(baseEnv.BASH_MAX_TIMEOUT_MS);
+  const userBashLimit = positiveWhole(given) ? given : 0;
   const env = {
     ...withSessionKeys(baseEnv, fileKeys),
     ...(envAdapter?.env(n) ?? {}),
@@ -151,26 +183,36 @@ export function command({ id, mode = '', config, slot, n, root, stateDir, superv
     FOREMAN_SUPERVISOR_PID: String(supervisorPid),
     ...(positiveWhole(testCores) ? { FOREMAN_TEST_CORES: String(testCores) } : {}),
     ...(typeof pluginRoot === 'string' && pluginRoot ? { FOREMAN_PLUGIN_ROOT: pluginRoot } : {}),
+    ...(typeof pluginLabel === 'string' && pluginLabel ? { FOREMAN_PLUGIN_LABEL: pluginLabel } : {}),
     CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '0',
+    BASH_MAX_TIMEOUT_MS: String(Math.max(SHIP_TIMEOUT_MS, userBashLimit)),
   };
   if (useSubscription) delete env.ANTHROPIC_API_KEY;
   delete env.CLAUDE_CODE_ENTRYPOINT;
   if (artifacts) env.CLAUDE_CODE_ENTRYPOINT = 'claude-vscode';
   const prefix = Array.isArray(packSession?.pathPrefix) ? packSession.pathPrefix : [];
-  if (prefix.length) env.PATH = [...prefix, env.PATH].filter(Boolean).join(delimiter);
+  // A plugin folder named by --plugin-dir wins over an installed copy of the same name.
+  const pluginFolder = pluginDir === undefined ? baseEnv.FOREMAN_PLUGIN_DIR : pluginDir;
+  const folder = typeof pluginFolder === 'string' && pluginFolder !== '';
+  const shadows = folder && Array.isArray(shadowed) ? shadowed.filter((c) => isObject(c) && typeof c.id === 'string' && SETTINGS_ID.test(c.id) && typeof c.path === 'string' && c.path !== '') : [];
+  if (folder) {
+    const dropped = new Set(shadows.map((c) => resolve(join(c.path, 'bin'))));
+    const kept = String(env.PATH ?? '').split(delimiter).filter((e) => e !== '' && !dropped.has(resolve(e)));
+    env.PATH = [join(pluginFolder, 'bin'), ...prefix, ...kept].join(delimiter);
+  } else if (prefix.length) env.PATH = [...prefix, env.PATH].filter(Boolean).join(delimiter);
   // Filtered again here: pack defaults are merged after validate() and never checked.
   const extra = Array.isArray(config?.session?.extraTools)
     ? config.session.extraTools.filter((t) => typeof t === 'string' && TOOL_NAME.test(t))
     : [];
   const tools = [...TOOLS, ...(artifacts ? ['ArtifactData'] : []), ...extra];
   const prompt = `/foreman:story ${id}${mode ? ` ${mode}` : ''}`;
-  // A plugin folder named by --plugin-dir wins over an installed copy of the same name.
-  const pluginFolder = pluginDir === undefined ? baseEnv.FOREMAN_PLUGIN_DIR : pluginDir;
   const plugin = pluginFolder ? ['--plugin-dir', pluginFolder] : [];
   const userSettings = config?.session?.userSettings === true;
   const dir = baseEnv.CLAUDE_CONFIG_DIR || (baseEnv.HOME && join(baseEnv.HOME, '.claude'));
   const lean = userSettings ? {} : { ...(dir ? { claudeMdExcludes: [join(dir, 'CLAUDE.md')] } : {}), autoMemoryEnabled: false };
-  const merged = mergeSettings(lean, scope?.settings ?? {}, packSession?.settings ?? {});
+  // Last, so it beats session-scope.mjs, which turns every `foreman@*` on.
+  const off = shadows.length ? { enabledPlugins: Object.fromEntries(shadows.map((c) => [c.id, false])) } : {};
+  const merged = mergeSettings(lean, scope?.settings ?? {}, packSession?.settings ?? {}, off);
   const mcpServers = isObject(scope?.mcpServers) ? scope.mcpServers : {};
   const files = [];
   const settings = [];

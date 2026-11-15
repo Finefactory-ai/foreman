@@ -1000,6 +1000,19 @@ describe('the waiting list in the snapshot', () => {
     expect((await snapshot(state, at(3), null, { root, slots: 3 })).skipped).toEqual([]);
   });
 
+  it('carries the split of a run with a number, the stories resumed on top, while the loop runs, and none once it stops', async () => {
+    const root = project({ 'ACME-1': note('ACME-1', 'Build it') });
+    const state = join(dir, 'state');
+    setLoop(state, 'running', '', at(1));
+    const file = join(state, 'state.json');
+    expect((await snapshot(state, at(2), null, { root, slots: 3 })).asked).toBeNull();
+    writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), asked: { max: 1, resumed: ['ACME-2'] } }));
+    expect((await snapshot(state, at(2), null, { root, slots: 3 })).asked).toEqual({ max: 1, resumed: ['ACME-2'] });
+
+    setLoop(state, 'stopped', 'Stopped on request.', at(3));
+    expect((await snapshot(state, at(3), null, { root, slots: 3 })).asked).toBeNull();
+  });
+
   it('shows a restart pending on new code as an FYI item and carries restartPending while the loop runs', async () => {
     const root = project({ 'ABC-1': note('ABC-1', 'Build it') });
     const state = join(dir, 'state');

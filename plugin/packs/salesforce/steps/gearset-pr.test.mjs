@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { noStatusReason } from '../gearset.mjs';
 import gearsetPr from './gearset-pr.mjs';
 import { runShip } from '../../../lib/engine/ship.mjs';
 import { fakeCtx } from '../../../../test/ship-fakes.mjs';
@@ -124,7 +125,7 @@ describe('gearset-pr', () => {
 
   it('does not take any other Gearset status, or a near match, as the validation', async () => {
     const { run } = setup({ rules: [[PROMO_LIST, list(promo())], [statusOf(SHA), statuses(st('Gearset UAT', 'success'), st('Gearset QA2', 'success'), st('gearset qa', 'success'))]] });
-    expect(await run()).toMatchObject({ ok: false, code: 2, reason: expect.stringContaining('has not validated') });
+    expect(await run()).toMatchObject({ ok: false, code: 2, noStatus: true, reason: expect.stringContaining('posted no status') });
   });
 
   it('times out when Gearset never opens the promotion PR', async () => {
@@ -146,10 +147,26 @@ describe('gearset-pr', () => {
       ok: false,
       code: 2,
       stage: 'gearset-pr',
-      reason: 'Gearset QA has not validated pull request #2 within 2 minutes; turn on "Validate pull requests targeting the source branch" for its CI job',
+      reason: noStatusReason('Gearset QA', 2, 2),
       pr: PROMO,
       prNumber: 2,
+      noStatus: true,
     });
+  });
+
+  it('says both likely causes of no status, and no longer blames the Validate pull requests switch', async () => {
+    const { run } = setup({ rules: [[PROMO_LIST, list(promo())], [statusOf(SHA), statuses(st('Gearset UAT', 'success'))]] });
+    const r = await run();
+    expect(r.reason).toContain('Gearset pipeline');
+    expect(r.reason).toContain('webhook');
+    expect(r.reason).not.toContain('Validate pull requests');
+  });
+
+  it('does not say noStatus for a validation that is still pending or never found the promotion PR', async () => {
+    const pending = setup({ rules: [[PROMO_LIST, list(promo())], [statusOf(SHA), statuses(st('Gearset QA', 'pending'))]] });
+    expect((await pending.run()).noStatus).toBeUndefined();
+    const none = setup({ rules: [[PROMO_LIST, list()], [FEATURE_LIST, list()], [CREATE, `${FEATURE}\n`]] });
+    expect((await none.run()).noStatus).toBeUndefined();
   });
 
   it('times out when Gearset QA is still pending', async () => {
@@ -168,8 +185,35 @@ describe('gearset-pr', () => {
     const { run } = setup({ rules: [[PROMO_LIST, list(promo())], [statusOf(SHA), { status: 1, stderr: 'HTTP 502: Bad Gateway' }]] });
     const r = await run();
     expect(r).toMatchObject({ ok: false, code: 2 });
-    expect(r.reason).toContain('has not validated pull request #2');
+    expect(r.reason).toContain('posted no status on pull request #2');
     expect(r.reason).toContain('HTTP 502: Bad Gateway');
+  });
+
+  describe('through the ship runner, as a real release waits', () => {
+    const through = (ctx, deps) => runShip({ steps: [{ ...gearsetPr, run: (c) => gearsetPr.run(c, deps) }], ctx });
+
+    it('a 25-minute wait for Gearset finishes, with a progress line each minute naming the step', async () => {
+      const { ctx, fetch, raiseStoryEvent } = setup({
+        ship: { ci: { timeoutMinutes: 30 } },
+        rules: [[PROMO_LIST, list(promo())], [statusOf(SHA), inTurn(...Array(75).fill(statuses(st('Gearset QA', 'pending'))), QA_OK)]],
+      });
+      const lines = [];
+      ctx.progress = (line) => lines.push(line);
+      const { code, result } = await through(ctx, { fetch, raiseStoryEvent });
+      expect(code).toBe(0);
+      expect(result).toMatchObject({ stage: 'shipped', pr: PROMO, prNumber: 2 });
+      expect(lines.length).toBeGreaterThanOrEqual(24);
+      for (const line of lines) expect(line).toContain("opening the pull request and following Gearset's promotion PR");
+    });
+
+    it('no status by the deadline is code 2 with noStatus and the two-cause reason', async () => {
+      const { ctx, fetch, raiseStoryEvent } = setup({ rules: [[PROMO_LIST, list(promo())], [statusOf(SHA), statuses(st('Gearset UAT', 'success'))]] });
+      const { code, result } = await through(ctx, { fetch, raiseStoryEvent });
+      expect(code).toBe(2);
+      expect(result.noStatus).toBe(true);
+      expect(result.reason).toBe(noStatusReason('Gearset QA', 2, 2));
+      expect(ctx.halts).toEqual([]);
+    });
   });
 
   it('ignores a CLOSED promotion PR and prefers an OPEN one to a MERGED one', async () => {
@@ -269,6 +313,55 @@ describe('gearset-pr', () => {
     });
   });
 
+  describe("a Gearset rate limit on the environments read", () => {
+    const rules = [[PROMO_LIST, list(promo())], [statusOf(SHA), QA_OK]];
+    const limited = (seconds) => ({ status: 429, body: {}, headers: { 'Retry-After': String(seconds) } });
+    const START = Date.UTC(2026, 9, 15, 12, 0, 0);
+
+    it('waits the time Gearset names, says so, and goes on', async () => {
+      const routes = acmeGearset({ [environmentsOf('pipe-1')]: inTurn(limited(2), { status: 200, body: acmeGearset()[environmentsOf('pipe-1')].body }) });
+      const { ctx, run } = setup({ rules, routes });
+      expect(await run()).toEqual({ ok: true, pr: PROMO, prNumber: 2 });
+      expect(ctx.sleeps[0]).toBe(2000);
+      expect(ctx.events.find((e) => e.kind === 'info').text).toMatch(/Gearset rate-limited gearset-pr; waiting 2 seconds/);
+      expect(ctx.reports[0]).toBe(`waiting for Gearset's rate limit until ${new Date(START + 2000).toISOString()}`);
+    });
+
+    it('fails with code 1 and the time to try again when the wait would pass the step limit', async () => {
+      const { ctx, run } = setup({ rules, routes: acmeGearset({ [environmentsOf('pipe-1')]: limited(675) }) });
+      const retryAt = new Date(START + 675_000).toISOString();
+      const r = await run();
+      expect(r).toMatchObject({ ok: false, code: 1, stage: 'gearset-pr', rateLimited: true, retryAt });
+      expect(r.reason).toContain(retryAt);
+      expect(r.reason).toContain('try the release again after');
+      expect(r.reason).toContain("the step's limit of 2 minutes");
+      expect(ghCalls(ctx)).toEqual([]);
+      expect(ctx.sleeps).toEqual([]);
+    });
+
+    it('through the ship runner it is code 1 with rateLimited and retryAt, and writes no HALT', async () => {
+      const { ctx, fetch, raiseStoryEvent } = setup({ rules, routes: acmeGearset({ [environmentsOf('pipe-1')]: limited(675) }) });
+      const { code, result } = await runShip({ steps: [{ ...gearsetPr, run: (c) => gearsetPr.run(c, { fetch, raiseStoryEvent }) }], ctx });
+      expect(code).toBe(1);
+      expect(result).toMatchObject({ stage: 'gearset-pr', rateLimited: true, retryAt: new Date(START + 675_000).toISOString() });
+      expect(ctx.halts).toEqual([]);
+    });
+
+    it('a huge Retry-After through the ship runner is capped at a day: code 1 with rateLimited and retryAt', async () => {
+      const { ctx, fetch, raiseStoryEvent } = setup({ rules, routes: acmeGearset({ [environmentsOf('pipe-1')]: limited('99999999999999999999999') }) });
+      const { code, result } = await runShip({ steps: [{ ...gearsetPr, run: (c) => gearsetPr.run(c, { fetch, raiseStoryEvent }) }], ctx });
+      expect(code).toBe(1);
+      expect(result).toMatchObject({ stage: 'gearset-pr', rateLimited: true, retryAt: new Date(START + 86_400_000).toISOString() });
+      expect(result.reason).not.toContain('Invalid time value');
+      expect(ctx.halts).toEqual([]);
+    });
+
+    it('keeps any other failure as it was', async () => {
+      const { run } = setup({ rules, routes: acmeGearset({ [environmentsOf('pipe-1')]: { status: 403, body: {} } }) });
+      expect(await run()).toEqual({ ok: false, code: 1, stage: 'gearset-pr', reason: "the Gearset Reporting API is not enabled for this token's team (Teams or Enterprise tier)" });
+    });
+  });
+
   describe('with salesforce.gearset.pipelineId', () => {
     const rules = [[PROMO_LIST, list(promo())], [statusOf(SHA), QA_OK]];
 
@@ -341,6 +434,8 @@ describe('gearset-pr', () => {
       { rules: [[PROMO_LIST, list()], [FEATURE_LIST, list()], [CREATE, `${FEATURE}\n`]] },
       { routes: acmeGearset({ [PIPELINES]: { status: 401, body: {} } }) },
       { routes: acmeGearset({ [PIPELINES]: new Error(`refused for ${secret}`) }) },
+      { routes: acmeGearset({ [PIPELINES]: { status: 429, body: {}, headers: { 'Retry-After': '675' } } }) },
+      { routes: acmeGearset({ [PIPELINES]: inTurn({ status: 429, body: {}, headers: { 'Retry-After': '2' } }, { status: 200, body: [{ PipelineId: 'pipe-1' }] }) }), rules: [[PROMO_LIST, list(promo())], [statusOf(SHA), QA_OK]] },
     ];
     for (const s of scenarios) {
       const { ctx, run } = setup({ ...s, env: { GEARSET_API_TOKEN: secret } });

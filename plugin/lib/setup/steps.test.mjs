@@ -444,7 +444,7 @@ describe('the Gearset screen', () => {
   });
 
   it("runs the CI job check with the others", () => {
-    expect(step.checks).toEqual(['salesforce gearset token', 'salesforce gearset branch', 'salesforce gearset merge method', 'salesforce gearset environments', 'salesforce gearset ci job']);
+    expect(step.checks).toEqual(['salesforce gearset token', 'salesforce gearset branch', 'salesforce gearset merge method', 'salesforce gearset environments', 'salesforce gearset ci job', 'salesforce gearset project file']);
   });
 
   it('guides the pipeline, the CI job and the test level, keeping the token and environment entries', () => {

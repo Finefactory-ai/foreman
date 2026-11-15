@@ -257,6 +257,23 @@ describe('describeStatus: the Waiting on you block', () => {
     }
   });
 
+  it('the stories asked for and the stories resumed on top: one line directly after the Workers line', () => {
+    const loop = { state: 'running', reason: '' };
+    const line = 'Stories: 1 asked for, 3 resumed on top (ACME-1, ACME-2, ACME-3)';
+    const lines = linesOf(describeStatus({ ...snap(loop), asked: { max: 1, resumed: ['ACME-1', 'ACME-2', 'ACME-3'] } }, 1, { items: [] }));
+    expect(lines.indexOf(line)).toBe(lines.findIndex((l) => l.startsWith('Workers:')) + 1);
+  });
+
+  it('shows no Stories line with nothing resumed on top, or no asked field', () => {
+    const loop = { state: 'running', reason: '' };
+    const plain = describeStatus(snap(loop), 1, { items: [] });
+    for (const asked of [null, { max: 1, resumed: [] }, { max: 0, resumed: ['ACME-1'] }]) {
+      const out = describeStatus({ ...snap(loop), asked }, 1, { items: [] });
+      expect(linesOf(out).some((l) => l.startsWith('Stories:'))).toBe(false);
+      expect(out).toBe(plain);
+    }
+  });
+
   it('the queued work: a Queued: heading after the slots, one line of text each, and nothing when there is none', () => {
     const loop = { state: 'running', reason: '' };
     const queued = [

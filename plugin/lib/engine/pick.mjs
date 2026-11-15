@@ -8,7 +8,8 @@
 // its `dependsOn` is done, whatever group it is in. Owner tasks are never picked. A blocked
 // story is picked again only when its `blockedBy` starts with story ids and every one of them
 // is done. blockedNow is that same rule as a question about one story: is it blocked, and would
-// the picker leave it alone?
+// the picker leave it alone? doneBlockers gives the ids of a block that is already met, which the
+// picker would take again at once.
 //
 // `exclude` is a test that drops stories from the automatic pick (the parallel factory keeps
 // a second story that needs an exclusive resource out while one is in flight). It never stops
@@ -41,6 +42,15 @@ export const waitsOnStories = (blockedBy, { idPattern } = {}) => blockingStories
 // True for a story that needs a resource only one slot may hold at a time. Today every resource
 // maps to the single exclusive lock; story 8 generalises it to one lock per resource.
 export const needsExclusive = (story, extraIds = []) => (story.resources ?? []).length > 0 || extraIds.includes(story.id);
+
+// The ids a block reason leads with when every one is a done story in the list, else []. That is
+// the block `unblocked` would take again at once, so `foreman story block` records it in words.
+export function doneBlockers(blockedBy, stories, { idPattern } = {}) {
+  need(idPattern);
+  const ids = blockingStories(blockedBy, idPattern);
+  const done = doneIds(stories);
+  return ids.length > 0 && ids.every((id) => done.has(id)) ? ids : [];
+}
 
 // A blocked story the picker takes again: its `blockedBy` starts with story ids and every one is done.
 const unblocked = (story, done, idPattern) => {

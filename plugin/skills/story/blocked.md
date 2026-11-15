@@ -4,6 +4,10 @@
   and delete `<branch>` only when it has no commits ahead. Run
   `foreman story block <ID> --reason '<reason>'` with the returned reason word for word (it
   starts with story ids when other stories block it, which is how it gets picked up again).
+  When `story block` prints `already done`, the story ids the reason leads with are already
+  done, so waiting cannot help: Foreman has recorded the story as waiting on the owner and
+  asked them once. Then propose no depends_on fix and run no `foreman story depend`, add no
+  task of your own, and use the `owner_question` case below only when the architect gave one.
   When the reason leads with story ids that are not already in the story's `depends_on`
   (see `foreman story next --id <ID>`), run `foreman settings get features.dependsOnProposals`.
   Only when it prints `true`, also ask the owner to approve the fix, unless

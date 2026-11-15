@@ -12,6 +12,20 @@
   stopped the release line" --body '<the ship JSON line>'` (single quotes, with each `'`
   inside written as `'\''`, so the shell passes the JSON whole). Put the JSON line in your reply marked urgent, and stop with
   `halted`.
+- **1, with `stage` `interrupted`** — the release was stopped from outside (a time limit or
+  a signal). When `lockReleased` is true nothing went live: run
+  `foreman ship --story <ID>` once more, in the foreground as in step 5. A run cut off with
+  no JSON line counts the same. When it is stopped again, or `lockReleased` is false, do not
+  run it again. Leave the pull request open, go back, and run
+  `foreman story block <ID> --reason '<the reason>'`. Then run
+  `foreman decide add --story <ID> --kind task --title "<ID>: the release was stopped before it finished" --body '<the ship JSON line>'`,
+  using the quoting rule (each `'` inside as `'\''`). Stop with `failed`, passing
+  `--cause environment` to `foreman story end`.
+- **1, with `rateLimited: true`** — Gearset's rate limit lasted past the step's time limit;
+  nothing is wrong with the story, and the JSON's `retryAt` says when Gearset answers again.
+  Do not run `foreman ship` again now. Leave the pull request open, go back, run
+  `foreman story block <ID> --reason '<the reason>'` (each `'` inside written as `'\''`),
+  and stop with `failed`, passing `--cause environment` to `foreman story end`.
 - **1** — the branch was not in a shippable state; the JSON says why. When the JSON's
   `stage` is `mergeable-recheck`, main kept moving during the release. That costs no
   round: run `foreman ship --story <ID>` once more. If it exits 1 at `mergeable-recheck`

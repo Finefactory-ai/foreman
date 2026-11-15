@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { BLOCK_DEFAULTS, BRANCH, COMMON_STEPS, OMNISTUDIO, PIPELINE_ID, ROLLBACK_COMMAND, checkConfig, defaults, fromOldShape, layout, reservedAlias, slotLimit } from './config.mjs';
+import { BLOCK_DEFAULTS, BRANCH, COMMON_STEPS, OMNISTUDIO, PIPELINE_ID, ROLLBACK_COMMAND, VALIDATE_LATER, checkConfig, defaults, fromOldShape, layout, reservedAlias, slotLimit } from './config.mjs';
 import { BRANCH as CORE_BRANCH, validate } from '../../lib/config/validate.mjs';
 import { withDefaults } from '../../lib/config/defaults.mjs';
 import { main } from '../../lib/cli/main.mjs';
@@ -628,6 +628,21 @@ describe('checkConfig: the other settings', () => {
       expect(check(full, (b) => { b.gearset.pipelineId = bad; }), String(bad)).toEqual([{ path: 'gearset.pipelineId', message: 'expected a Gearset pipeline ID' }]);
     }
     expect(check(full, (b) => { b.gearset = { pipelineId: 'pipe-1', other: 1 }; })).toEqual([{ path: 'gearset.other', message: 'unknown key' }]);
+  });
+  it('takes an optional gearset.nudgeMinutes, a whole number of minutes from 1 to 60, with no default', () => {
+    for (const ok of [1, 5, 60]) expect(check(full, (b) => { b.gearset.nudgeMinutes = ok; }), String(ok)).toEqual([]);
+    for (const bad of [0, 61, 2.5, '5', null, -1]) {
+      expect(check(full, (b) => { b.gearset.nudgeMinutes = bad; }), String(bad)).toEqual([{ path: 'gearset.nudgeMinutes', message: 'must be an integer from 1 to 60' }]);
+    }
+    expect(BLOCK_DEFAULTS.gearset).not.toHaveProperty('nudgeMinutes');
+  });
+  it('takes an optional gearset.validateLaterStages, foreman or gearset, with no default', () => {
+    for (const ok of ['foreman', 'gearset']) expect(check(full, (b) => { b.gearset.validateLaterStages = ok; }), ok).toEqual([]);
+    expect(check(full, (b) => { b.gearset.validateLaterStages = 'auto'; })).toEqual([{ path: 'gearset.validateLaterStages', message: 'must be one of foreman, gearset' }]);
+    expect(check(full, (b) => { b.gearset.validateLaterStages = true; })).toEqual([{ path: 'gearset.validateLaterStages', message: 'must be one of foreman, gearset' }]);
+    expect(VALIDATE_LATER).toEqual(['foreman', 'gearset']);
+    expect(BLOCK_DEFAULTS.gearset).not.toHaveProperty('validateLaterStages');
+    expect(BLOCK_DEFAULTS.gearset).toEqual({ promote: 'merge' });
   });
   it('gives no default pipelineId', () => {
     expect(PIPELINE_ID.test('pipe-1')).toBe(true);

@@ -83,6 +83,36 @@ describe('foreman sf', () => {
     expect(Object.keys(JSON.parse(fs.readFileSync(path.join(root, 'skills-lock.json'), 'utf8')).skills)).toEqual(['platform-apex-generate', 'platform-lwc-build']);
   });
 
+  it('sf skills with a sample sfdx-project.json keeps it out of git and says to commit .gitignore too', async () => {
+    src = makeSkillsSource(path.join(dir, 'samples-source'), {
+      '1.66.0': { 'service-omni-routing': { 'SKILL.md': '# Omni for Acme\n', 'assets/sfdx-project.json': '{"packageDirectories":[]}\n' } },
+    });
+    writeConfig();
+    const r = await run(['skills']);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain('; commit skills-lock.json, .gitignore, .agents/skills and .claude/skills');
+    expect(r.out).not.toContain('stopped git tracking');
+    expect(fs.readFileSync(path.join(root, '.gitignore'), 'utf8')).toContain('.agents/skills/**/sfdx-project.json\n');
+    expect(r.last).toMatchObject({ ok: true, installed: 1 });
+    expect(r.last).not.toHaveProperty('untracked');
+  });
+
+  it('sf skills says how many sample files git stopped tracking', async () => {
+    src = makeSkillsSource(path.join(dir, 'samples-source'), {
+      '1.66.0': { 'service-omni-routing': { 'SKILL.md': '# Omni for Acme\n', 'assets/sfdx-project.json': '{"packageDirectories":[]}\n' } },
+    });
+    writeConfig();
+    const nested = '.agents/skills/service-omni-routing/assets/sfdx-project.json';
+    gitIn(root, 'init', '-q', '-b', 'main');
+    expect((await run(['skills'])).code).toBe(0);
+    gitIn(root, 'add', '-f', nested);
+    gitIn(root, 'commit', '-q', '-m', 'Acme skills with their samples');
+    const r = await run(['skills']);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain('stopped git tracking 1 sample sfdx-project.json file(s) inside the skills; commit skills-lock.json, .gitignore, .agents/skills and .claude/skills');
+    expect(r.last.untracked).toEqual([nested]);
+  });
+
   it('sf skills warns on stderr when the tag moved upstream since the lock was written', async () => {
     expect((await run(['skills'])).code).toBe(0);
     const old = gitIn(src, 'rev-parse', '1.66.0^{commit}');

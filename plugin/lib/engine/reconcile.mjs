@@ -1,6 +1,7 @@
 // What the supervisor does first after the whole run died (Mac slept, VS Code closed), before
-// it picks any new story. Spec §9.4. This file only decides; supervisor.mjs gathers the
-// facts (ship lock, claims, merged pull requests, the vault) and carries out the actions.
+// it picks any new story. Spec §9.4. This file only decides; session-lifecycle.mjs (recoveryPlan,
+// a part of supervisor.mjs) gathers the facts (ship lock, claims, merged pull requests, the vault)
+// and carries out the actions.
 //
 // Order: finish a release cut off after the hosted database changed but before main did;
 // close stories whose pull request merged but are not done; let go of a parked story's stale
@@ -11,7 +12,8 @@
 // (or null). The resumes come in the order of the `priority` input, the story ids in priority
 // order (pick.mjs byPriority); an id not in it keeps its found order, after the ones in it.
 //
-// No CLI: supervisor.mjs imports reconcile() and recoverySteps().
+// No CLI: session-lifecycle.mjs (recoveryPlan, a part of supervisor.mjs) imports reconcile() and
+// recoverySteps().
 
 // The ship lock carries the name of the ship step that is running (ship.mjs), or `waiting`.
 // A release cut off at one of these stages is finished, not redone: past them the live

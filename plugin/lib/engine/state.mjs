@@ -59,6 +59,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wri
 import { dirname, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DEFAULTS } from '../config/defaults.mjs';
+import { askedOf } from './asked-for.mjs';
 import { haltReason } from './halt-reason.mjs';
 import { loadConfig } from '../config/load.mjs';
 import { currentSlot, projectRoot, stateDir } from './paths.mjs';
@@ -1115,6 +1116,8 @@ export async function snapshot(dir = DIR, now = new Date(), stages = null, { roo
     slow: state.loop?.state === 'stopped' ? [] : Array.isArray(state.slow) ? state.slow : [],
     // The stories the owner skipped this run (the supervisor's skipped): none once it stops.
     skipped: state.loop?.state === 'stopped' ? [] : Array.isArray(state.skipped) ? state.skipped : [],
+    // The split of a run with a number: { max, resumed } (the stories start-up recovery queued and the live sessions a fresh start adopted, on top of max); null once it stops.
+    asked: askedOf(state),
     // The supervisor's { from, to, since } until it restarts on new plugin code: no new story
     // starts meanwhile. A stopped run has none, and neither has one whose supervisor has died
     // (restartPendingOf).

@@ -6,11 +6,12 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { clearHolds, commandLabel, heldList, heldSpawnSync, holdDuring, HOLD_MIN_MS, HOLDS_KEPT, noteHold } from './loop-holds.mjs';
 import { lateWakeText } from './wake.mjs';
+import { SUPERVISOR_PARTS, supervisorSource } from '../../../test/supervisor-source.mjs';
 
 const HOLDS_URL = new URL('./loop-holds.mjs', import.meta.url).href;
 const WORKTREE_URL = new URL('./worktree.mjs', import.meta.url).href;
 // supervisor.mjs and the modules split out of it, so a guard on the loop covers every one of them.
-const LOOP_SOURCES = ['supervisor.mjs', 'owner-commands.mjs', 'account-checks.mjs', 'story-claims.mjs', 'standby.mjs', 'session-records.mjs', 'background-jobs.mjs', 'dry-run.mjs'];
+const LOOP_SOURCES = [...SUPERVISOR_PARTS, 'owner-commands.mjs', 'account-checks.mjs', 'story-claims.mjs', 'standby.mjs', 'session-records.mjs', 'background-jobs.mjs', 'dry-run.mjs'];
 
 const T0 = Date.parse('2026-10-30T10:34:39.000Z');
 const MIN = 60_000;
@@ -153,7 +154,7 @@ describe('the synchronous shells that go through it', () => {
   const read = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8');
 
   it("the supervisor's sh, and no synchronous `claude auth status` in it or the modules split from it (the subscription check runs asynchronously)", () => {
-    expect(read('./supervisor.mjs')).toContain("const r = heldSpawnSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });");
+    expect(supervisorSource()).toContain("const r = heldSpawnSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });");
     for (const file of LOOP_SOURCES) {
       const src = read(`./${file}`);
       expect(src, file).not.toContain('authSh');
@@ -163,7 +164,7 @@ describe('the synchronous shells that go through it', () => {
   });
 
   it("the supervisor's gh and git ls-remote calls end within 30 s", () => {
-    const src = read('./supervisor.mjs');
+    const src = supervisorSource();
     expect(src).toContain("const NET_LIMIT = { timeout: 30_000, killSignal: 'SIGKILL' };");
     const calls = src.match(/\bsh\('gh', [^\n]*/g) ?? [];
     expect(calls.length).toBeGreaterThanOrEqual(1);
@@ -287,12 +288,12 @@ describe('recordSyncChildren', () => {
 
 describe('the supervisor installs the record', () => {
   it('right after its imports', () => {
-    const src = readFileSync(fileURLToPath(new URL('./supervisor.mjs', import.meta.url)), 'utf8');
+    const src = supervisorSource();
     expect(src).toContain('recordSyncChildren();');
   });
 
   it('counts a session being read as in hand wherever a held set is built, and as running', () => {
-    const src = readFileSync(fileURLToPath(new URL('./supervisor.mjs', import.meta.url)), 'utf8');
+    const src = supervisorSource();
     expect(src).toContain('const inHandSessions = () => [...sessions.values(), ...closing.values()];');
     expect(src.match(/inHandSessions\(\)/g).length).toBeGreaterThanOrEqual(5);
     expect(src).toContain('sessions.has(s) || closing.has(s) || preparing.has(s)');
@@ -306,7 +307,7 @@ describe('the supervisor installs the record', () => {
       expect(src, file).not.toContain('applyOwnerAnswers');
       expect(src, file).not.toContain('sessionTokens(');
     }
-    const src = readFileSync(fileURLToPath(new URL('./supervisor.mjs', import.meta.url)), 'utf8');
+    const src = supervisorSource();
     expect(src).toContain('const CODE = DRY ? null : codeVersionWatch();');
   });
 });

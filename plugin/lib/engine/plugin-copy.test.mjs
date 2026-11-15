@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { copyWarning, initPluginWarning, installedCopies, ownCopy, samePlace, sessionPlugin } from './plugin-copy.mjs';
+import { copyWarning, initPluginWarning, installedCopies, ownCopy, samePlace, sessionPlugin, shadowingCopies } from './plugin-copy.mjs';
 
 let base;
 let pluginsDir;
@@ -144,7 +144,7 @@ describe('copyWarning', () => {
 
   it('names both versions, both paths and the label', () => {
     expect(copyWarning({ copy, own: { path: '/opt/acme/checkout/plugin', version: '0.0.2', label: 'a1b2c3d' } })).toBe(
-      'The installed Foreman plugin is 0.0.1 (/opt/acme/cache/0.0.1), but this Foreman is 0.0.2 (a1b2c3d) (/opt/acme/checkout/plugin); story sessions load this one with --plugin-dir.',
+      'The installed Foreman plugin is 0.0.1 (/opt/acme/cache/0.0.1), but this Foreman is 0.0.2 (a1b2c3d) (/opt/acme/checkout/plugin); story sessions load this one with --plugin-dir and run its `foreman`, with the installed copy turned off.',
     );
   });
 
@@ -199,7 +199,7 @@ describe('samePlace with no path', () => {
 describe('given a missing or wrong input', () => {
   const copy = (path, version = '0.0.1') => ({ id: 'foreman@acme-market', scope: 'user', path, version });
   const outside = () => join(base, 'checkout', 'plugin');
-  const bare = 'The installed Foreman plugin is ? (?), but this Foreman is ? (?); story sessions load this one with --plugin-dir.';
+  const bare = 'The installed Foreman plugin is ? (?), but this Foreman is ? (?); story sessions load this one with --plugin-dir and run its `foreman`, with the installed copy turned off.';
 
   it('installedCopies is [] with no argument, and keeps only the user entries when root is not a string', () => {
     expect(installedCopies()).toEqual([]);
@@ -242,5 +242,31 @@ describe('given a missing or wrong input', () => {
   it('copyWarning gives question marks for a missing copy or own', () => {
     expect(copyWarning()).toBe(bare);
     expect(copyWarning({ copy: null, own: null })).toBe(bare);
+  });
+});
+
+describe('shadowingCopies', () => {
+  const copy = (path, id = 'foreman@acme-market') => ({ id, scope: 'user', path, version: '0.0.1' });
+  const own = () => join(base, 'checkout', 'plugin');
+
+  it('keeps the copies at another place and drops the one that is the same place, with or without a trailing slash', () => {
+    const elsewhere = copy(join(base, 'cache', '0.0.1'));
+    expect(shadowingCopies({ pluginDir: own(), copies: [elsewhere, copy(own()), copy(`${own()}/`, 'foreman@other')] })).toEqual([elsewhere]);
+  });
+
+  it('drops entries with no string id or no non-empty string path', () => {
+    const good = copy(join(base, 'cache', '0.0.1'));
+    expect(shadowingCopies({ pluginDir: own(), copies: [good, { path: '/opt/acme/x' }, { id: 7, path: '/opt/acme/x' }, { id: 'foreman@acme-market' }, copy(''), copy(5)] })).toEqual([good]);
+  });
+
+  it('is [] for a missing or non-string pluginDir, and for copies that are not an array', () => {
+    const list = [copy(join(base, 'cache', '0.0.1'))];
+    for (const pluginDir of [undefined, null, '', 5]) expect(shadowingCopies({ pluginDir, copies: list })).toEqual([]);
+    for (const copies of [undefined, null, 'x', {}]) expect(shadowingCopies({ pluginDir: own(), copies })).toEqual([]);
+    expect(shadowingCopies()).toEqual([]);
+  });
+
+  it('does not throw on null or non-object entries', () => {
+    expect(shadowingCopies({ pluginDir: own(), copies: [null, undefined, 'x', 7] })).toEqual([]);
   });
 });

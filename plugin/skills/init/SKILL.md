@@ -183,7 +183,7 @@ with sample values for Acme (environment branches, one build sandbox, QA then UA
 1. The pack brings its own traits for every agent, the security reviewer and the tester, so add
    none of them with `foreman traits add`.
 2. Run `foreman sf skills`. It installs the pinned Salesforce skills. On success, tell the
-   owner to commit `skills-lock.json`, `.agents/skills` and `.claude/skills`. If its last
+   owner to commit `skills-lock.json`, `.gitignore`, `.agents/skills` and `.claude/skills`. If its last
    line is `{ "ok": false, "reason": ... }`, give the reason in plain words and carry on;
    the doctor reports it again.
 3. Never log in to an org, and never run `sf org login` yourself. The owner signs each

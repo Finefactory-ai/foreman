@@ -1,7 +1,7 @@
 // The story sessions running now in the slots' folders, found from the machine itself rather than
 // from what a supervisor wrote down. A supervisor that starts (after a hard kill, a crash, or a
 // restart whose hand-over did not reach it) adopts these instead of starting each story again
-// beside its live session (supervisor.mjs), and `foreman doctor` warns when one folder has two
+// beside its live session (session-lifecycle.mjs adoptLive, a part of supervisor.mjs), and `foreman doctor` warns when one folder has two
 // (doctor-checks.mjs). Pure apart from the `sh` and `readlink` passed in.
 //
 //   parseStorySessions(psText) -> [{ pid, ppid, ageMs, id, mode }]
@@ -51,7 +51,7 @@ import { lsofFolders, parseEtime } from './strays.mjs';
 
 const PROMPT = '/foreman:story';
 // The words a story session may carry after its id: what the supervisor passes (scheduler.mjs
-// 'after-halt', supervisor.mjs 'fresh', slot-work.mjs 'group-summary') and the story skill's
+// 'after-halt', owner-controls.mjs restartFresh 'fresh', slot-work.mjs 'group-summary') and the story skill's
 // 'phase-summary'. '' is no mode.
 export const SESSION_MODES = new Set(['', 'after-halt', 'fresh', 'group-summary', 'phase-summary']);
 const NOT_A_SESSION = new Set(['sh', 'bash', 'zsh', 'dash', 'fish', 'ksh', 'grep', 'egrep', 'rg', 'ps', 'pgrep', 'less', 'tail', 'cat']);

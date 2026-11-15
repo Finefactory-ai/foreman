@@ -10,6 +10,7 @@ import { jiraRefresher } from '../jira/refresher.mjs';
 import { startFakeJiraHere } from '../../../test/fake-jira.mjs';
 import { checkWake, DEFAULT_TICK_MS, LATE_FACTOR, lateWake, lateWakeText, loopRest, refreshAfterWake, restThenCheckWake, tickMs, WAKE_POLL_LIMIT_MS } from './wake.mjs';
 import { progressWatch, stuckLimits } from './progress-watch.mjs';
+import { supervisorSource } from '../../../test/supervisor-source.mjs';
 
 const SITE = 'acme.atlassian.net';
 const JQL = 'project = APP ORDER BY rank';
@@ -71,7 +72,7 @@ describe('tickMs', () => {
   });
 
   it('the supervisor reads its tick from FOREMAN_TICK_MS through tickMs', () => {
-    const src = fs.readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     expect(src).toContain('const TICK_MS = tickMs(process.env.FOREMAN_TICK_MS);');
   });
 });
@@ -410,7 +411,7 @@ describe('loopRest', () => {
   });
 
   it('the supervisor rests through loopRest with its progress watch', () => {
-    const src = fs.readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     expect(src).toContain('await loopRest({ intervalMs: TICK_MS, sleep, jira, event, wait: sleep, progress })');
     expect(src).not.toContain('restThenCheckWake(');
   });

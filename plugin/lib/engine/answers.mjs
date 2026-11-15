@@ -78,6 +78,7 @@ const DROP = 'Drop';
 const RETRY_RELEASE = 'Retry the release';
 export const RELEASE_RETRY_NOTE = 'The owner asked to retry the release: resume from the built branch and ship it again.';
 export const releaseTitle = (id) => `${id} could not be released`;
+export const haltTitle = (id) => `${id} stopped the release line`;
 const FAILED_STORY = /^(\S+) could not (?:pass review|be released)$/;
 const DEPENDS = /^Add depends_on: (.+) to (\S+)\?$/;
 const WAITS = /^(\S+) now waits for (.+)$/;

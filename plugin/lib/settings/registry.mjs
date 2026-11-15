@@ -42,6 +42,7 @@
 import { DEFAULTS } from '../config/defaults.mjs';
 import { AGENT_MODELS, BRANCH, CLAUDE_FALLBACKS, COMMENT_DETAILS, LEARNING_MODELS } from '../config/validate.mjs';
 import { PACKS } from '../../packs/index.mjs';
+import { VALIDATE_LATER } from '../../packs/salesforce/config.mjs';
 import { roleModelEntries, roleModelEntry } from './role-models.mjs';
 
 export const TYPES = ['boolean', 'integer', 'number', 'string', 'string[]', 'enum', 'map'];
@@ -86,6 +87,7 @@ const isJira = (config) => config?.stories?.adapter === 'jira';
 const JIRA = { group: 'jira', when: isJira, whenText: 'stories.adapter is "jira"' };
 const WATCH = { when: (config) => config?.ship?.watch !== undefined, whenText: 'ship.watch is configured' };
 const EMAIL = { when: (config) => config?.notify?.adapter === 'email-resend', whenText: 'notify.adapter is "email-resend"' };
+const GEARSET = { when: (config) => config?.pack === 'salesforce' && config?.salesforce?.release === 'gearset', whenText: 'salesforce.release is "gearset"' };
 const DASHBOARD = { when: (config) => (config?.console?.adapter ?? 'dashboard') === 'dashboard', whenText: 'console.adapter is "dashboard"' };
 
 export const TRANSITION_EVENTS = ['started', 'blocked', 'review', 'failed', 'shipped'];
@@ -139,6 +141,7 @@ const ENTRIES = [
   entry('ship.smoke.urls', 'Smoke-test URLs', 'Live pages to load after a deploy, to check the site is up.', { type: 'string[]', default: [], applies: 'next-story', group: 'release' }),
   entry('ship.pr.into', 'Pull request target', 'The branch pull requests merge into. Leave empty to use baseBranch, the branch stories start from.', { type: 'string', default: null, applies: 'next-story', group: 'release', check: prInto }),
   entry('ship.merge.keepBranch', 'Keep the branch', 'Keeps the story branch after its pull request merges, instead of deleting it.', { type: 'boolean', default: false, applies: 'next-story', group: 'release' }),
+  entry('salesforce.gearset.validateLaterStages', 'Later-stage validation', "Who checks each later stage's promotion pull request before the merge: Foreman, or Gearset itself.", { type: 'enum', values: VALIDATE_LATER, default: 'foreman', applies: 'next-story', group: 'release', ...GEARSET }),
   // jira
   entry('stories.jql', 'JQL filter', 'The Jira search (JQL) that picks which issues are stories. Its ORDER BY sets the build order.', { type: 'string', default: null, applies: 'next-story', ...JIRA }),
   entry('stories.pollSeconds', 'Poll interval (seconds)', 'How long Foreman reuses the story list before asking Jira again. 0 asks every time.', { type: 'integer', min: 0, default: 60, applies: 'next-story', ...JIRA }),

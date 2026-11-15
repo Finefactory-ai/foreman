@@ -24,6 +24,8 @@ describe('the build limit with a story that stops making progress', () => {
     const out = join(repos.base, 'args.json');
     const { code, state, events, runs, sessions } = await runFactory({
       FAKE_MODE: 'stall',
+      // The second session ships, so the run ends there (a blocked story does not count toward `run 1`).
+      FAKE_END: 'shipped',
       FAKE_ARGS_OUT: out,
       // A note another process queued while the second session ran (the dashboard, a command), which no
       // session ending posts: only the supervisor's tick does.
@@ -44,7 +46,7 @@ describe('the build limit with a story that stops making progress', () => {
     // The first record says why it stopped and what will be done again: the compliance review.
     expect(runs).toHaveLength(2);
     expect(runs[0]).toMatchObject({ result: 'crashed', watchdog: { why: 'too-long', kept, redoneTokens: 700, redoneMinutes: 15 } });
-    expect(runs[1].result).toBe('blocked');
+    expect(runs[1].result).toBe('shipped');
     expect(Object.hasOwn(runs[1], 'watchdog')).toBe(false);
 
     // The next session was given the plan and the finished build and tester, not the architect.

@@ -2,12 +2,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ANSWER_RETRY_MS, answerRetryMs, answerSkips, answersToApply, applyAnswers, EVERY_TICK, failedAnswer, failedStoryOf, heldForAnswer, kindOf, learnedNote, mayApplyAnswers, OPTIONS, RELEASE_RETRY_NOTE, releaseTitle, requeueKind, slotHolds, STORYLESS, supervisorApplies, waitsForAnswer } from './answers.mjs';
+import { ANSWER_RETRY_MS, answerRetryMs, answerSkips, answersToApply, applyAnswers, EVERY_TICK, failedAnswer, failedStoryOf, haltTitle, heldForAnswer, kindOf, learnedNote, mayApplyAnswers, OPTIONS, RELEASE_RETRY_NOTE, releaseTitle, requeueKind, slotHolds, STORYLESS, supervisorApplies, waitsForAnswer } from './answers.mjs';
 import { openProjectStories } from './story-source.mjs';
 import { addItem, readLedger, updateItem } from './learning-store.mjs';
 import { main } from '../cli/main.mjs';
 import * as decisions from '../console/decisions.mjs';
 import { CLOSE_TASK, RETRY_STORY, TASK_OPTIONS } from '../console/decisions.mjs';
+import { supervisorSource } from '../../../test/supervisor-source.mjs';
 
 const REVIEW = ['Retry with a note to the architect', "I'll take it", 'Drop'];
 
@@ -614,7 +615,7 @@ describe('heldForAnswer', () => {
   });
 
   it('is what the supervisor uses to decide whether a story can be put back', () => {
-    const src = readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     expect(src).toContain('const held = heldForAnswer({ claims: claims(DIR), sessions: inHandSessions(), work, slots: SLOT_IDS.map((s) => readSlot(DIR, s)) });');
     expect(src).not.toContain('claims(DIR).filter((c) => !c.stale)');
   });
@@ -818,7 +819,7 @@ describe('mayApplyAnswers', () => {
     }
   });
   it("is what the supervisor's tick asks, with the live counts, and failed answers are skipped", () => {
-    const src = readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     expect(src).toContain('const answersIdle = mayApplyAnswers({ running: sessions.size + closing.size, preparing: preparing.size, queued: takeable(work, workers), halted, held: pickHeld, stopping });');
     expect(src).toContain('await startAnswers(answersIdle ? null : EVERY_TICK);');
     expect(src).toContain('const skip = answerSkips(answerFailures, Date.now());');
@@ -837,7 +838,7 @@ describe('mayApplyAnswers', () => {
   });
 
   it('runs the answers and the learning tick without FOREMAN_RUN, as the owner', () => {
-    const src = readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     expect(src).toContain('runAsync(NODE.node(), [FOREMAN_BIN, ...args], { cwd: ROOT, env: ownerEnv(process.env), timeoutMs: 120_000, track: loopChildren })');
     // The learning tick is started in background-jobs.mjs.
     const jobs = readFileSync(new URL('./background-jobs.mjs', import.meta.url), 'utf8');
@@ -1304,6 +1305,12 @@ describe('a failed answer is tried again after a growing wait', () => {
     const failures = new Map([[waiting.id, { retryAt: new Date(NOW + MIN).toISOString() }], [due.id, { retryAt: new Date(NOW - MIN).toISOString() }]]);
     const todo = answersToApply([due, waiting], { skip: answerSkips(failures, NOW), canRequeue: () => true });
     expect(todo.map((t) => t.item.id)).toEqual([due.id]);
+  });
+});
+
+describe('the halt title', () => {
+  it("is the title the story skill gives the halt's task", () => {
+    expect(haltTitle('ACME-1')).toBe('ACME-1 stopped the release line');
   });
 });
 

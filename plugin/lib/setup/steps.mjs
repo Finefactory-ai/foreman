@@ -406,7 +406,7 @@ export const STEPS = Object.freeze([
     actions: [CHECK, { id: 'sf-skills', label: 'Install the skills' }],
     guide: [
       { text: 'Run `foreman sf skills` to install the pinned Salesforce skills.' },
-      { text: 'Commit skills-lock.json, .agents/skills and .claude/skills.' },
+      { text: 'Commit skills-lock.json, .gitignore, .agents/skills and .claude/skills.' },
     ],
     more: DOCS_URL + 'salesforce-set-up/',
   },
@@ -417,7 +417,7 @@ export const STEPS = Object.freeze([
     why: 'With release gearset, Gearset promotes each story through your stages, and Foreman follows it through the Gearset API.',
     hint: 'add GEARSET_API_TOKEN to .env.foreman',
     applies: (config) => isSalesforce(config) && config?.salesforce?.release === 'gearset',
-    checks: ['salesforce gearset token', 'salesforce gearset branch', 'salesforce gearset merge method', 'salesforce gearset environments', 'salesforce gearset ci job'],
+    checks: ['salesforce gearset token', 'salesforce gearset branch', 'salesforce gearset merge method', 'salesforce gearset environments', 'salesforce gearset ci job', 'salesforce gearset project file'],
     inputs: [
       { kind: 'key', name: 'GEARSET_API_TOKEN', validate: oneWord },
       { kind: 'config', name: 'salesforce.gearset.pipelineId', configPath: 'salesforce.gearset.pipelineId', required: false },

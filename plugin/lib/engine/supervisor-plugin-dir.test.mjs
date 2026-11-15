@@ -18,7 +18,7 @@ import { PLUGIN_DIR } from './code-version.mjs';
 // init event with the plugin path FAKE_PLUGIN_PATH, waits for the file FAKE_PROCEED, then marks
 // its story blocked and says so.
 const FAKE_CLAUDE = `#!/usr/bin/env node
-const { appendFileSync, existsSync, mkdirSync, writeFileSync } = require('node:fs');
+const { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs');
 const { join } = require('node:path');
 if (process.argv[2] === 'auth') {
   console.log(JSON.stringify({ loggedIn: false }));
@@ -26,7 +26,12 @@ if (process.argv[2] === 'auth') {
 }
 const id = process.env.FOREMAN_STORY;
 const at = process.argv.indexOf('--plugin-dir');
-appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({ pluginDir: at === -1 ? null : process.argv[at + 1], pluginRoot: process.env.FOREMAN_PLUGIN_ROOT ?? null }) + '\\n');
+const heads = (process.env.PATH ?? '').split(':').filter(Boolean);
+const foreman = heads.map((d) => join(d, 'foreman')).find((f) => { try { accessSync(f, constants.X_OK); return true; } catch { return false; } }) ?? null;
+const sat = process.argv.indexOf('--settings');
+let foremanOff = null;
+try { foremanOff = JSON.parse(readFileSync(process.argv[sat + 1], 'utf8')).enabledPlugins?.['foreman@foreman'] ?? null; } catch {}
+appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({ pluginDir: at === -1 ? null : process.argv[at + 1], pluginRoot: process.env.FOREMAN_PLUGIN_ROOT ?? null, foreman, foremanOff, pathHead: heads[0] ?? null }) + '\\n');
 console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'fake', model: 'claude-opus-5-5', plugins: [{ name: 'foreman', path: process.env.FAKE_PLUGIN_PATH, source: 'foreman@foreman', version: '0.0.1' }] }));
 const wait = () => {
   if (!existsSync(process.env.FAKE_PROCEED)) return setTimeout(wait, 50);
@@ -88,10 +93,10 @@ function install(installPath) {
   writeFileSync(join(plugins, 'installed_plugins.json'), JSON.stringify({ version: 2, plugins: { 'foreman@foreman': [{ scope: 'user', installPath, version: '0.0.1' }] } }));
 }
 
-const runEnv = (pluginPath) => {
+const runEnv = (pluginPath, front = '') => {
   const env = {
     ...process.env,
-    PATH: `${bin}:${process.env.PATH}`,
+    PATH: `${bin}:${front}${process.env.PATH}`,
     HOME: repos.base,
     CLAUDE_CONFIG_DIR: join(repos.base, '.claude'),
     GIT_CONFIG_GLOBAL: '/dev/null',
@@ -123,8 +128,8 @@ const until = async (ready, what) => {
 
 // Runs the supervisor to idle, letting the session end once `ready` says the checks it waits on
 // have had their chance.
-async function runToIdle(pluginPath, ready) {
-  const child = startForeman(['run', '--foreground', '--exit-when-idle'], { cwd: clone, env: runEnv(pluginPath), stdio: 'ignore' });
+async function runToIdle(pluginPath, ready, front = '') {
+  const child = startForeman(['run', '--foreground', '--exit-when-idle'], { cwd: clone, env: runEnv(pluginPath, front), stdio: 'ignore' });
   const exited = new Promise((resolveExit) => child.on('exit', (code) => resolveExit(code)));
   const timer = setTimeout(() => endChild(child), 80_000);
   await until(() => sessions().length > 0, 'the session to start');
@@ -140,13 +145,18 @@ describe('the plugin folder a story session loads', () => {
     setUp();
     const cache = join(repos.base, 'cache', 'foreman', '0.0.1');
     install(cache);
+    // The older installed copy's bin is on the PATH the supervisor inherited, as from an outer Claude Code.
+    mkdirSync(join(cache, 'bin'), { recursive: true });
+    writeFileSync(join(cache, 'bin', 'foreman'), '#!/bin/sh\n');
+    chmodSync(join(cache, 'bin', 'foreman'), 0o755);
     // After the warning, a few more ticks pass with the session still up: it must not warn again.
     const code = await runToIdle(cache, async () => {
       await until(() => warns('its session loaded').length > 0, "the slot's warning");
       await new Promise((r) => setTimeout(r, 3 * TEST_TICK_MS));
-    });
+    }, `${join(cache, 'bin')}:`);
     expect(code).toBe(0);
-    expect(sessions()).toEqual([{ pluginDir: resolve(PLUGIN_DIR), pluginRoot: resolve(PLUGIN_DIR) }]);
+    // The session's first `foreman` is the supervisor's own, with the installed copy turned off.
+    expect(sessions().map(({ pathHead, ...rest }) => rest)).toEqual([{ pluginDir: resolve(PLUGIN_DIR), pluginRoot: resolve(PLUGIN_DIR), foreman: join(resolve(PLUGIN_DIR), 'bin', 'foreman'), foremanOff: false }]);
     const start = warns('story sessions load this one with --plugin-dir');
     expect(start).toHaveLength(1);
     expect(start[0].slot).toBeNull();
@@ -164,7 +174,11 @@ describe('the plugin folder a story session loads', () => {
     // The check of the init runs on a tick; give it a few before the session ends.
     const code = await runToIdle(PLUGIN_DIR, () => new Promise((r) => setTimeout(r, 3 * TEST_TICK_MS)));
     expect(code).toBe(0);
-    expect(sessions()).toEqual([{ pluginDir: null, pluginRoot: resolve(PLUGIN_DIR) }]);
+    // Nothing is changed: the PATH is the one the run was given, and no copy is turned off.
+    const [only, ...more] = sessions();
+    expect(more).toEqual([]);
+    expect(only).toMatchObject({ pluginDir: null, pluginRoot: resolve(PLUGIN_DIR), foremanOff: null, pathHead: bin });
+    expect(only.foreman).not.toBe(join(resolve(PLUGIN_DIR), 'bin', 'foreman'));
     expect(events().filter((e) => e.text.includes('--plugin-dir') || e.text.includes('its session loaded'))).toEqual([]);
   }, 90_000);
 });

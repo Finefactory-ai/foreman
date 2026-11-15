@@ -3,9 +3,13 @@
 //   foreman sf skills   installs the skills at salesforce.skills.tag from salesforce.skills.source
 //                       into .agents/skills, links them from .claude/skills, and writes
 //                       skills-lock.json (skills.mjs). It commits nothing: it says what to commit.
+//                       Sample sfdx-project.json files inside the skills are kept out of git:
+//                       the .gitignore line is added, and any sample git tracks is untracked
+//                       (the file stays); the line then also says to commit .gitignore.
 //                       The last line is JSON: { ok: true, source, tag, commit, installed,
 //                       removed } plus movedFrom, the commit skills-lock.json recorded, when the
-//                       tag moved upstream (with a warning on stderr), or { ok: false, reason }.
+//                       tag moved upstream (with a warning on stderr), plus untracked, the sample
+//                       paths git stopped tracking, when there were any, or { ok: false, reason }.
 //   foreman sf deletes allow|keep-out <story id>
 //                       records the owner's answer to the metadata deletes the sf-delta ship
 //                       step is waiting on (deletes.mjs). An allow holds only for the
@@ -268,9 +272,12 @@ export function makeSfCommand({ sh = null, packs = null, tmpDir, now = () => new
     if (r.movedFrom) {
       stderr.write(`warning: tag ${tag} of ${source} now points at ${r.commit.slice(0, SHORT_COMMIT)}, not ${r.movedFrom.slice(0, SHORT_COMMIT)} as skills-lock.json recorded; it was moved upstream, so check what changed before you commit\n`);
     }
-    stdout.write(`installed ${r.installed.length} skills from ${source} at ${tag} (${r.commit.slice(0, SHORT_COMMIT)}); commit skills-lock.json, .agents/skills and .claude/skills\n`);
+    const untracked = r.untracked?.length ? r.untracked : null;
+    const stopped = untracked ? `stopped git tracking ${untracked.length} sample sfdx-project.json file(s) inside the skills; ` : '';
+    const commitWhat = untracked || r.ignoreAdded ? 'skills-lock.json, .gitignore, .agents/skills and .claude/skills' : 'skills-lock.json, .agents/skills and .claude/skills';
+    stdout.write(`installed ${r.installed.length} skills from ${source} at ${tag} (${r.commit.slice(0, SHORT_COMMIT)}); ${stopped}commit ${commitWhat}\n`);
     const moved = r.movedFrom ? { movedFrom: r.movedFrom } : {};
-    stdout.write(`${JSON.stringify({ ok: true, source, tag, commit: r.commit, installed: r.installed.length, removed: r.removed, ...moved })}\n`);
+    stdout.write(`${JSON.stringify({ ok: true, source, tag, commit: r.commit, installed: r.installed.length, removed: r.removed, ...moved, ...(untracked ? { untracked } : {}) })}\n`);
     return 0;
   }
 

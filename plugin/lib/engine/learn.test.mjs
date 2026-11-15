@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { createdSummary, createdTitle, followUpDoneWhen, followUpKey, followUps, followUpSummary, followUpTitle, followUpWhat, keyOf, learnEvent, normaliseRule, parseFindings, proposals, traitExplain, traitHints, traitSummary } from './learn.mjs';
 import { explainProblems } from '../console/decisions.mjs';
+import { supervisorSource } from '../../../test/supervisor-source.mjs';
 
 const f = (story, rule, extra = {}) => ({ story, result: 'failed', builder: 'developer', stage: 'review', severity: 'major', rule, where: `${story}.js`, observed: 'o', fix: 'add a test', ...extra });
 
@@ -96,7 +97,7 @@ describe('proposals', () => {
 
 describe('the supervisor', () => {
   it('runs foreman learn once while stopping, through its owner commands', () => {
-    const src = readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     const stop = src.slice(src.indexOf('async function stop('), src.indexOf('function tick('));
     expect(stop.match(/owner\.finish\(/g)).toHaveLength(1);
     expect(stop).not.toContain('owner.learn(');

@@ -2,6 +2,7 @@
 
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { leftInHand, resumedLine } from './asked-for.mjs';
 import { claims } from './locks.mjs';
 import { needsExclusive, nextStory } from './pick.mjs';
 import { recoveryWords } from './reconcile.mjs';
@@ -24,6 +25,8 @@ export function dryRun({ loaded, START, workers, MAX, SLOT_IDS, DIR, CONFIG, slo
   console.log(`${workers} ${workers === 1 ? 'worker' : 'workers'} (${START.from === 'flag' ? '--workers' : 'the workers setting'})`);
   const queue = recoveryPlan().filter((a) => a.type !== 'clear-stale');
   rehome(queue, workers);
+  const line = resumedLine({ max: MAX, count: leftInHand(queue).length });
+  if (line) console.log(line);
   const taken = new Set(claims(DIR).map((c) => c.id));
   const extra = schemaExtra();
   let tokenFree = schemaFree();

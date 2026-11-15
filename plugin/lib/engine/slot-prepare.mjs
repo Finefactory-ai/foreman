@@ -130,7 +130,7 @@ export function notStartedPatch(st) {
 // The slot patch for a session that starts now (`at`, an ISO string): building, with the
 // slot's story kept, or a fresh one for `id`. It clears heldStory, which a released held slot
 // keeps until its story's session starts (scheduler.mjs releaseHeld), and parkedStory, the story
-// a crash-parked slot keeps its claim for (supervisor.mjs onExit).
+// a crash-parked slot keeps its claim for (session-lifecycle.mjs onExit, a part of supervisor.mjs).
 export function sessionStartPatch(st, id, at) {
   return {
     state: 'building',

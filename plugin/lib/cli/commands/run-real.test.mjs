@@ -29,12 +29,19 @@ describe('foreman run --dry-run', () => {
   });
 
   describe('stories a dead run left in hand', () => {
-    // A dead run's claim names S-2 in a slot (w1 unless said).
-    const deadClaim = (slot = 'w1') => {
+    // A dead run's claim names a story (S-2 unless said) in a slot (w1 unless said).
+    const deadClaim = (slot = 'w1', id = 'S-2') => {
       const dead = spawnSync(process.execPath, ['-e', '']).pid;
       mkdirSync(join(proj, '.foreman', 'claims'), { recursive: true });
-      writeFileSync(join(proj, '.foreman', 'claims', 'S-2.json'), JSON.stringify({ pid: dead, slot, story: 'S-2', by: 'factory', at: new Date().toISOString() }));
+      writeFileSync(join(proj, '.foreman', 'claims', `${id}.json`), JSON.stringify({ pid: dead, slot, story: id, by: 'factory', at: new Date().toISOString() }));
     };
+
+    it('says they are resumed on top of the stories asked for', () => {
+      for (const id of ['S-2', 'S-3', 'S-4']) deadClaim('w1', id);
+      const r = foreman('run', '1', '--dry-run', '--workers', '1');
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('3 stories left in hand are resumed first, on top of the 1 asked for: they do not count towards it.');
+    });
 
     it('with one worker, a higher-priority story starts first and the resume waits', () => {
       deadClaim();
@@ -68,6 +75,7 @@ describe('foreman run --dry-run', () => {
     expect(r.stdout).toContain('would start S-1 (First thing) in w1');
     expect(r.stdout).not.toContain('S-2');
     expect(r.stdout).toContain('nothing to start in w2');
+    expect(r.stdout).not.toContain('left in hand');
   });
 
   it('passes over a slot that is not idle', () => {

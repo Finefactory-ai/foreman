@@ -41,6 +41,22 @@ describe('skills/run/SKILL.md', () => {
     for (const l of lines) expect(l).toContain('artifacts');
   });
 
+  it('says a story that ends blocked does not use up one of the N', () => {
+    const flat = text.replace(/\s+/g, ' ');
+    expect(flat).toContain('a story that ends blocked and built nothing does not use up one of the N');
+  });
+
+  it('says the stories an earlier run left in hand come on top of the N', () => {
+    const flat = text.replace(/\s+/g, ' ');
+    expect(flat).toContain('stories an earlier run left in hand are resumed first, on top of the N, and do not count towards it');
+  });
+
+  it('keeps the no-number note next to the sentence it explains', () => {
+    const flat = text.replace(/\s+/g, ' ');
+    expect(flat).toContain('does not use up one of the N (no number: it runs until stopped');
+    expect(flat).not.toMatch(/\) \(/);
+  });
+
   it('says a run with no N lasts until foreman stop', () => {
     expect(text).toMatch(/no N lasts until `foreman stop`/);
     expect(text).toContain('--exit-when-idle');

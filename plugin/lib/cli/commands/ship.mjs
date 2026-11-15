@@ -25,6 +25,13 @@
 // release. When the config names a pack, that pack's steps can be in `ship.steps`; `packs`
 // stands in for the real pack registry (plugin/packs/index.mjs) in tests.
 //
+// While it runs, a line goes to stdout at least once a minute saying what the release is waiting
+// on ("still releasing <story>: <what> (<n> min)"), so a session that watches the command sees
+// output; the last line printed is still the JSON. A SIGTERM, SIGINT or SIGHUP ends the process
+// at once with that JSON, exit 1 and stage `interrupted` (engine/ship.mjs `interrupts`): the ship
+// lock is released when nothing could be live, and kept past a point of no return. Nothing is
+// written on the story for it.
+//
 // The runner also gets `rolledBackAt`: when the pack says the story's last release was rolled
 // back (else null). The pr step uses it to open a new pull request instead of reusing one merged
 // before the rollback.
@@ -117,7 +124,7 @@ function missingEnv(steps, env) {
 }
 
 // The real ctx for the runner: locks and HALT in the state folder, status to the slot.
-function shipContext({ config, story, shell, shellEnv, root, env, clock, packs }) {
+function shipContext({ config, story, shell, shellEnv, root, env, clock, packs, stdout }) {
   const dir = stateDir(root, config, env);
   // When the story's last release was rolled back (null for none); the pr step opens a new pull
   // request instead of reusing one merged before it. The same rule as `foreman story next`.
@@ -150,6 +157,7 @@ function shipContext({ config, story, shell, shellEnv, root, env, clock, packs }
         beat(dir, slot, clock());
       }),
     beat: () => quiet(() => beat(dir, slot, clock())),
+    progress: (line) => quiet(() => stdout.write(`${line}\n`)),
     isHalted: () => existsSync(haltFile),
     halt: (result) => {
       mkdirSync(dir, { recursive: true });
@@ -159,7 +167,10 @@ function shipContext({ config, story, shell, shellEnv, root, env, clock, packs }
   };
 }
 
-export function makeShipCommand({ runShip = realRunShip, sh = null, packs = PACKS } = {}) {
+const STOP_SIGNALS = ['SIGTERM', 'SIGINT', 'SIGHUP'];
+
+// `signals` stands in for the process and `exit` for process.exit in tests.
+export function makeShipCommand({ runShip = realRunShip, sh = null, packs = PACKS, signals = process, exit = (code) => process.exit(code) } = {}) {
   return {
     name: 'ship',
     summary: 'release the story branch through the configured ship steps (ship --story <id> | --preflight)',
@@ -219,8 +230,37 @@ export function makeShipCommand({ runShip = realRunShip, sh = null, packs = PACK
       if (!story) return print(1, { stage: 'start', reason: 'no story id: pass --story or set FOREMAN_STORY' });
 
       try {
-        const ctx = shipContext({ config, story, shell, shellEnv, root, env, clock, packs });
-        const { code, result } = await runShip({ steps, ctx, onFailure });
+        const ctx = shipContext({ config, story, shell, shellEnv, root, env, clock, packs, stdout });
+        // A signal ends the process with the JSON line; the line is flushed before the exit (a pipe
+        // write is asynchronous on some systems), with a timer as the backstop.
+        let stoppedOnce = false;
+        const interrupts = (stopped) => {
+          const onSignal = (signal) => {
+            if (stoppedOnce) return;
+            stoppedOnce = true;
+            const { code, result } = stopped(signal);
+            let gone = false;
+            const leave = () => {
+              if (gone) return;
+              gone = true;
+              exit(code);
+            };
+            setTimeout(leave, 1000);
+            try {
+              stdout.write(`${JSON.stringify({ ok: false, code, ...result })}\n`, leave);
+            } catch {
+              leave();
+            }
+          };
+          const handlers = STOP_SIGNALS.map((name) => [name, () => onSignal(name)]);
+          for (const [name, handler] of handlers) signals.on(name, handler);
+          return () => {
+            for (const [name, handler] of handlers) signals.off(name, handler);
+          };
+        };
+        const { code, result } = await runShip({ steps, ctx, onFailure, interrupts });
+        // The signal handler printed the one JSON line and its pending exit ends the process.
+        if (stoppedOnce) return code;
         if (code === 9) {
           const recorded = await parkStory(
             { dir: stateDir(root, config, env), root, config, env, now: clock, slot: currentSlot(env) },

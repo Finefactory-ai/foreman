@@ -25,15 +25,20 @@ on your PATH. Not for building a single story by hand: that is `/foreman:story <
    - `foreman decide list`: name any open items to the owner. Applying their answers is the
      story sessions' job, not yours.
 2. Start it with the Bash tool, as a plain command: `foreman run <N> --workers <W>`. N is the
-   number of stories the owner asked for (no number: it runs until stopped, and when nothing
-   is buildable it waits on standby and starts new stories as they come). W is how many at
-   once, 1 to `slots`; when the owner does not say, use 1. It returns at once, printing the
+   number of stories the owner asked for; a story that ends blocked and built nothing does not
+   use up one of the N (no number: it runs until stopped, and when nothing is buildable it
+   waits on standby and starts new stories as they come). The stories an earlier run left in
+   hand are resumed first, on top of the N, and do not count towards it: `foreman run` says
+   how many when it starts, and `foreman status` shows the split. W is how many at once, 1 to
+   `slots`; when the owner does not say, use 1. It returns at once, printing the
    supervisor's pid, the dashboard and the log (`<stateDir>/logs/supervisor.out`); the run
    lives on in its own session after this one closes.
    The story sessions load this plugin from the folder the supervisor itself runs: it passes
    `--plugin-dir <its own plugin folder>` to each session when the installed copy is elsewhere,
-   missing, or the project is Foreman's own repo. Nothing to set. `foreman doctor` and the run
-   log say when the installed copy differs.
+   missing, or the project is Foreman's own repo. The session's `foreman` command is that same
+   folder's: its `bin` goes first on the session's PATH and the installed copy is turned off for
+   the session. Nothing to set. `foreman doctor` and the run log say when the installed copy
+   differs.
    - With the background service installed (`foreman service status` says so), `foreman run`
      takes no story or worker count: it starts the service, which runs until stopped, on
      standby when nothing is buildable. For a count, tell the owner to run

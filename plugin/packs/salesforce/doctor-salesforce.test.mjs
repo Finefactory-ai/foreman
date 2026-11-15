@@ -28,7 +28,7 @@ import {
   sfOk,
   sfRaw,
 } from '../../../test/fake-sf.mjs';
-import { writeInstalled } from '../../../test/fake-skills.mjs';
+import { gitIn, gitSh, writeInstalled } from '../../../test/fake-skills.mjs';
 import { DEPLOYMENTS, PIPELINES, acmeDeployment, acmeDeployments, acmeEnvironment, acmeGearset, acmeTwoPipelines, environmentsOf, fakeGearset } from '../../../test/fake-gearset.mjs';
 import { CREDENTIALS_REASON } from './skills.mjs';
 import { makeSfCommand } from './sf-command.mjs';
@@ -135,9 +135,9 @@ const layoutC = (b, file) => {
 const gitFallback = (git = { status: 0, stdout: REF, stderr: '' }) => (cmd, args) =>
   cmd === 'git' && args[0] === 'ls-remote' ? git : { status: 0, stdout: '', stderr: '' };
 
-function ctxFor({ routes = {}, env = {}, git, fallback, fetch } = {}) {
+function ctxFor({ routes = {}, env = {}, git, fallback, fetch, root = dir } = {}) {
   return {
-    root: dir,
+    root,
     env: { FOREMAN_SF_HOME: sfHome, PATH: sfBin, ...env },
     sh: fakeSfShell(acmeSfRoutes(routes), fallback ?? gitFallback(git)),
     fs,
@@ -158,6 +158,11 @@ async function one(name, { edit, ...opts } = {}) {
   expect(res, `no check named ${name}`).toHaveProperty([name]);
   return { ...res[name], ctx, all: res };
 }
+
+// A remote that is not a remote name is never printed: the owner may have written a URL with a token.
+const NOT_A_REMOTE = 'could not check: remote in foreman.config.json is not a remote name';
+const REMOTE_HINT = 'set remote in foreman.config.json to the name of a git remote, such as origin';
+const URL_REMOTE = 'https://acme:t-acme-secret-41@git.example.com/acme.git';
 
 const OK = { ok: true, level: 'error' };
 const FAIL = { ok: false, level: 'error' };
@@ -405,6 +410,9 @@ describe('salesforce set-up steps and fix hints', () => {
       'salesforce gearset environments': 'sf-gearset',
       'salesforce gearset ci job': 'sf-gearset',
       'salesforce gearset ci tests': 'sf-gearset',
+      'salesforce gearset project file': 'sf-gearset',
+      'salesforce gearset webhooks': 'sf-gearset',
+      'salesforce gearset later stages': 'sf-gearset',
     });
     expect(doctorChecks(acmeConfig(scratch), ctxFor()).find((c) => c.name === 'salesforce org build').step).toBe('sf-orgs');
   });
@@ -708,8 +716,17 @@ describe('salesforce production branch', () => {
   });
   it('warns on a remote that starts with "-", without running git', async () => {
     const r = await one(PROD, { edit: (b, file) => { file.remote = '-u'; } });
-    expect(r).toEqual(expect.objectContaining({ ...WARN, detail: 'could not check -u' }));
+    expect(r).toEqual(expect.objectContaining({ ...WARN, detail: NOT_A_REMOTE }));
+    expect(r.fix.hint).toBe(REMOTE_HINT);
     expect(r.ctx.sh.calls.some((c) => c.cmd === 'git')).toBe(false);
+  });
+  it('never echoes a remote written as a URL with a token, and runs no git against it', async () => {
+    const r = await one(PROD, { edit: (b, file) => { file.remote = URL_REMOTE; } });
+    expect(r).toEqual(expect.objectContaining({ ...WARN, detail: NOT_A_REMOTE }));
+    expect(r.fix.hint).toBe(REMOTE_HINT);
+    expect(r.ctx.sh.calls.some((c) => c.cmd === 'git')).toBe(false);
+    expect(JSON.stringify(r.all)).not.toContain('t-acme-secret-41');
+    expect(JSON.stringify(r.all)).not.toContain('git.example.com');
   });
   it('warns when the remote has no such branch, or cannot be reached', async () => {
     const none = await one(PROD, { git: { status: 0, stdout: '', stderr: '' } });
@@ -727,7 +744,10 @@ describe('salesforce gearset', () => {
   const ENVS = 'salesforce gearset environments';
   const CI_JOB = 'salesforce gearset ci job';
   const CI_TESTS = 'salesforce gearset ci tests';
-  const GEARSET_CHECKS = [TOKEN_CHECK, BRANCH_CHECK, METHOD_CHECK, ENVS, CI_JOB, CI_TESTS];
+  const PROJECT_FILE = 'salesforce gearset project file';
+  const WEBHOOKS = 'salesforce gearset webhooks';
+  const LATER = 'salesforce gearset later stages';
+  const GEARSET_CHECKS = [TOKEN_CHECK, BRANCH_CHECK, METHOD_CHECK, ENVS, CI_JOB, CI_TESTS, PROJECT_FILE, WEBHOOKS, LATER];
   // The Acme block on the gearset path: qa and uat each on their own branch.
   const gearset = (more) => (b, file) => {
     b.release = 'gearset';
@@ -744,11 +764,302 @@ describe('salesforce gearset', () => {
     expect(ci.some((n) => n.startsWith('salesforce gearset'))).toBe(false);
   });
 
-  it('adds its six checks right after the production branch check', () => {
+  it('adds its nine checks right after the production branch check', () => {
     const names = doctorChecks(acmeConfig(gearset()), ctxFor()).map((c) => c.name);
     const at = names.indexOf('salesforce production branch');
-    expect(names.slice(at + 1, at + 7)).toEqual(GEARSET_CHECKS);
-    expect(names[at + 7]).toBe('salesforce workflows');
+    expect(names.slice(at + 1, at + 10)).toEqual(GEARSET_CHECKS);
+    expect(names[at + 10]).toBe('salesforce workflows');
+  });
+
+  describe('later stages', () => {
+    it('says Foreman validates the later stages by default, and Gearset validates the first', async () => {
+      const r = await one(LATER, { edit: gearset() });
+      expect(r).toMatchObject({ ...OK, detail: 'Foreman validates the promotion pull request of uat against its org before the merge (validateLaterStages "foreman"); Gearset validates qa' });
+    });
+
+    it('says the same for "foreman" set outright, and names every later stage through stopAt', async () => {
+      const edit = gearset((b) => {
+        b.gearset = { promote: 'merge', validateLaterStages: 'foreman' };
+        b.orgs['acme-prod-like'] = { orgId: '00D000000000009AAA' };
+        b.stages.push({ name: 'stg', org: 'acme-prod-like', branch: 'stg' });
+      });
+      const r = await one(LATER, { edit });
+      expect(r.detail).toBe('Foreman validates the promotion pull request of uat, stg against its org before the merge (validateLaterStages "foreman"); Gearset validates qa');
+    });
+
+    it('says each story waits for a click when validateLaterStages is "gearset"', async () => {
+      const r = await one(LATER, { edit: gearset((b) => { b.gearset = { promote: 'merge', validateLaterStages: 'gearset' }; }) });
+      expect(r).toMatchObject({ ...OK, detail: 'Gearset validates uat: each story waits until someone presses Run validation in Gearset (validateLaterStages "gearset")' });
+    });
+
+    it('says the owner presses Promote when gearset.promote is "owner"', async () => {
+      const r = await one(LATER, { edit: gearset((b) => { b.gearset = { promote: 'owner' }; }) });
+      expect(r).toMatchObject({ ...OK, detail: 'gearset.promote is "owner": you press Promote in Gearset for every stage' });
+    });
+
+    it('says Gearset validates its pull requests itself when stopAt leaves one stage', async () => {
+      const r = await one(LATER, { edit: gearset((b) => { b.stopAt = 'qa'; }) });
+      expect(r).toMatchObject({ ...OK, detail: 'one stage: Gearset validates its pull requests itself' });
+    });
+
+    it('is ok with no token and no Gearset call', async () => {
+      const fetch = fakeGearset(acmeGearset());
+      const r = await one(LATER, { edit: gearset(), env: {}, fetch });
+      expect(r.ok).toBe(true);
+      expect(fetch.calls).toEqual([]);
+    });
+
+    it('is absent when the release is not gearset', () => {
+      for (const edit of [addUat(), (b) => { b.release = 'ci'; }]) {
+        expect(doctorChecks(acmeConfig(edit), ctxFor()).map((c) => c.name)).not.toContain(LATER);
+      }
+    });
+  });
+
+  describe('webhooks', () => {
+    const HOOKS = 'gh api repos/{owner}/{repo}/hooks?per_page=100';
+    const SECRET = 'acme-hook-secret';
+    const hook = (id, over = {}) => ({ id, active: true, config: { url: `https://webhooks.gearset.com/acme/path-${id}?token=${SECRET}` }, last_response: { code: 200, status: 'active' }, ...over });
+    const other = { id: 99, active: true, config: { url: 'https://hooks.acme.example/x' }, last_response: { code: 500 } };
+    // Answers the hooks call, and nothing else, like GitHub.
+    const github = (answer) => (cmd, args) => {
+      if (cmd === 'gh' && [cmd, ...args].join(' ') === HOOKS) return typeof answer === 'function' ? answer() : answer;
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const body = (hooks) => ({ status: 0, stdout: JSON.stringify(hooks), stderr: '' });
+    const check = (answer) => one(WEBHOOKS, { edit: gearset(), fallback: github(answer) });
+    const HINT = "turn the Gearset webhooks on in the repository's Settings → Webhooks";
+
+    it('passes with both Gearset hooks on, ignoring any other hook', async () => {
+      const r = await check(body([hook(1), hook(2), other]));
+      expect(r).toEqual(expect.objectContaining({ ...OK, detail: '2 Gearset webhooks on' }));
+    });
+
+    it('says "1 Gearset webhook on" for one', async () => {
+      expect((await check(body([hook(1)]))).detail).toBe('1 Gearset webhook on');
+    });
+
+    it('warns on a switched-off Gearset hook, naming its id and never its URL', async () => {
+      const r = await check(body([hook(1), hook(2, { active: false })]));
+      expect(r).toMatchObject(WARN);
+      expect(r.detail).toContain('Gearset webhook 2 is switched off');
+      expect(r.detail).not.toContain('webhook 1');
+      expect(r.fix.hint).toBe(HINT);
+      const everything = JSON.stringify(r.all);
+      expect(everything).not.toContain(SECRET);
+      expect(everything).not.toContain('path-2');
+    });
+
+    it('warns on a hook whose last delivery failed, with the code', async () => {
+      const r = await check(body([hook(1, { last_response: { code: 502, status: 'bad' } }), hook(2)]));
+      expect(r).toMatchObject(WARN);
+      expect(r.detail).toContain("Gearset webhook 1's last delivery failed (HTTP 502)");
+      expect(r.fix.hint).toBe(HINT);
+    });
+
+    it('does not count a hook that has never delivered as failed', async () => {
+      const r = await check(body([hook(1, { last_response: { code: null, status: 'unused' } }), hook(2, { last_response: undefined })]));
+      expect(r).toMatchObject(OK);
+    });
+
+    it("warns when no hook is Gearset's, and ignores a look-alike host or a URL it cannot read", async () => {
+      const r = await check(body([other, hook(3, { config: { url: 'https://webhooks.gearset.com.acme.example/x' } }), hook(4, { config: { url: 'not a url' } }), hook(5, { config: {} })]));
+      expect(r).toMatchObject(WARN);
+      expect(r.detail).toBe('no Gearset webhook on this repository; Gearset adds them when its pipeline connects to the repository');
+      expect(r.fix.hint).toBe(HINT);
+    });
+
+    it('is skipped quietly when the token cannot read hooks (HTTP 403 or 404)', async () => {
+      for (const code of [403, 404]) {
+        const r = await check({ status: 1, stdout: '', stderr: `gh: Must have admin rights to Repository. (HTTP ${code})` });
+        expect(r, String(code)).toMatchObject(OK);
+        expect(r.detail).toMatch(/^skipped:/);
+      }
+    });
+
+    it('warns on any other gh failure', async () => {
+      const r = await check({ status: 1, stdout: '', stderr: 'gh: HTTP 502 Bad Gateway' });
+      expect(r).toMatchObject({ ...WARN, detail: "could not read the repository's webhooks" });
+      expect(r.fix.hint).toBe(HINT);
+      expect(await check({ status: 1, stdout: '', stderr: '' })).toMatchObject(WARN);
+    });
+
+    it('warns on an answer that is not a list', async () => {
+      for (const answer of [{ status: 0, stdout: 'not json', stderr: '' }, { status: 0, stdout: '{"message":"x"}', stderr: '' }, { status: 0, stdout: '', stderr: '' }]) {
+        const r = await check(answer);
+        expect(r).toMatchObject({ ...WARN, detail: 'GitHub answered something unreadable for the webhooks' });
+      }
+    });
+
+    it('asks GitHub from the project folder, with a time limit', async () => {
+      const r = await check(body([hook(1)]));
+      const call = r.ctx.sh.calls.find((c) => c.cmd === 'gh');
+      expect(call.args).toEqual(['api', 'repos/{owner}/{repo}/hooks?per_page=100']);
+      expect(call.opts).toMatchObject({ cwd: dir, timeout: expect.any(Number) });
+    });
+
+    it('does not exist on the sf and ci paths, and asks GitHub nothing there', async () => {
+      for (const release of ['sf', 'ci']) {
+        const edit = (b) => { b.release = release; addUat()(b); };
+        expect(doctorChecks(acmeConfig(edit), ctxFor()).map((c) => c.name), release).not.toContain(WEBHOOKS);
+        const ctx = ctxFor({ fallback: github(body([])) });
+        await runAll(acmeConfig(edit), ctx);
+        expect(ctx.sh.calls.some((c) => c.cmd === 'gh' && String(c.args[1]).includes('/hooks')), release).toBe(false);
+      }
+    });
+  });
+
+  describe('project file', () => {
+    const SAMPLE = '.agents/skills/x/assets/sfdx-project.json';
+    const gitFor = (extra = {}) => (cmd, args, opts) => (args[0] === 'ls-remote' ? { status: 0, stdout: REF, stderr: '' } : (extra[args[0]] ?? gitSh)(cmd, args, opts));
+    // The project's one sfdx-project.json on main, with the stage branches qa and uat cut from it.
+    function repo() {
+      gitIn(dir, 'init', '-q', '-b', 'main');
+      fs.writeFileSync(path.join(dir, 'sfdx-project.json'), '{"packageDirectories":[{"path":"force-app"}]}\n');
+      gitIn(dir, 'add', 'sfdx-project.json');
+      gitIn(dir, 'commit', '-q', '-m', 'Acme project');
+      gitIn(dir, 'branch', 'qa');
+      gitIn(dir, 'branch', 'uat');
+    }
+    const addSample = (branch) => {
+      gitIn(dir, 'checkout', '-q', branch);
+      fs.mkdirSync(path.join(dir, path.dirname(SAMPLE)), { recursive: true });
+      fs.writeFileSync(path.join(dir, SAMPLE), '{"packageDirectories":[]}\n');
+      gitIn(dir, 'add', '-f', SAMPLE);
+      gitIn(dir, 'commit', '-q', '-m', 'Acme skills with their samples');
+      gitIn(dir, 'checkout', '-q', 'main');
+    };
+    const check = (opts = {}) => one(PROJECT_FILE, { edit: gearset(), fallback: gitFor(), ...opts });
+    // The Acme project as a subfolder of a larger repository; the baselines live under the project root.
+    function nested() {
+      gitIn(dir, 'init', '-q', '-b', 'main');
+      const root = path.join(dir, 'acme');
+      fs.mkdirSync(root);
+      fs.writeFileSync(path.join(root, 'sfdx-project.json'), '{"packageDirectories":[{"path":"force-app"}]}\n');
+      gitIn(dir, 'add', 'acme/sfdx-project.json');
+      gitIn(dir, 'commit', '-q', '-m', 'Acme project');
+      gitIn(dir, 'branch', 'qa');
+      gitIn(dir, 'branch', 'uat');
+      for (const [alias, orgId] of [['acme-dev1', ACME_DEV1_ID], ['acme-dev2', ACME_DEV2_ID], ['acme-qa', ACME_QA_ID], ['acme-uat', ACME_UAT_ID]]) writeBase(alias, orgId, {}, root);
+      return root;
+    }
+
+    it('passes with one sfdx-project.json on every branch Gearset reads', async () => {
+      repo();
+      const r = await check();
+      expect(r).toEqual(expect.objectContaining({ ...OK, detail: 'one sfdx-project.json on main, qa, uat' }));
+    });
+
+    it('fails with two on a stage branch, naming the extra file and the fix', async () => {
+      repo();
+      addSample('uat');
+      const r = await check();
+      expect(r).toMatchObject(FAIL);
+      expect(r.detail).toContain(`uat tracks 2 sfdx-project.json files: ${SAMPLE}`);
+      expect(r.detail).toContain('Gearset needs exactly one');
+      expect(r.detail).not.toContain('qa tracks');
+      expect(r.fix.hint).toBe('run `foreman sf skills` and commit on the production branch, then `git rm --cached` the extra sfdx-project.json files on each branch named');
+    });
+
+    it('reads the remote branch before the local one', async () => {
+      repo();
+      addSample('uat');
+      gitIn(dir, 'update-ref', 'refs/remotes/origin/qa', gitIn(dir, 'rev-parse', 'uat'));
+      const r = await check();
+      expect(r).toMatchObject(FAIL);
+      expect(r.detail).toContain('qa tracks 2 sfdx-project.json files');
+      expect(r.detail).toContain('uat tracks 2 sfdx-project.json files');
+    });
+
+    it('warns about a branch it cannot read, and never fetches', async () => {
+      repo();
+      gitIn(dir, 'branch', '-D', 'uat');
+      const r = await check();
+      expect(r).toEqual(expect.objectContaining({ ...WARN, detail: 'could not read uat; fetch them, then run the doctor again' }));
+      expect(r.ctx.sh.calls.some((c) => c.cmd === 'git' && ['fetch', 'pull'].includes(c.args[0]))).toBe(false);
+    });
+
+    it('warns when git cannot list a branch tree', async () => {
+      repo();
+      const r = await check({ fallback: gitFor({ 'ls-tree': () => ({ status: 128, stdout: '', stderr: 'fatal' }) }) });
+      expect(r).toMatchObject(WARN);
+      expect(r.detail).toBe('could not read main, qa, uat; fetch them, then run the doctor again');
+    });
+
+    it('a failure beats an unread branch', async () => {
+      repo();
+      addSample('qa');
+      gitIn(dir, 'branch', '-D', 'uat');
+      expect(await check()).toMatchObject(FAIL);
+    });
+
+    it('warns, running no git, when the remote could be read as an option', async () => {
+      repo();
+      const r = await check({ edit: gearset((b, file) => { file.remote = '-x'; }) });
+      expect(r).toEqual(expect.objectContaining({ ...WARN, detail: NOT_A_REMOTE }));
+      expect(r.fix.hint).toBe(REMOTE_HINT);
+      expect(r.ctx.sh.calls.some((c) => c.cmd === 'git' && c.args[0] === 'ls-tree')).toBe(false);
+    });
+
+    it('never echoes a remote written as a URL with a token, and runs no git against it', async () => {
+      repo();
+      const r = await check({ edit: gearset((b, file) => { file.remote = URL_REMOTE; }) });
+      expect(r).toEqual(expect.objectContaining({ ...WARN, detail: NOT_A_REMOTE }));
+      expect(r.fix.hint).toBe(REMOTE_HINT);
+      expect(r.ctx.sh.calls.some((c) => c.cmd === 'git' && ['ls-tree', 'rev-parse'].includes(c.args[0]))).toBe(false);
+      expect(JSON.stringify(r.all)).not.toContain('t-acme-secret-41');
+      expect(JSON.stringify(r.all)).not.toContain('git.example.com');
+      expect(r.all['salesforce production branch']).toEqual(expect.objectContaining({ ...WARN, detail: NOT_A_REMOTE }));
+    });
+
+    it('warns when git cannot say where the project folder sits in the repository', async () => {
+      repo();
+      const gitShow = gitFor({ 'rev-parse': (cmd, args, opts) => (args[1] === '--show-prefix' ? { status: 128, stdout: '', stderr: 'fatal' } : gitSh(cmd, args, opts)) });
+      const r = await check({ fallback: gitShow });
+      expect(r).toEqual(expect.objectContaining({ ...WARN, detail: 'could not read main, qa, uat; fetch them, then run the doctor again' }));
+      expect(r.ctx.sh.calls.some((c) => c.cmd === 'git' && c.args[0] === 'ls-tree')).toBe(false);
+    });
+
+    it('lists the whole tree, whatever folder it runs in', async () => {
+      repo();
+      const r = await check();
+      const trees = r.ctx.sh.calls.filter((c) => c.cmd === 'git' && c.args[0] === 'ls-tree');
+      expect(trees.length).toBeGreaterThan(0);
+      for (const c of trees) expect(c.args).toContain('--full-tree');
+    });
+
+    it('passes when the project is a subfolder and its own file is the only one', async () => {
+      const root = nested();
+      const r = await check({ root });
+      expect(r).toEqual(expect.objectContaining({ ...OK, detail: 'one sfdx-project.json on main, qa, uat' }));
+    });
+
+    it('fails on a sfdx-project.json outside the project folder, naming it from the repository top', async () => {
+      const root = nested();
+      gitIn(dir, 'checkout', '-q', 'uat');
+      fs.mkdirSync(path.join(dir, 'tools'));
+      fs.writeFileSync(path.join(dir, 'tools', 'sfdx-project.json'), '{"packageDirectories":[]}\n');
+      gitIn(dir, 'add', '-f', 'tools/sfdx-project.json');
+      gitIn(dir, 'commit', '-q', '-m', 'Acme tooling project');
+      gitIn(dir, 'checkout', '-q', 'main');
+      const r = await check({ root });
+      expect(r).toMatchObject(FAIL);
+      expect(r.detail).toContain('uat tracks 2 sfdx-project.json files: tools/sfdx-project.json');
+      expect(r.detail).not.toContain('acme/sfdx-project.json');
+      expect(r.detail).not.toContain('qa tracks');
+    });
+
+    it('does not exist on the sf and ci paths, and runs no ls-tree there', async () => {
+      repo();
+      for (const release of ['sf', 'ci']) {
+        const edit = (b) => { b.release = release; addUat()(b); };
+        const names = doctorChecks(acmeConfig(edit), ctxFor()).map((c) => c.name);
+        expect(names, release).not.toContain(PROJECT_FILE);
+        const ctx = ctxFor({ fallback: gitFor() });
+        await runAll(acmeConfig(edit), ctx);
+        expect(ctx.sh.calls.some((c) => c.cmd === 'git' && c.args[0] === 'ls-tree'), release).toBe(false);
+      }
+    });
   });
 
   it('token: fails when it is missing, naming the variable and the env file, never a value', async () => {
@@ -796,6 +1107,22 @@ describe('salesforce gearset', () => {
     expect(fetch.calls.slice(0, 2).map((c) => c.path)).toEqual([PIPELINES, environmentsOf('pipe-1')]);
     expect(fetch.calls[0].headers).toMatchObject({ Authorization: `token ${TOKEN}`, 'api-version': '3.0' });
     expect(JSON.stringify(r.all)).not.toContain(TOKEN);
+  });
+
+  it('the environments, ci job and ci tests checks share one pipelines read and one environments read', async () => {
+    const fetch = fakeGearset();
+    const r = await one(ENVS, { edit: gearset(), ...withToken, fetch });
+    expect(r.all[CI_JOB]).toBeDefined();
+    expect(r.all[CI_TESTS]).toBeDefined();
+    expect(fetch.calls.filter((c) => c.path === PIPELINES)).toHaveLength(1);
+    expect(fetch.calls.filter((c) => c.path === environmentsOf('pipe-1'))).toHaveLength(1);
+  });
+
+  it('reads Gearset afresh on each doctor run', async () => {
+    const fetch = fakeGearset();
+    await one(ENVS, { edit: gearset(), ...withToken, fetch });
+    await one(ENVS, { edit: gearset(), ...withToken, fetch });
+    expect(fetch.calls.filter((c) => c.path === PIPELINES)).toHaveLength(2);
   });
 
   it('environments: fails a stage with no environment, naming the stage and its alias', async () => {
@@ -1154,6 +1481,19 @@ describe('salesforce skills lock', () => {
     expect(await one(LOCK)).toMatchObject(OK);
     fs.writeFileSync(skillFile('sf-apex', 'extra.md'), 'more\n');
     expect(await one(LOCK)).toEqual(expect.objectContaining(changed));
+  });
+  it('passes a skill with a sample sfdx-project.json both with the sample and without it, as in a slot', async () => {
+    writeInstalled(dir, { ...INSTALLED, 'sf-omni': { 'SKILL.md': '# Omni for Acme\n', 'assets/sfdx-project.json': '{"packageDirectories":[]}\n' } }, SOURCE);
+    expect(await one(LOCK)).toEqual(expect.objectContaining({ ...OK, detail: '3 skills from forcedotcom/sf-skills' }));
+    fs.rmSync(skillFile('sf-omni', 'assets', 'sfdx-project.json'));
+    expect(await one(LOCK)).toMatchObject(OK);
+    const file = skillFile('sf-omni', 'SKILL.md');
+    fs.writeFileSync(file, '# Omni for Acme, edited\n');
+    expect(await one(LOCK)).toEqual(expect.objectContaining({ ...FAIL, detail: 'changed since install: sf-omni; run `foreman sf skills` to restore them' }));
+    fs.writeFileSync(file, '# Omni for Acme\n');
+    expect(await one(LOCK)).toMatchObject(OK);
+    fs.writeFileSync(skillFile('sf-omni', 'assets', 'sfdx-project.json'), '{"edited":true}\n');
+    expect(await one(LOCK)).toEqual(expect.objectContaining({ ...FAIL, detail: 'changed since install: sf-omni; run `foreman sf skills` to restore them' }));
   });
   it('fails when a skill is not installed, or not linked into .claude/skills', async () => {
     fs.rmSync(path.join(dir, '.claude', 'skills', 'sf-lwc'));

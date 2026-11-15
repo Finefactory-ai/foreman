@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { FIX_HINT, overrideText, readType, selfCheck } from './foreman-command.mjs';
+import { FIX_HINT, overrideText, readType, selfCheck, updateHint } from './foreman-command.mjs';
 
 const typed = (stdout, extra = {}) => readType({ status: 0, stdout, stderr: '', ...extra });
 
@@ -78,6 +78,18 @@ describe('overrideText', () => {
     expect(overrideText({ found: 'a shell alias', expected: '/home/acme/p/bin/foreman' }))
       .toBe("`foreman` in story sessions runs a shell alias, not the plugin's CLI at /home/acme/p/bin/foreman, so the run's steps use other code than its agents");
   });
+
+  it('names both Foreman versions when it is given them', () => {
+    expect(overrideText({ found: '/opt/acme/old/bin/foreman', expected: '/home/acme/p/bin/foreman', foundVersion: '0.0.1', expectedVersion: '0.0.2 a1b2c3d' }))
+      .toBe("`foreman` in story sessions runs /opt/acme/old/bin/foreman (Foreman 0.0.1), not the plugin's CLI at /home/acme/p/bin/foreman (Foreman 0.0.2 a1b2c3d), so the run's steps use other code than its agents");
+  });
+
+  it('names a version only when it is a non-empty string', () => {
+    expect(overrideText({ found: 'a', expected: 'b', foundVersion: '', expectedVersion: null }))
+      .toBe("`foreman` in story sessions runs a, not the plugin's CLI at b, so the run's steps use other code than its agents");
+    expect(overrideText({ found: 'a', expected: 'b', expectedVersion: '0.0.2' }))
+      .toBe("`foreman` in story sessions runs a, not the plugin's CLI at b (Foreman 0.0.2), so the run's steps use other code than its agents");
+  });
 });
 
 describe('selfCheck', () => {
@@ -102,6 +114,7 @@ describe('selfCheck', () => {
       FOREMAN_STORY: 'ACME-7',
       FOREMAN_SUPERVISOR_PID: '123',
       FOREMAN_PROJECT_DIR: path.join(tmp, 'project'),
+      CLAUDE_CONFIG_DIR: path.join(tmp, 'claude'),
     };
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -120,6 +133,112 @@ describe('selfCheck', () => {
     expect(lines()).toHaveLength(1);
     expect(selfCheck({ env: { ...env, FOREMAN_STORY: 'ACME-8' }, self: other })).not.toBeNull();
     expect(lines()).toHaveLength(2);
+  });
+
+  const plugin = (folder, version) => {
+    fs.mkdirSync(path.join(folder, '.claude-plugin'), { recursive: true });
+    fs.writeFileSync(path.join(folder, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'foreman', version }));
+  };
+
+  const installed = (entries, dir = path.join(tmp, 'claude')) => {
+    fs.mkdirSync(path.join(dir, 'plugins'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'plugins', 'installed_plugins.json'), JSON.stringify({ version: 2, plugins: entries }));
+  };
+
+  it('says the update command, in the same words as doctor', () => {
+    expect(updateHint('foreman@acme')).toBe('update it with `claude plugin update foreman@acme`');
+  });
+
+  it('ends with the update hint when the session runs an installed copy (user scope)', () => {
+    plugin(other, '0.0.1');
+    plugin(path.join(tmp, 'expected'), '0.0.2');
+    installed({ 'foreman@acme': [{ scope: 'user', installPath: other, version: '0.0.1' }] });
+    const text = selfCheck({ env, self: other });
+    expect(text.endsWith(`; ${updateHint('foreman@acme')}.`)).toBe(true);
+    expect(text).not.toContain(FIX_HINT);
+    expect(text).not.toContain('if [[ -z');
+    expect(text).toContain(`${path.join(other, 'bin', 'foreman')} (Foreman 0.0.1)`);
+    expect(text).toContain(`${path.join(tmp, 'expected', 'bin', 'foreman')} (Foreman 0.0.2)`);
+    const events = lines();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ kind: 'warn', slot: 'w2', text });
+  });
+
+  it('ends with the update hint for a project-scope copy of this project or a worktree in it', () => {
+    const project = env.FOREMAN_PROJECT_DIR;
+    const inProject = path.join(project, '.foreman', 'worktrees', 'w1');
+    let n = 0;
+    for (const projectPath of [project, inProject]) {
+      installed({ 'foreman@acme': [{ scope: 'project', projectPath, installPath: other, version: '0.0.1' }] });
+      const text = selfCheck({ env: { ...env, FOREMAN_STORY: `ACME-${++n}` }, self: other });
+      expect(text.endsWith(`; ${updateHint('foreman@acme')}.`), projectPath).toBe(true);
+    }
+  });
+
+  it('keeps the shell hint when self is not an installed copy of this session', () => {
+    const cases = {
+      'another folder': () => installed({ 'foreman@acme': [{ scope: 'user', installPath: path.join(tmp, 'elsewhere') }] }),
+      'another project': () => installed({ 'foreman@acme': [{ scope: 'project', projectPath: path.join(tmp, 'other-project'), installPath: other }] }),
+      'not JSON': () => {
+        fs.mkdirSync(path.join(tmp, 'claude', 'plugins'), { recursive: true });
+        fs.writeFileSync(path.join(tmp, 'claude', 'plugins', 'installed_plugins.json'), '{nope');
+      },
+      'no file': () => {},
+    };
+    let n = 0;
+    for (const [name, setup] of Object.entries(cases)) {
+      fs.rmSync(path.join(tmp, 'claude'), { recursive: true, force: true });
+      setup();
+      const text = selfCheck({ env: { ...env, FOREMAN_STORY: `ACME-${++n}` }, self: other });
+      expect(text.endsWith(`; ${FIX_HINT}.`), name).toBe(true);
+      expect(text, name).not.toContain('claude plugin update');
+    }
+  });
+
+  it('reads the plugins list under the home folder when CLAUDE_CONFIG_DIR is not set', () => {
+    const { CLAUDE_CONFIG_DIR, ...rest } = env;
+    const home = path.join(tmp, 'home');
+    installed({ 'foreman@acme': [{ scope: 'user', installPath: other }] }, path.join(home, '.claude'));
+    const text = selfCheck({ env: rest, self: other, home });
+    expect(text.endsWith(`; ${updateHint('foreman@acme')}.`)).toBe(true);
+  });
+
+  it('matches an installed path with a trailing slash', () => {
+    installed({ 'foreman@acme': [{ scope: 'user', installPath: `${other}/` }] });
+    expect(selfCheck({ env, self: other }).endsWith(`; ${updateHint('foreman@acme')}.`)).toBe(true);
+  });
+
+  it('still returns its text and creates nothing when the config folder is missing', () => {
+    const missing = path.join(tmp, 'no-claude');
+    const text = selfCheck({ env: { ...env, CLAUDE_CONFIG_DIR: missing }, self: other });
+    expect(text.endsWith(`; ${FIX_HINT}.`)).toBe(true);
+    expect(fs.existsSync(missing)).toBe(false);
+  });
+
+  it('names both Foreman versions and the supervisor commit when the session runs another copy', () => {
+    plugin(other, '0.0.1');
+    plugin(path.join(tmp, 'expected'), '0.0.2');
+    const text = selfCheck({ env: { ...env, FOREMAN_PLUGIN_LABEL: 'a1b2c3d' }, self: other });
+    const events = lines();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ kind: 'warn', slot: 'w2', text });
+    expect(text).toContain(`${path.join(other, 'bin', 'foreman')} (Foreman 0.0.1)`);
+    expect(text).toContain(`${path.join(tmp, 'expected', 'bin', 'foreman')} (Foreman 0.0.2 a1b2c3d)`);
+  });
+
+  it('leaves the label out when it only repeats the version, and uses it alone when there is no plugin.json', () => {
+    plugin(path.join(tmp, 'expected'), '0.0.2');
+    const text = selfCheck({ env: { ...env, FOREMAN_PLUGIN_LABEL: 'v0.0.2' }, self: other });
+    expect(text).toContain('(Foreman 0.0.2)');
+    expect(text).not.toContain('v0.0.2');
+    expect(text).not.toContain('(Foreman 0.0.1');
+    fs.rmSync(path.join(tmp, 'expected', '.claude-plugin'), { recursive: true });
+    const text2 = selfCheck({ env: { ...env, FOREMAN_PLUGIN_LABEL: 'a1b2c3d', FOREMAN_STORY: 'ACME-8' }, self: other });
+    expect(text2).toContain('(Foreman a1b2c3d)');
+  });
+
+  it('has no version part when no plugin.json is there', () => {
+    expect(selfCheck({ env, self: other })).not.toContain('(Foreman');
   });
 
   it('writes nothing, anywhere, for a slot that is not a plain name', () => {

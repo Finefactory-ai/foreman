@@ -55,6 +55,8 @@ export const OMNISTUDIO = ['auto', 'standard', 'managed', 'off'];
 export const AGENTFORCE = ['auto', 'off'];
 export const DESTRUCTIVE = ['ask', 'allow'];
 export const PROMOTE = ['owner', 'merge'];
+// Who validates a later stage's promotion pull request, which Gearset never validates by itself.
+export const VALIDATE_LATER = ['foreman', 'gearset'];
 // Values the documentation names that are not supported yet, so the error can say so.
 const LATER = { release: 'devops-center', omnistudio: 'datapacks' };
 
@@ -99,6 +101,10 @@ export const BLOCK_DEFAULTS = deepFreeze({
   agentforce: 'auto',
   // Foreman merges Gearset's promotion PR itself; "owner" parks the story for a Promote click.
   // gearset.pipelineId has no default: unset, every pipeline the token sees is searched.
+  // gearset.nudgeMinutes (1 to 60) has none either: unset, the step waits NUDGE_MINUTES of
+  // gearset.mjs for a Gearset status before it nudges Gearset.
+  // gearset.validateLaterStages has none either: unset means "foreman", which dry-runs a later
+  // stage's promotion PR itself; "gearset" waits for Gearset's own validation.
   gearset: { promote: 'merge' },
   skills: { source: 'forcedotcom/sf-skills', tag: '1.66.0' },
 });
@@ -555,8 +561,12 @@ export function checkConfig(block, config) {
   oneOf(block, 'destructive', DESTRUCTIVE, '', errors);
   oneOf(block, 'omnistudio', OMNISTUDIO, '', errors);
   oneOf(block, 'agentforce', AGENTFORCE, '', errors);
-  nested(block, 'gearset', ['promote', 'pipelineId'], errors, (v) => {
+  nested(block, 'gearset', ['promote', 'pipelineId', 'nudgeMinutes', 'validateLaterStages'], errors, (v) => {
     oneOf(v, 'promote', PROMOTE, 'gearset', errors);
+    oneOf(v, 'validateLaterStages', VALIDATE_LATER, 'gearset', errors);
+    if (v.nudgeMinutes !== undefined && !isInt(v.nudgeMinutes, 1, 60)) {
+      errors.push({ path: 'gearset.nudgeMinutes', message: 'must be an integer from 1 to 60' });
+    }
     if (v.pipelineId !== undefined && !(typeof v.pipelineId === 'string' && PIPELINE_ID.test(v.pipelineId))) {
       errors.push({ path: 'gearset.pipelineId', message: 'expected a Gearset pipeline ID' });
     }

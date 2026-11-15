@@ -12,13 +12,15 @@
 //   writeInstalled(root, skills, source, { ref })
 //                                     what `foreman sf skills` leaves in a project: the files in
 //                                     .agents/skills, the .claude/skills symlinks and a
-//                                     skills-lock.json with real hashes. ref null leaves it out.
+//                                     skills-lock.json with real hashes, and a trackedHash for a
+//                                     skill that holds a sample sfdx-project.json, as writeSkills
+//                                     does. ref null leaves it out.
 //   gitIn(cwd, ...args)               runs git there and returns its trimmed stdout, or throws.
 
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { hashSkillDir, sourceType } from '../plugin/packs/salesforce/skills.mjs';
+import { hashSkillDir, isSampleProject, sourceType } from '../plugin/packs/salesforce/skills.mjs';
 
 const ENV = {
   ...process.env,
@@ -84,6 +86,7 @@ export function writeInstalled(root, skills, source, { ref = '1.66.0' } = {}) {
       ...(ref === null ? {} : { ref }),
       skillPath: `skills/${name}/SKILL.md`,
       computedHash: hashSkillDir(real, fs),
+      ...(Object.keys(skills[name]).some(isSampleProject) ? { trackedHash: hashSkillDir(real, fs, { skip: isSampleProject }) } : {}),
     };
   }
   fs.writeFileSync(path.join(root, 'skills-lock.json'), `${JSON.stringify(lock, null, 2)}\n`);

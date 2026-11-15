@@ -10,6 +10,7 @@ import { envSweepDue, envVerdict, isPending, learnedSkills, learnedSkillsByRole,
 import { readSlot, redact, setSlot } from './state.mjs';
 import { releaseHeld } from './scheduler.mjs';
 import { storiesInSlots } from '../../packs/salesforce/scratch-orgs.mjs';
+import { supervisorSource } from '../../../test/supervisor-source.mjs';
 
 // A promise with its resolve and reject on the outside.
 function deferred() {
@@ -747,7 +748,7 @@ describe('notStartedPatch', () => {
   });
 
   it('is what the supervisor applies when a session does not start', () => {
-    const src = readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     expect(src).toContain('notStartedPatch(readSlot(DIR, slot))');
   });
 });
@@ -794,7 +795,7 @@ describe('sessionStartPatch', () => {
   });
 
   it('is what the supervisor applies when a session starts', () => {
-    const src = readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     const start = src.slice(src.indexOf('function startSession('), src.indexOf('function killSession('));
     expect(start).toContain('sessionStartPatch(readSlot(DIR, slot), id, now().toISOString())');
   });

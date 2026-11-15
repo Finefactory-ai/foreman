@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { checkBeforeEnv, closeInstead, mergedAfter, mergedPrOf, mergedPrOfAsync, rolledBackAtOf } from './resume-close.mjs';
+import { supervisorSource } from '../../../test/supervisor-source.mjs';
 
 const PR = 'https://example.com/acme/pull/1';
 const BRANCH = 'story/acme-1';
@@ -298,7 +299,7 @@ describe('a story rolled back after its merge is built again', () => {
 });
 
 describe('the supervisor passes the rollback on', () => {
-  const source = readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+  const source = supervisorSource();
 
   it("gives lookUpMerged's look-up the story's rollback time", () => {
     expect(source).toMatch(/mergedPrOfAsync\(branchOf\(id\), \(args\) => [^\n]*\{ rolledBackAt: rolledBackOf\(id\) \}\)/);

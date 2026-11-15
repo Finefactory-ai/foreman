@@ -6,6 +6,7 @@ import { confirmedResult } from './parks.mjs';
 import { ACTIONS, actionsFor, afterFixCheck, afterOutcome, apiHeldText, BACKOFF_MS, backoffMs, backoffShown, canPick, canResume, dropSteps, ENV_BACKOFF_STEPS, envWhy, failCauseOf, hung, LET_GO_PATCH, looseClaims, looseClaimText, lastProgressText, MAX_SIGNIN_RESUMES, newestStep, outcome, OWNER_CLAIM_POLL_SECONDS, ownerClaimFate, ownerClaimText, pendingCommands, releaseAfterWait, releaseHeld, resumeCheck, resumeHeld, settledOwnerClaims, signinRun, slotIdsFor, slotStoryId, spentResult, STANDBY, whenNothingLeft, workStop, workStopText } from './scheduler.mjs';
 import { readSlot, setSlot } from './state.mjs';
 import { storiesInSlots } from '../../packs/salesforce/scratch-orgs.mjs';
+import { supervisorSource } from '../../../test/supervisor-source.mjs';
 
 const base = { halted: false, stopping: false, paused: false, backoffUntil: 0, now: 1000, slotIndex: 0, workers: 3, max: 0, started: 0, slotState: 'idle' };
 
@@ -832,7 +833,7 @@ describe('ownerClaimFate / settledOwnerClaims / ownerClaimText', () => {
     expect(ownerClaimText({ id: 'ACME-1', why: 'gone' })).toBe('ACME-1: cleared your claim; the story is no longer in the story source.');
   });
   it('is swept by the supervisor every tick, after the claims sweep and before the picks', () => {
-    const src = fs.readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     const tick = src.slice(src.indexOf('async function tick()'));
     const at = tick.indexOf('sweepOwnerClaims()');
     expect(tick.indexOf('sweepClaims()')).toBeGreaterThan(0);
@@ -979,7 +980,7 @@ describe('releaseHeld', () => {
   });
 
   it('is what the supervisor runs when the halt clears', () => {
-    const src = fs.readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     const fixed = src.slice(src.indexOf('function fixed()'), src.indexOf('function handBack('));
     expect(fixed).toContain('releaseHeld(SLOT_IDS.map((slot) => ({ slot, st: readSlot(DIR, slot) })))');
     expect(fixed).toContain('setSlot(DIR, r.slot, r.patch, now());');
@@ -988,7 +989,7 @@ describe('releaseHeld', () => {
   });
 
   it('is gated: queued work passes queuedStop before takeOver, and a held slot records heldWas', () => {
-    const src = fs.readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     const start = src.slice(src.indexOf('function startWork('), src.indexOf('const sweepClaims'));
     expect(start).toContain('queuedStop(w)');
     expect(start.indexOf('queuedStop(w)')).toBeLessThan(start.indexOf('takeOver('));
@@ -1095,7 +1096,7 @@ describe('dropSteps', () => {
     expect(dropSteps()).toEqual(dropSteps({ running: false, pinned: false, elsewhere: false }));
   });
   it('is what the supervisor drops stopped work with: running is read from sessions and slots, and the claim goes after the decision', () => {
-    const src = fs.readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     const drop = src.slice(src.indexOf('function dropWork('), src.indexOf('function startWork('));
     expect(drop).toContain('inHandSessions()');
     expect(drop).toContain('.story?.id === w.id');
@@ -1187,7 +1188,7 @@ describe('releaseAfterWait', () => {
     ).toEqual([]);
   });
   it('is what the supervisor runs every tick, before the claims sweep and the picks', () => {
-    const src = fs.readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     const tick = src.slice(src.indexOf('async function tick()'));
     expect(tick.indexOf('releaseApiHeld({ halted, paused, stopping })')).toBeGreaterThan(0);
     expect(tick.indexOf('releaseApiHeld({ halted, paused, stopping })')).toBeLessThan(tick.indexOf('sweepClaims()'));
@@ -1199,14 +1200,14 @@ describe('releaseAfterWait', () => {
     expect(fn).toContain('work.push(r.work)');
   });
   it('the supervisor holds a session that died on the API for the API, and shows the retry time', () => {
-    const src = fs.readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     expect(src).toContain("heldFor: run.cause ? 'api' : null");
     expect(src).toContain("afterOutcome(counters, o, Date.now(), id, { backoffMs: BACKOFF, why })");
     expect(src).toContain('retimeApiHeld();');
     expect(src).toContain("after.global === 'backoff' && after.reason");
   });
   it('the supervisor times an environment wait by envUntil and shows it as envWait, never touching the API hold', () => {
-    const src = fs.readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     expect(src).toContain('envUntil: counters.envUntil');
     expect(src).toContain('envWait: { since:');
     expect(src).toContain('until: new Date(counters.envUntil)');
@@ -1217,7 +1218,7 @@ describe('releaseAfterWait', () => {
     expect(src).toMatch(/apiWait: null, envWait: null/);
   });
   it('Resume on a held slot queues its story through resumeHeld', () => {
-    const src = fs.readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     const resume = src.slice(src.indexOf("case 'resume':"), src.indexOf("case 'resume-as-is':"));
     expect(resume).toContain("st.state === 'held'");
     expect(resume).toContain('resumeHeld([{ slot, st }])');
@@ -1274,7 +1275,7 @@ describe('LET_GO_PATCH', () => {
     expect(LET_GO_PATCH.heldFor).toBeNull();
   });
   it('is what the supervisor applies when the owner skips or takes over a story', () => {
-    const src = fs.readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     const command = src.slice(src.indexOf('function slotCommand('), src.indexOf('function fixed()'));
     expect(command).toContain('slotStoryId({ st, running, claims: claims(DIR), slot })');
     expect(command).not.toContain('st.heldStory ?? st.parkedStory');
@@ -1322,7 +1323,7 @@ describe('backoffShown', () => {
   });
 
   it('is what the supervisor keeps in state.json after each ending, at stop and at start', () => {
-    const src = fs.readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+    const src = supervisorSource();
     expect(src).toContain('backoffShown(counters, Date.now())');
     expect(src).toContain('saveRun({ backoffUntil: backoffAt })');
     expect(src).toMatch(/saveRun\(\{ configProblem: null, stuck: null[^}]*backoffUntil: null/);

@@ -19,7 +19,7 @@ the ship steps, the notifier and the console.
 ## Install
 
 ```
-/plugin marketplace add finefactory-ai/foreman#v0.12.0
+/plugin marketplace add finefactory-ai/foreman#v0.13.0
 /plugin install foreman@foreman
 ```
 
@@ -134,7 +134,15 @@ plugin/                  everything that installs
                          (stage 1 only: reverts the merge and deploys the reverse delta; the
                          sf path's ship.rollback.command), and gearset-pr (on the gearset path, built but not yet proven on a live
                          pipeline: opens the pull request and waits for Gearset's validation
-                         on the promotion PR it opens; needs GEARSET_API_TOKEN)
+                         on the promotion PR it opens; needs GEARSET_API_TOKEN), and
+                         gearset-promote-<stage> (merges each promotion PR, and confirms the deploy.
+                         Gearset validates the PR into the first stage itself but never one into a
+                         later stage, so for a later stage Foreman dry-runs everything the PR
+                         carries, from its exact head, against that stage's org first, then
+                         merges exactly that head:
+                         salesforce.gearset.validateLaterStages, "foreman" by default, or "gearset"
+                         to wait for Gearset's own validation and park until someone presses Run
+                         validation)
 .claude-plugin/          marketplace.json (points at plugin/)
 runner/                  the container runner: Dockerfile, compose and Fly examples, guide
 test/                    cross-module tests

@@ -4,7 +4,10 @@
 // supervisor runs, so a fix to the plugin does not reach the sessions. `--plugin-dir <folder>`
 // wins over an installed copy of the same name (checked against a real `claude -p`), so the
 // supervisor passes its own plugin folder (code-version.mjs PLUGIN_DIR, the code its restart
-// watches) whenever the installed copy is elsewhere. No settings are changed.
+// watches) whenever the installed copy is elsewhere. Passing the folder alone is not enough for
+// the session's `foreman` command: Claude Code puts an installed copy's bin on PATH too, so
+// session.mjs also puts the folder's bin first on PATH and turns every shadowing copy
+// (shadowingCopies) off in the --settings it writes. No settings file of the user's is changed.
 //
 // Pure apart from the `fs` it is given (default node:fs); nothing here throws, and nothing scans
 // the disk: the only file read is <pluginsDir>/installed_plugins.json. A missing or non-string
@@ -32,6 +35,11 @@
 //                        runner), 'differs' (copy is an installed copy elsewhere) or null.
 //                        FOREMAN_PLUGIN_DIR plays no part: the supervisor decides. All three are
 //                        null when pluginDir is not a string.
+//   shadowingCopies({ pluginDir, copies, fs, home })
+//                        the entries of `copies` (installedCopies) with a string id and a
+//                        non-empty string path that are not the same place as pluginDir: the
+//                        copies whose bin could beat pluginDir's for `foreman`; [] when pluginDir
+//                        is not a non-empty string or copies is not an array
 //   copyWarning({ copy, own })
 //                        the sentence the supervisor logs at start and `foreman doctor` shows
 //   initPluginWarning({ id, init, expected, fs, home })
@@ -107,9 +115,14 @@ export function sessionPlugin({ pluginDir, root, copies = [], fs = nodeFs, home 
   return { dir: why ? path.resolve(pluginDir) : null, why, copy };
 }
 
+export function shadowingCopies({ pluginDir, copies, fs = nodeFs, home = os.homedir() } = {}) {
+  if (typeof pluginDir !== 'string' || !pluginDir || !Array.isArray(copies)) return [];
+  return copies.filter((c) => isObject(c) && typeof c.id === 'string' && typeof c.path === 'string' && c.path !== '' && !samePlace(c.path, pluginDir, { fs, home }));
+}
+
 export function copyWarning({ copy, own } = {}) {
   const label = own?.label && own.label !== `v${own.version}` ? ` (${own.label})` : '';
-  return `The installed Foreman plugin is ${copy?.version ?? '?'} (${copy?.path ?? '?'}), but this Foreman is ${own?.version ?? '?'}${label} (${own?.path ?? '?'}); story sessions load this one with --plugin-dir.`;
+  return `The installed Foreman plugin is ${copy?.version ?? '?'} (${copy?.path ?? '?'}), but this Foreman is ${own?.version ?? '?'}${label} (${own?.path ?? '?'}); story sessions load this one with --plugin-dir and run its \`foreman\`, with the installed copy turned off.`;
 }
 
 export function initPluginWarning({ id, init, expected, fs = nodeFs, home = os.homedir() } = {}) {
