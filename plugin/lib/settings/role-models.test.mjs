@@ -5,7 +5,7 @@ import { checkValue, findSetting, GROUPS, REGISTRY, settingsFor } from './regist
 import { roleModelEntries, roleModelEntry } from './role-models.mjs';
 
 const acme = (extra = {}) => withDefaults({ version: 1, project: { name: 'Acme' }, ...extra });
-const UNSET = 'Same as the story session';
+const UNSET = "The agent's default";
 
 describe('the role model settings', () => {
   it('finds an entry per role by name, as a model dropdown', () => {
@@ -139,8 +139,8 @@ describe('the role model settings', () => {
   });
 
   it("tells a reviewer's model apart from the engine it may run through", () => {
-    expect(findSetting('roles.reviewers.security.model').description).toBe('The Claude model this reviewer runs on, or falls back to when its engine cannot run.');
-    expect(findSetting('roles.tester.model').description).toBe("The Claude model this agent runs on. Unset, it uses the story session's model.");
+    expect(findSetting('roles.reviewers.security.model').description).toBe("The model this reviewer runs on, or falls back to if its engine fails. Unset, its agent's default.");
+    expect(findSetting('roles.tester.model').description).toBe("The Claude model this agent runs on. Unset, it runs on its agent's default.");
   });
 });
 

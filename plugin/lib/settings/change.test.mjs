@@ -96,7 +96,7 @@ describe('role models on the team layer', () => {
     changeSetting(ctx(), { name: 'roles.architect.model', value: 'opus', layer: 'team' });
     expect(settingValue(ctx(), 'roles.architect.model')).toEqual({ value: 'opus' });
     const row = settingsView(ctx()).rows.find((x) => x.name === 'roles.architect.model');
-    expect(row).toMatchObject({ label: 'Architect', group: 'models', value: 'opus', source: 'team', unset: 'Same as the story session', limits: { values: ['haiku', 'sonnet', 'opus', 'fable'] } });
+    expect(row).toMatchObject({ label: 'Architect', group: 'models', value: 'opus', source: 'team', unset: "The agent's default", limits: { values: ['haiku', 'sonnet', 'opus', 'fable'] } });
   });
 });
 

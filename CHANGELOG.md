@@ -3,6 +3,10 @@
 What changed in each release of Foreman. Install a release with
 `/plugin marketplace add finefactory-ai/foreman#vX.Y.Z`, then `/plugin install foreman@foreman`.
 
+## 0.13.1 — 2026-11-15
+
+The Agent models settings now say what an unset model means. The first choice in each role's dropdown reads "The agent's default" instead of "Same as the story session", because since 0.13.0 Foreman's own agents carry a model of their own: Opus for the architect, the tester and the security reviewer, Sonnet for the builder and the compliance reviewer. Only an agent whose file names no model, such as your own agent or a Salesforce pack agent, runs on the story session's model.
+
 ## 0.13.0 — 2026-11-15
 
 Foreman's agents now start on a sensible mix of models, with no setting needed. The architect, the tester and the security reviewer run on Opus, where a miss costs the most. The builder and the compliance reviewer run on Sonnet. Set a role's model in the settings, as before, and your choice wins.

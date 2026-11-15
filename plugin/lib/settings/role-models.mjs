@@ -40,10 +40,13 @@ import { AGENT_MODELS, REVIEW_ENGINES } from '../config/validate.mjs';
 
 const NAME = /^roles\.(?:(architect|tester)|(builders|reviewers)\.([a-z][a-z0-9-]*))\.model$/;
 const ENGINE_NAME = /^roles\.reviewers\.([a-z][a-z0-9-]*)\.engine$/;
-const DESCRIPTION = "The Claude model this agent runs on. Unset, it uses the story session's model.";
-const REVIEWER_DESCRIPTION = 'The Claude model this reviewer runs on, or falls back to when its engine cannot run.';
+// The agent's default: the model in its own file's frontmatter (plugin/agents/*.md: architect,
+// tester and security reviewer opus, builder and compliance reviewer sonnet). An agent whose file
+// names none runs on the story session's model.
+const DESCRIPTION = "The Claude model this agent runs on. Unset, it runs on its agent's default.";
+const REVIEWER_DESCRIPTION = "The model this reviewer runs on, or falls back to if its engine fails. Unset, its agent's default.";
 const ENGINE_DESCRIPTION = 'Another CLI for this review, as engine:model, such as antigravity:claude-opus-4-6-thinking.';
-const UNSET_MODEL = 'Same as the story session';
+const UNSET_MODEL = "The agent's default";
 // "<engine>:<model>": a known engine, then the model as the CLI names it (no spaces or colons).
 const ENGINE_TEXT = new RegExp(`^(${REVIEW_ENGINES.join('|')}):([^\\s:]+)$`);
 const ENGINE_PROBLEM = `expected engine:model, the engine being ${REVIEW_ENGINES.join(' or ')}, such as antigravity:claude-opus-4-6-thinking`;

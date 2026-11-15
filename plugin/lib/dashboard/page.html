@@ -3551,7 +3551,7 @@ select option{background:var(--deep);color:var(--text)}
   }
 
   // What a save or reset sends: { body } or { error }. Choosing a setting's unset option (the
-  // role models' "Same as the story session") and saving removes the value on that layer.
+  // role models' "The agent's default") and saving removes the value on that layer.
   function settingBody(s, layer, reset, draft) {
     if (reset || (s.type === 'enum' && s.unset && draft === '')) return { body: { name: s.name, reset: true, layer } };
     const v = draftValue(s, draft);

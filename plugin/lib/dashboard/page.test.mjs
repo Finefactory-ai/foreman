@@ -620,17 +620,17 @@ describe('the Settings tab', () => {
     expect(draftValue({ type: 'enum' }, 'a')).toEqual({ value: 'a' });
   });
 
-  it('offers "Same as the story session" first in an enum that has an unset text', () => {
+  it("offers \"The agent's default\" first in an enum that has an unset text", () => {
     const control = SCRIPT.match(/function settingControl\(s, labelId\) \{[\s\S]*?\n {2}\}\n/)[0];
     expect(control).toContain('s.unset');
     expect(control.indexOf('s.unset')).toBeLessThan(control.indexOf('s.limits && s.limits.values'));
   });
 
-  it('turns "Same as the story session" into a reset on the layer saved to', () => {
+  it("turns \"The agent's default\" into a reset on the layer saved to", () => {
     const pick = (re) => SCRIPT.match(re)[0];
     const settingBody = new Function(`${pick(/function draftValue\(s, d\) \{[\s\S]*?\n {2}\}\n/)}${pick(/function settingBody\(s, layer, reset, draft\) \{[\s\S]*?\n {2}\}\n/)}; return settingBody;`)();
     const name = 'roles.tester.model';
-    const s = { name, type: 'enum', unset: 'Same as the story session' };
+    const s = { name, type: 'enum', unset: "The agent's default" };
     expect(settingBody(s, 'team', false, '')).toEqual({ body: { name, reset: true, layer: 'team' } });
     expect(settingBody(s, 'local', false, '')).toEqual({ body: { name, reset: true, layer: 'local' } });
     expect(settingBody(s, 'local', false, 'haiku')).toEqual({ body: { name, value: 'haiku', layer: 'local' } });

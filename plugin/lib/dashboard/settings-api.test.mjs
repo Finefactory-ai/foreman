@@ -131,7 +131,7 @@ describe('the agent models', () => {
     ]);
     const models = rows.filter((s) => s.name.endsWith('.model'));
     for (const s of models) {
-      const unset = s.name === 'session.model' ? 'The Claude CLI default' : 'Same as the story session';
+      const unset = s.name === 'session.model' ? 'The Claude CLI default' : "The agent's default";
       expect(s, s.name).toMatchObject({ type: 'enum', default: null, value: null, source: 'default', unset, limits: { values: ['haiku', 'sonnet', 'opus', 'fable'] } });
     }
     for (const s of rows.filter((s) => s.name.endsWith('.engine'))) {
