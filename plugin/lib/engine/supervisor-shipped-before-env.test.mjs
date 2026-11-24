@@ -1,11 +1,12 @@
 // A real `foreman run --foreground --exit-when-idle --workers 1` with an environment adapter
 // (docker), for the look at whether a story already shipped, made before the slot makes or resets
-// its environment. A story whose pull request merged is marked done with no docker call and no
-// session, whether it is picked fresh or is start-up work ("closing ACME-1"); one whose look-up
+// its environment. A story whose pull request merged is marked done with no docker compose call
+// and no session, whether it is picked fresh or is start-up work ("closing ACME-1"); one whose look-up
 // fails is built. A fake `claude`, `gh` and `docker` on the PATH stand in for the session, GitHub
 // and Docker. The fake gh answers the merged-PR look-up for story/acme-1 with a merged pull
 // request (exit 1 with FAKE_GH_BROKEN), and start-up recovery's merged list with it only when
-// FAKE_GH_STARTUP is set.
+// FAKE_GH_STARTUP is set. The fake docker answers `docker ps` with FAKE_DOCKER_PS, so the stop
+// sees a slot's project running.
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -31,6 +32,7 @@ console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false
 
 const FAKE_DOCKER = `#!/bin/sh
 echo "$(basename "$(pwd -P)") $*" >> "$FAKE_DOCKER_LOG"
+if [ "$1" = "ps" ] && [ -n "$FAKE_DOCKER_PS" ]; then echo "$FAKE_DOCKER_PS"; fi
 exit 0
 `;
 
@@ -94,6 +96,8 @@ const run = (extra = {}, args = []) => {
   return runForeman(['run', '--foreground', '--exit-when-idle', '--workers', '1', ...args], { cwd: clone, env, encoding: 'utf8', timeout: 100_000 });
 };
 const lines = (file) => readFileSync(file, 'utf8').split('\n').filter(Boolean);
+// The docker calls that make, reset or stop an environment: the stop's `docker ps` only looks.
+const composeCalls = () => lines(dockerLog).filter((l) => l.split(' ')[1] === 'compose');
 const texts = () => lines(join(state, 'events.jsonl')).map((l) => JSON.parse(l).text);
 const story = (id) => JSON.parse(readFileSync(join(state, 'stories', `${id}.json`), 'utf8'));
 const why = (r) => `${texts().join('\n')}\n${r.stdout}\n${r.stderr}`;
@@ -110,12 +114,12 @@ function expectClosed(r) {
 }
 
 describe('foreman run with an environment adapter and a story whose pull request merged', () => {
-  it('marks a todo story done, picked fresh, with no docker call and no session', () => {
+  it('marks a todo story done, picked fresh, with no docker compose call and no session', () => {
     setup([['ACME-1', 1]]);
     const r = run();
     expect(r.status, why(r)).toBe(0);
     expect(lines(claudeLog)).toEqual([]);
-    expect(lines(dockerLog)).toEqual([]);
+    expect(composeCalls()).toEqual([]);
     expectClosed(r);
     expect(lines(ghLog)).toContain('pr list --head story/acme-1 --state merged --json url,mergedAt --limit 10');
   }, 120_000);
@@ -128,6 +132,14 @@ describe('foreman run with an environment adapter and a story whose pull request
     expect(lines(claudeLog)).toEqual(['ACME-2']);
     expect(lines(dockerLog).length).toBeGreaterThan(0);
     expect(story('ACME-2').status).toBe('done');
+  }, 120_000);
+
+  it("stops the slot's compose project at the stop, keeping its containers", () => {
+    setup([['ACME-1', 1], ['ACME-2', 5]]);
+    const r = run({ FAKE_DOCKER_PS: 'acme-w1' });
+    expect(r.status, why(r)).toBe(0);
+    expect(lines(dockerLog).map((l) => l.split(' ').slice(1).join(' '))).toContain('compose -p acme-w1 stop');
+    expect(lines(dockerLog).some((l) => / down$/.test(l))).toBe(false);
   }, 120_000);
 
   it('does not count the closed story toward --max: with --max 1 it builds the next story', () => {
@@ -155,13 +167,13 @@ describe('foreman run with an environment adapter and a story whose pull request
     expect(story('ACME-2').status).toBe('done');
   }, 120_000);
 
-  it('closes the story queued by start-up recovery, with no docker call and no session', () => {
+  it('closes the story queued by start-up recovery, with no docker compose call and no session', () => {
     setup([['ACME-1', 1, 'in-progress']]);
     const r = run({ FAKE_GH_STARTUP: '1' });
     expect(r.status, why(r)).toBe(0);
     expect(texts(), why(r)).toContain('Start-up: closing ACME-1.');
     expect(lines(claudeLog)).toEqual([]);
-    expect(lines(dockerLog)).toEqual([]);
+    expect(composeCalls()).toEqual([]);
     expectClosed(r);
   }, 120_000);
 

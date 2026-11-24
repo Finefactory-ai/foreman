@@ -378,7 +378,8 @@ function checkStrays() {
 
 // Stops the sessions still running (SIGTERM, then SIGKILL for any still there after 10 s),
 // deletes the slot environments of the stories that closed (up to 60 s; an interrupted, held or
-// claimed story keeps its own), records why, emails, and exits. `loop` is the state left for the console.
+// claimed story keeps its own) and stops what the run started, such as the slot stacks and
+// Colima, keeping their data, then records why, emails, and exits. `loop` is the state left for the console.
 async function stop(code, reason, { loop = code === 2 ? 'halted' : 'stopped' } = {}) {
   if (exiting) return;
   exiting = 'stop';

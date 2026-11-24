@@ -66,7 +66,7 @@ All settings come from the environment. Pass secrets as secrets, never in the im
 ```
 docker run -d --name foreman --restart on-failure --stop-timeout 900 \
   --env-file .env.runner -v foreman-work:/work -p 127.0.0.1:4317:4317 \
-  ghcr.io/finefactory-ai/foreman-runner:0.13.1
+  ghcr.io/finefactory-ai/foreman-runner:0.13.2
 ```
 
 At start it runs `foreman cloud doctor`, and stops with the reason if a check fails: the
@@ -139,7 +139,7 @@ this in the project's committed `.claude/settings.json`:
 - A project in another language needs its toolchain. Build on this image:
 
   ```dockerfile
-  FROM ghcr.io/finefactory-ai/foreman-runner:0.13.1
+  FROM ghcr.io/finefactory-ai/foreman-runner:0.13.2
   USER root
   RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv && rm -rf /var/lib/apt/lists/*
   USER foreman

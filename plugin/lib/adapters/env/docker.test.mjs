@@ -65,6 +65,43 @@ describe('docker prepare', () => {
   });
 });
 
+describe('docker sweep at a stop', () => {
+  const fakeRun = (answer) => {
+    const calls = [];
+    const run = async (cmd, args, opts = {}) => {
+      calls.push({ cmd, args, opts });
+      return { stderr: '', timedOut: false, ...answer(cmd, args) };
+    };
+    return { run, calls };
+  };
+  const makeStop = (run) => create(OPTS, { root: '/repo', config: { slots: 3 }, sh: fakeSh().sh, run });
+  const STOP = { stopping: true, limitMs: 60_000 };
+  const PS = 'docker ps --format {{.Label "com.docker.compose.project"}}';
+
+  it('does nothing on the sweep while the run goes on', async () => {
+    const r = fakeRun(() => ({ status: 0, stdout: '' }));
+    expect(await makeStop(r.run).sweep()).toEqual({ warnings: [] });
+    expect(r.calls).toEqual([]);
+  });
+  it("stops each slot's running compose project, keeping its containers, and nothing else", async () => {
+    const r = fakeRun((cmd, args) => ({ status: 0, stdout: args[0] === 'ps' ? 'app-w1\napp-w1\napp-w3\napp\nother\n\n' : '' }));
+    expect(await makeStop(r.run).sweep(STOP)).toEqual({ warnings: [] });
+    const stops = r.calls.slice(1);
+    expect(r.calls[0] && said(r.calls[0])).toBe(PS);
+    expect(stops.map(said).sort()).toEqual(['docker compose -p app-w1 stop', 'docker compose -p app-w3 stop']);
+    for (const c of stops) expect(c.opts.cwd).toBe('/repo');
+  });
+  it('stops nothing when Docker cannot be reached', async () => {
+    const r = fakeRun(() => ({ status: 1, stdout: '' }));
+    expect(await makeStop(r.run).sweep(STOP)).toEqual({ warnings: [] });
+    expect(r.calls.length).toBe(1);
+  });
+  it('warns with the command to run by hand when a project will not stop', async () => {
+    const r = fakeRun((cmd, args) => (args[0] === 'ps' ? { status: 0, stdout: 'app-w2\n' } : { status: 1, stdout: '' }));
+    expect((await makeStop(r.run).sweep(STOP)).warnings).toEqual(['slot 2 containers did not stop; run `docker compose -p app-w2 stop`']);
+  });
+});
+
 describe('docker options', () => {
   it('has no repair or hostedEnv', () => {
     const a = make();

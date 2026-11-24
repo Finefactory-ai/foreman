@@ -3,6 +3,12 @@
 What changed in each release of Foreman. Install a release with
 `/plugin marketplace add finefactory-ai/foreman#vX.Y.Z`, then `/plugin install foreman@foreman`.
 
+## 0.13.2 — 2026-11-23
+
+Stopping Foreman now stops what it started. With the Supabase slot environment, each slot's local stack is stopped when the run stops, and its data is kept, so a held story finds its stack as it left it. With the Docker Compose slot environment, each slot's containers are stopped the same way. Standby stops nothing, so the next story still starts quickly.
+
+When Foreman started Colima itself (the `colima` option), the last Foreman run on the machine to stop shuts Colima down too. A run only ever stops its own slots, never another project's. Colima stays up while another Foreman run still uses it, while any other container runs on it, and always when you started it yourself. Anything that will not stop is shown as a warning with the command to run by hand.
+
 ## 0.13.1 — 2026-11-15
 
 The Agent models settings now say what an unset model means. The first choice in each role's dropdown reads "The agent's default" instead of "Same as the story session", because since 0.13.0 Foreman's own agents carry a model of their own: Opus for the architect, the tester and the security reviewer, Sonnet for the builder and the compliance reviewer. Only an agent whose file names no model, such as your own agent or a Salesforce pack agent, runs on the story session's model.

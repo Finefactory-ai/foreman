@@ -1,3 +1,6 @@
+import { existsSync, mkdtempSync, readdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { envAdapterContract } from './contract.mjs';
 import { hostedEnv } from '../ship/migrate-supabase.mjs';
@@ -13,7 +16,8 @@ const fakeSh = (answer = () => ({ status: 0, stdout: '' })) => {
 };
 const said = (call) => [call.cmd, ...call.args].join(' ');
 const ACME = { adapter: 'supabase', projectPrefix: 'acme-app', extraPorts: { UI_PORT: { base: 3210, step: 1 } } };
-const make = (options = ACME, sh = fakeSh().sh) => create(options, { root: '/repo', config: { slots: 3 }, sh });
+// The machine folder is a temporary one, so no test touches the real ~/.config/foreman.
+const make = (options = ACME, sh = fakeSh().sh) => create(options, { root: '/repo', config: { slots: 3 }, sh, machineDir: mkdtempSync(join(tmpdir(), 'foreman-machine-')) });
 
 envAdapterContract({ name: 'supabase', make: () => make(ACME, fakeSh().sh) });
 
@@ -149,6 +153,142 @@ describe('supabase repair', () => {
     const f = fakeSh();
     expect(make({ ...ACME, colima: true }, f.sh).repair()).toBe(true);
     expect(f.calls.map(said)).toEqual(['colima status']);
+  });
+});
+
+// The stop: the supervisor's stop() calls sweep({ stopping: true, limitMs }) once.
+const fakeRun = (answer = () => ({ status: 0, stdout: '' })) => {
+  const calls = [];
+  const run = async (cmd, args, opts = {}) => {
+    calls.push({ cmd, args, opts });
+    return { stderr: '', timedOut: false, ...answer(cmd, args, opts, calls) };
+  };
+  return { run, calls };
+};
+const PROJECTS = 'docker ps --format {{.Label "com.supabase.cli.project"}}';
+const NAMES = 'docker ps --format {{.Names}}';
+// Docker answers the Supabase projects of the running containers, then their names; every other
+// command succeeds unless `more` says otherwise.
+const docker = ({ projects = [], names = [], more = {} } = {}) => (cmd, args) => {
+  const line = [cmd, ...args].join(' ');
+  if (line === PROJECTS) return { status: 0, stdout: projects.map((n) => `${n}\n`).join('') };
+  if (line === NAMES) return { status: 0, stdout: names.map((n) => `${n}\n`).join('') };
+  return more[line] ?? { status: 0, stdout: '' };
+};
+const colimaDown = () => fakeSh((c, args) => ({ status: args[0] === 'status' ? 1 : 0, stdout: '' }));
+const machine = () => mkdtempSync(join(tmpdir(), 'foreman-machine-'));
+const makeStop = (options, run, { sh = fakeSh().sh, machineDir = machine(), pid = 101, alive = () => false } = {}) =>
+  create(options, { root: '/repo', config: { slots: 3 }, sh, run, machineDir, pid, alive });
+const STOP = { stopping: true, limitMs: 60_000 };
+const COLIMA = { ...ACME, colima: true };
+
+describe('supabase sweep at a stop', () => {
+  it('does nothing on the sweep while the run goes on', async () => {
+    const r = fakeRun();
+    expect(await makeStop(ACME, r.run).sweep()).toEqual({ warnings: [] });
+    expect(r.calls).toEqual([]);
+  });
+  it('stops only its own slot stacks, by their exact project id, keeping their data', async () => {
+    const r = fakeRun(docker({ projects: ['acme-app-w1', 'acme-app-w1', 'acme-app-w3', 'acme-app', 'other-acme-app-w2', 'x_acme-app-w2', 'acme-app-w2x', ''] }));
+    expect(await makeStop(ACME, r.run).sweep(STOP)).toEqual({ warnings: [] });
+    const stops = r.calls.filter((c) => c.cmd === 'supabase');
+    expect(stops.map(said).sort()).toEqual(['supabase stop --project-id acme-app-w1', 'supabase stop --project-id acme-app-w3']);
+    for (const c of stops) {
+      expect(c.opts.cwd).toBe('/repo');
+      expect(c.opts.timeoutMs).toBeGreaterThan(0);
+      expect(c.opts.timeoutMs).toBeLessThanOrEqual(60_000);
+    }
+  });
+  it('stops nothing when Docker cannot be reached, as nothing can be running', async () => {
+    const r = fakeRun((cmd) => ({ status: cmd === 'docker' ? 1 : 0, stdout: '' }));
+    expect(await makeStop(ACME, r.run).sweep(STOP)).toEqual({ warnings: [] });
+    expect(r.calls.map(said)).toEqual([PROJECTS]);
+  });
+  it('warns with the command to run by hand when a stack will not stop', async () => {
+    const r = fakeRun(docker({ projects: ['acme-app-w2'], more: { 'supabase stop --project-id acme-app-w2': { status: 1, stdout: '' } } }));
+    const { warnings } = await makeStop(ACME, r.run).sweep(STOP);
+    expect(warnings).toEqual(['slot 2 stack did not stop; run `supabase stop --project-id acme-app-w2`']);
+  });
+});
+
+describe('supabase and Colima at a stop, with other Foreman runs on the machine', () => {
+  it('stops Colima after the stacks when a Foreman run started it and no other run or container uses it', async () => {
+    let ps = 0;
+    const r = fakeRun((cmd, args) => {
+      if (cmd !== 'docker') return { status: 0, stdout: '' };
+      ps += 1;
+      return { status: 0, stdout: ps === 1 ? 'acme-app-w1\n' : '' };
+    });
+    const a = makeStop(COLIMA, r.run, { sh: colimaDown().sh });
+    expect(a.repair()).toBe(true);
+    expect(await a.sweep(STOP)).toEqual({ warnings: [] });
+    expect(r.calls.map(said)).toEqual([PROJECTS, 'supabase stop --project-id acme-app-w1', NAMES, 'colima stop']);
+  });
+  it('never stops a Colima that was up before any Foreman run', async () => {
+    const r = fakeRun(docker());
+    const a = makeStop(COLIMA, r.run);
+    expect(a.repair()).toBe(true);
+    await a.sweep(STOP);
+    expect(r.calls.map(said)).not.toContain('colima stop');
+  });
+  it('leaves Colima up, without a warning, while another live Foreman run uses it', async () => {
+    const dir = machine();
+    makeStop(COLIMA, fakeRun().run, { machineDir: dir, pid: 202 }).prepare(1, '/wt');
+    const r = fakeRun(docker());
+    const a = makeStop(COLIMA, r.run, { sh: colimaDown().sh, machineDir: dir, pid: 101, alive: (pid) => pid === 202 });
+    a.repair();
+    expect(await a.sweep(STOP)).toEqual({ warnings: [] });
+    expect(r.calls.map(said)).not.toContain('colima stop');
+    expect(existsSync(join(dir, 'colima', 'started'))).toBe(true);
+  });
+  it('lets the last Foreman run to stop stop the Colima another run started', async () => {
+    const dir = machine();
+    makeStop(COLIMA, fakeRun().run, { sh: colimaDown().sh, machineDir: dir, pid: 202 }).repair();
+    const b = makeStop(COLIMA, fakeRun().run, { machineDir: dir, pid: 101 });
+    b.prepare(1, '/wt');
+    const r = fakeRun(docker());
+    // 202 has stopped (it left Colima for 101); 101 stops now and is the last.
+    await makeStop(COLIMA, r.run, { machineDir: dir, pid: 101, alive: () => false }).sweep(STOP);
+    expect(r.calls.map(said)).toContain('colima stop');
+    expect(existsSync(join(dir, 'colima', 'started'))).toBe(false);
+    expect(readdirSync(join(dir, 'colima', 'runs'))).toEqual([]);
+  });
+  it('forgets runs that died without stopping', async () => {
+    const dir = machine();
+    makeStop(COLIMA, fakeRun().run, { sh: colimaDown().sh, machineDir: dir, pid: 303 }).repair();
+    const r = fakeRun(docker());
+    await makeStop(COLIMA, r.run, { machineDir: dir, pid: 101, alive: () => false }).sweep(STOP);
+    expect(r.calls.map(said)).toContain('colima stop');
+    expect(readdirSync(join(dir, 'colima', 'runs'))).toEqual([]);
+  });
+  it('leaves Colima running, and says why, when containers outside Foreman still use it', async () => {
+    const r = fakeRun(docker({ names: ['redis'] }));
+    const a = makeStop(COLIMA, r.run, { sh: colimaDown().sh });
+    a.repair();
+    const { warnings } = await a.sweep(STOP);
+    expect(r.calls.map(said)).not.toContain('colima stop');
+    expect(warnings).toEqual(['Colima left running: other containers still use it (redis)']);
+  });
+  it('warns when Colima will not stop', async () => {
+    const r = fakeRun(docker({ more: { 'colima stop': { status: 1, stdout: '' } } }));
+    const a = makeStop(COLIMA, r.run, { sh: colimaDown().sh });
+    a.repair();
+    expect((await a.sweep(STOP)).warnings).toEqual(['Colima did not stop; run `colima stop`']);
+  });
+  it('keeps what a Foreman run started across a restart on new code (a new process)', async () => {
+    const dir = machine();
+    makeStop(COLIMA, fakeRun().run, { sh: colimaDown().sh, machineDir: dir, pid: 101 }).repair();
+    expect(existsSync(join(dir, 'colima', 'started'))).toBe(true);
+    const r = fakeRun(docker());
+    await makeStop(COLIMA, r.run, { machineDir: dir, pid: 102 }).sweep(STOP);
+    expect(r.calls.map(said)).toContain('colima stop');
+  });
+  it('writes nothing to the machine folder without the colima option', async () => {
+    const dir = machine();
+    const a = makeStop(ACME, fakeRun(docker()).run, { machineDir: dir });
+    a.prepare(1, '/wt');
+    await a.sweep(STOP);
+    expect(existsSync(join(dir, 'colima'))).toBe(false);
   });
 });
 

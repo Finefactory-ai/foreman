@@ -42,8 +42,9 @@ export const PARK_CHECK_MS = 5 * 60_000;
 // (slot-prepare.mjs runEnvSweep). It runs every minute, while paused or halted too, and is
 // never counted as busy: it touches only stories that are in no slot.
 export const ENV_SWEEP_MS = 60_000;
-// The one sweep at a stop, which deletes the environments of closed stories (the supervisor's
-// stop() awaits it): the most time its calls may take, before runEnvSweep's own backstop.
+// The one sweep at a stop, which deletes the environments of closed stories and stops what the
+// run started, such as the slot stacks and Colima (the supervisor's stop() awaits it): the most
+// time its calls may take, before runEnvSweep's own backstop.
 export const STOP_SWEEP_MS = 60_000;
 
 // The supervisor passes `settings()` (the config in effect, replaced when the settings change); the objects
@@ -81,7 +82,8 @@ export function backgroundJobs({ root: ROOT, dir: DIR, bin: FOREMAN_BIN, node: N
   }
 
   // The sweep at a stop, awaited by the supervisor's stop(): the environments of stories that
-  // closed are deleted, for up to STOP_SWEEP_MS. Never throws; its warnings are events.
+  // closed are deleted and what the run started is stopped, for up to STOP_SWEEP_MS. Never
+  // throws; its warnings are events.
   async function sweepAtStop() {
     if (DRY || typeof envAdapter?.sweep !== 'function') return;
     try {

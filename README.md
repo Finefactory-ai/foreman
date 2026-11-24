@@ -19,7 +19,7 @@ the ship steps, the notifier and the console.
 ## Install
 
 ```
-/plugin marketplace add finefactory-ai/foreman#v0.13.1
+/plugin marketplace add finefactory-ai/foreman#v0.13.2
 /plugin install foreman@foreman
 ```
 
